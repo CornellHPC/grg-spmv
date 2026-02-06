@@ -1,0 +1,22 @@
+[project]
+name = "grg-spmv"
+version = "0.1.0"
+description = "GRG matvec/matmat with SpMV"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "grapp>=0.2",
+    "igdtools>=2.6",
+    "matplotlib>=3.10.8",
+    "mtkahypar>=1.5.3",
+    "numpy>=2.4.1",
+    "pygrgl>=2.5",
+    "pytest>=9.0.2",
+    "scipy>=1.17.0",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.14"
+pythonPlatform = "aarch64-apple-darwin"
