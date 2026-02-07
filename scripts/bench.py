@@ -43,11 +43,11 @@ def benchmark_configs(grg_path, k, n_trials, worker_counts, chunk_size):
         n, m = op.n, op.m
         rng = np.random.default_rng(42)
         if k == 1:
-            W = rng.standard_normal(m)
-            V = rng.standard_normal(n)
+            W = rng.standard_normal(m, dtype=np.float32)
+            V = rng.standard_normal(n, dtype=np.float32)
         else:
-            W = rng.standard_normal((m, k))
-            V = rng.standard_normal((n, k))
+            W = rng.standard_normal((m, k), dtype=np.float32)
+            V = rng.standard_normal((n, k), dtype=np.float32)
 
         # Time G @ W
         times_fwd = []
@@ -94,9 +94,9 @@ def benchmark_configs(grg_path, k, n_trials, worker_counts, chunk_size):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--grg", default="inputs/simulation-source-stdpopsim-500k.trees.v4.igd.final.grg")
+    parser.add_argument("--grg", default="/pscratch/sd/q/qys/grg/simulation-source-stdpopsim-500k.trees.v4.igd.final.grg")
     parser.add_argument("--k", type=int, default=4)
-    parser.add_argument("--trials", type=int, default=10)
+    parser.add_argument("--trials", type=int, default=2)
     parser.add_argument("--workers", type=str, default="1,4,16")
     parser.add_argument("--chunk-size", type=int, default=4096)
     args = parser.parse_args()

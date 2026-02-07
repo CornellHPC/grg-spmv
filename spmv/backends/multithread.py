@@ -129,9 +129,9 @@ class MultithreadBackend(Backend):
         chunk_size = self._chunk_size
 
         if is_1d:
-            result = np.zeros(nrows, dtype=np.float64)
+            result = np.zeros(nrows, dtype=x.dtype)
         else:
-            result = np.zeros((nrows, x.shape[1]), dtype=np.float64)
+            result = np.zeros((nrows, x.shape[1]), dtype=x.dtype)
 
         def process_chunk(start: int) -> None:
             """Process a chunk of rows."""

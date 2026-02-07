@@ -5,21 +5,6 @@ import numpy as np
 import scipy.sparse as sp
 
 
-def _make_ones_array(size, dtype=np.float64):
-    """
-    Create an array of ones for CSR data arrays.
-    Parameters
-    ----------
-    size : int
-        Number of elements in the array.
-    Returns
-    -------
-    ndarray
-        An array of ones with shape (size,).
-    """
-    return np.ones(size, dtype=dtype)
-
-
 def save_operator_npz(op, A_fwd, AT_bwd, npz_path, algo="none"):
     """
     Save SpMVOperator state to NPZ file for fast loading.
@@ -57,10 +42,10 @@ def save_operator_npz(op, A_fwd, AT_bwd, npz_path, algo="none"):
         save_dict[f'AT_bwd_{h}_indices'] = AT.indices
         save_dict[f'AT_bwd_{h}_indptr'] = AT.indptr
         save_dict[f'AT_bwd_{h}_shape'] = np.array(AT.shape)
-    np.savez_compressed(npz_path, **save_dict)
+    np.savez(npz_path, **save_dict)
 
 
-def load_operator_npz(npz_path):
+def load_operator_npz(npz_path, dtype):
     """
     Load SpMVOperator state from NPZ file.
     Loads extracted A_fwd and AT_bwd blocks directly.
@@ -68,6 +53,8 @@ def load_operator_npz(npz_path):
     ----------
     npz_path : str or Path
         Path to the NPZ file.
+    dtype : numpy dtype
+        Data type for sparse matrix values.
     Returns
     -------
     dict
@@ -86,17 +73,21 @@ def load_operator_npz(npz_path):
     inv_sample_perm = np.empty(n, dtype=np.uint32)
     inv_sample_perm[result['sample_perm']] = np.arange(n)
     result['_inv_sample_perm'] = inv_sample_perm
+
+    n_levels = len(result['level_offsets']) - 1
     sel_nnz = len(data['sel_indices'])
+    sel_T_nnz = len(data['sel_T_indices'])
+
     result['sel'] = sp.csr_matrix(
-        (_make_ones_array(sel_nnz), data['sel_indices'], data['sel_indptr']),
+        (np.ones(sel_nnz, dtype=dtype), data['sel_indices'], data['sel_indptr']),
         shape=(result['m'], result['K'])
     )
-    sel_T_nnz = len(data['sel_T_indices'])
+
     result['sel_T'] = sp.csr_matrix(
-        (_make_ones_array(sel_T_nnz), data['sel_T_indices'], data['sel_T_indptr']),
+        (np.ones(sel_T_nnz, dtype=dtype), data['sel_T_indices'], data['sel_T_indptr']),
         shape=(result['K'], result['m'])
     )
-    n_levels = len(result['level_offsets']) - 1
+
     result['A_fwd'] = []
     for h in range(n_levels):
         indices = data[f'A_fwd_{h}_indices']
@@ -104,9 +95,10 @@ def load_operator_npz(npz_path):
         shape = tuple(data[f'A_fwd_{h}_shape'])
         nnz = len(indices)
         result['A_fwd'].append(sp.csr_matrix(
-            (_make_ones_array(nnz), indices, indptr),
+            (np.ones(nnz, dtype=dtype), indices, indptr),
             shape=shape
         ))
+
     result['AT_bwd'] = []
     for h in range(n_levels):
         indices = data[f'AT_bwd_{h}_indices']
@@ -114,23 +106,24 @@ def load_operator_npz(npz_path):
         shape = tuple(data[f'AT_bwd_{h}_shape'])
         nnz = len(indices)
         result['AT_bwd'].append(sp.csr_matrix(
-            (_make_ones_array(nnz), indices, indptr),
+            (np.ones(nnz, dtype=dtype), indices, indptr),
             shape=shape
         ))
+
     return result
 
 
-def _extract_block(M, row_lo, row_hi, col_lo, col_hi):
+def _extract_block(M, row_lo, row_hi, col_lo, col_hi, dtype):
     """
     Extract a block M[row_lo:row_hi, col_lo:col_hi] as an independent CSR matrix.
     """
     if col_lo >= M.shape[1] or col_hi <= 0:
         nrows = min(row_hi, M.shape[0]) - max(row_lo, 0)
-        return sp.csr_matrix((nrows, 0), dtype=np.float64)
+        return sp.csr_matrix((nrows, 0), dtype=dtype)
     nrows = row_hi - row_lo
     ncols = col_hi - col_lo
     if ncols == 0:
-        return sp.csr_matrix((nrows, 0), dtype=np.float64)
+        return sp.csr_matrix((nrows, 0), dtype=dtype)
     start = M.indptr[row_lo]
     end = M.indptr[row_hi]
     indices = M.indices[start:end]
@@ -143,7 +136,7 @@ def _extract_block(M, row_lo, row_hi, col_lo, col_hi):
     row_counts = cumsum_full[indptr[1:]] - cumsum_full[indptr[:-1]]
     new_indptr = np.zeros(nrows + 1, dtype=np.uint32)
     new_indptr[1:] = np.cumsum(row_counts)
-    new_data = _make_ones_array(len(new_indices))
+    new_data = np.ones(len(new_indices), dtype=dtype)
     return sp.csr_matrix(
         (new_data, new_indices, new_indptr),
         shape=(nrows, ncols),

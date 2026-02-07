@@ -11,7 +11,7 @@ import scipy.sparse as sp
 from scipy.sparse.csgraph import reverse_cuthill_mckee
 from scipy.sparse.linalg import LinearOperator
 
-from spmv.io import save_operator_npz, load_operator_npz, _make_ones_array, _extract_block
+from spmv.io import save_operator_npz, load_operator_npz, _extract_block
 from spmv.backends.thread import ThreadBackend
 from spmv.backends.multithread import MultithreadBackend
 
@@ -62,6 +62,8 @@ class SpMVOperator(LinearOperator):
         - Additional backend-specific parameters (e.g., 'n_workers', 'chunk_size')
     use_rcm : bool
         Apply Reverse Cuthill-McKee reordering for cache locality (default: True).
+    dtype : numpy dtype
+        Data type for computation (default: np.float32).
 
     Public Attributes
     -----------------
@@ -74,8 +76,9 @@ class SpMVOperator(LinearOperator):
     sel_T : csr_matrix - Transposed selector (K × m).
     """
 
-    def __init__(self, path, backend_config: dict[str, Any], use_rcm: bool = True):
+    def __init__(self, path, backend_config: dict[str, Any], use_rcm: bool = True, dtype = np.float32):
         self._use_rcm = use_rcm
+        self._dtype = np.dtype(dtype)
         self._backend = _create_backend(backend_config)
 
         path = Path(path)
@@ -84,8 +87,10 @@ class SpMVOperator(LinearOperator):
         npz_path = path.with_suffix(f".spmv.{algo}.npz")
 
         if npz_path.exists():
+            print(f"Loading cached SpMVOperator from {npz_path}")
             self._load_from_npz(npz_path)
         else:
+            print(f"Building SpMVOperator with {path}")
             grg = pygrgl.load_immutable_grg(str(path))
             self._build_from_grg(grg)
             save_operator_npz(self, self.A_fwd, self.AT_bwd, npz_path, algo)
@@ -97,6 +102,7 @@ class SpMVOperator(LinearOperator):
     def _build_from_grg(self, grg):
         """Build SpMVOperator from a GRG object."""
         n, m, K = grg.num_samples, grg.num_mutations, grg.num_nodes
+        dtype = self._dtype
 
         # 1. Extract edges and compute heights
         rows, cols = [], []
@@ -116,7 +122,7 @@ class SpMVOperator(LinearOperator):
         perm_height = np.argsort(heights, kind='stable')
         sorted_heights = heights[perm_height]
         assert np.all(np.diff(sorted_heights) >= 0), "Heights must be non-decreasing!"
-        
+
         changes = np.flatnonzero(np.diff(sorted_heights)) + 1
         self.level_offsets = np.concatenate([[0], changes, [K]])
         num_levels = len(self.level_offsets) - 1
@@ -126,18 +132,18 @@ class SpMVOperator(LinearOperator):
         inv_perm_height[perm_height] = np.arange(K)
         rows_h = inv_perm_height[rows]
         cols_h = inv_perm_height[cols]
-        ones_E = _make_ones_array(E)
+        ones_E = np.ones(E, dtype=dtype)
         A_h = sp.csr_matrix((ones_E, (rows_h, cols_h)), shape=(K, K))
 
         # 4. Compute RCM permutations per level (optional)
-        level_perms = [np.arange(self.level_offsets[h+1] - self.level_offsets[h]) 
+        level_perms = [np.arange(self.level_offsets[h+1] - self.level_offsets[h])
                        for h in range(num_levels)]
-        
+
         if self._use_rcm:
             for h in range(1, num_levels):
                 row_lo, row_hi = self.level_offsets[h], self.level_offsets[h + 1]
                 col_lo, col_hi = self.level_offsets[h - 1], self.level_offsets[h]
-                
+
                 # Extract block A_{h,h-1}
                 A_block = A_h[row_lo:row_hi, col_lo:col_hi]
                 if A_block.nnz == 0:
@@ -157,7 +163,7 @@ class SpMVOperator(LinearOperator):
         for h in range(num_levels):
             lo, hi = self.level_offsets[h], self.level_offsets[h + 1]
             within_perm[lo:hi] = lo + level_perms[h]
-        
+
         final_perm = perm_height[within_perm]
         inv_final_perm = np.empty(K, dtype=np.uint32)
         inv_final_perm[final_perm] = np.arange(K)
@@ -177,12 +183,12 @@ class SpMVOperator(LinearOperator):
         self.A_fwd = []
         for h in range(num_levels):
             lo, hi = self.level_offsets[h], self.level_offsets[h + 1]
-            self.A_fwd.append(_extract_block(A, lo, hi, 0, lo))
+            self.A_fwd.append(_extract_block(A, lo, hi, 0, lo, dtype))
         AT = A.T.tocsr()
         self.AT_bwd = []
         for h in range(num_levels):
             lo, hi = self.level_offsets[h], self.level_offsets[h + 1]
-            self.AT_bwd.append(_extract_block(AT, lo, hi, hi, K))
+            self.AT_bwd.append(_extract_block(AT, lo, hi, hi, K, dtype))
 
         # 7. Selector matrix
         pairs = grg.get_mutation_node_pairs()
@@ -197,14 +203,14 @@ class SpMVOperator(LinearOperator):
         pair_node_ids = inv_final_perm[np.array(pair_node_ids_orig, dtype=np.uint32)]
         del pair_node_ids_orig
 
-        sel_ones = _make_ones_array(len(pair_mut_ids))
+        sel_ones = np.ones(len(pair_mut_ids), dtype=dtype)
         self.sel = sp.csr_matrix((sel_ones, (pair_mut_ids, pair_node_ids)), shape=(m, K))
         self.sel_T = sp.csr_matrix((sel_ones, (pair_node_ids, pair_mut_ids)), shape=(K, m))
 
         self.n = n
         self.m = m
         self.K = K
-        super().__init__(dtype=np.float64, shape=(n, m))
+        super().__init__(dtype=dtype, shape=(n, m))
 
     @staticmethod
     def _rcm_bipartite(A):
@@ -258,7 +264,7 @@ class SpMVOperator(LinearOperator):
 
     def _load_from_npz(self, npz_path):
         """Load operator state from NPZ file."""
-        data = load_operator_npz(npz_path)
+        data = load_operator_npz(npz_path, self._dtype)
         self.n = data['n']
         self.m = data['m']
         self.K = data['K']
@@ -269,7 +275,7 @@ class SpMVOperator(LinearOperator):
         self.sel_T = data['sel_T']
         self.A_fwd = data['A_fwd']
         self.AT_bwd = data['AT_bwd']
-        super().__init__(dtype=np.float64, shape=(self.n, self.m))
+        super().__init__(dtype=self._dtype, shape=(self.n, self.m))
 
     def _matmat(self, X):
         """G @ X for matrix X (m × k)."""
@@ -282,7 +288,7 @@ class SpMVOperator(LinearOperator):
         """G^T @ X for matrix X (n × k)."""
         X_arr = np.atleast_2d(X)
         n_vecs = X_arr.shape[1]
-        U = np.zeros((self.K, n_vecs), dtype=np.float64)
+        U = np.zeros((self.K, n_vecs), dtype=self._dtype)
         U[:self.n, :] = X_arr[self.sample_perm, :]
         U = self._backend.forward_matmat(U)
         return self.sel @ U

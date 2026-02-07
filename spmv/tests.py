@@ -13,7 +13,7 @@ from spmv import SpMVOperator
 
 
 # Use small file for faster tests
-SMALL_GRG = "inputs/msprime.example.igd.final.grg"
+SMALL_GRG = "/pscratch/sd/q/qys/grg/msprime.example.igd.final.grg"
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +69,10 @@ def vecs(spmv_seq):
     rng = np.random.default_rng(42)
     n, m = spmv_seq.shape
     return dict(
-        v=rng.standard_normal(n),
-        w=rng.standard_normal(m),
-        V=rng.standard_normal((n, 5)),
-        W=rng.standard_normal((m, 5)),
+        v=rng.standard_normal(n, dtype=np.float32),
+        w=rng.standard_normal(m, dtype=np.float32),
+        V=rng.standard_normal((n, 5), dtype=np.float32),
+        W=rng.standard_normal((m, 5), dtype=np.float32),
     )
 
 
@@ -213,7 +213,7 @@ class TestAlgebraic:
 
     def test_allele_counts(self, spmv_seq):
         """G^T @ 1 gives non-negative integer counts."""
-        counts = spmv_seq.H @ np.ones(spmv_seq.shape[0])
+        counts = spmv_seq.H @ np.ones(spmv_seq.shape[0], dtype=np.float32)
         assert np.all(counts >= 0)
         assert np.allclose(counts, np.round(counts))
 
@@ -228,7 +228,7 @@ class TestDifferentWorkerCounts:
         backend_config = {'type': 'multithread', 'n_workers': n_workers, 'chunk_size': 4096, 'verbose': False}
         op = SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False)
         rng = np.random.default_rng(123)
-        w = rng.standard_normal(op.m)
+        w = rng.standard_normal(op.m, dtype=np.float32)
         result = op @ w
         expected = ref_op @ w
         assert np.allclose(result, expected), f"n_workers={n_workers}, max diff: {np.max(np.abs(result - expected))}"
@@ -239,7 +239,7 @@ class TestDifferentWorkerCounts:
         backend_config = {'type': 'multithread', 'n_workers': n_workers, 'chunk_size': 4096, 'verbose': False}
         op = SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False)
         rng = np.random.default_rng(123)
-        v = rng.standard_normal(op.n)
+        v = rng.standard_normal(op.n, dtype=np.float32)
         result = op.H @ v
         expected = ref_op.H @ v
         assert np.allclose(result, expected), f"n_workers={n_workers}, max diff: {np.max(np.abs(result - expected))}"
