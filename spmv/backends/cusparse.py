@@ -337,6 +337,18 @@ class CusparseBackend(Backend):
                     cp.take(self._fwd_X_gpu, self._fwd_scatter_src[h], axis=0,
                             out=self._level_bufs[h][:ns])
 
+    def _bwd_gather(self):
+        """Gather from level_bufs into bwd_result_gpu.  (Outside graph.)"""
+        cp = self._cp
+        with self._stream:
+            self._bwd_result_gpu[:] = 0
+            for h in range(self._H):
+                if self._bwd_gather_temp[h] is not None:
+                    cp.take(self._level_bufs[h], self._bwd_gather_src[h], axis=0,
+                            out=self._bwd_gather_temp[h])
+                    self._bwd_result_gpu[self._bwd_gather_dst[h]] = \
+                        self._bwd_gather_temp[h]
+
     # ------------------------------------------------------------------
     # CUDA graph preparation (multi-stream wavefront)
     # ------------------------------------------------------------------
@@ -553,8 +565,9 @@ class CusparseBackend(Backend):
     def _capture_bwd_graph(self, dtype):
         """Warm up backward wavefront, then capture as CUDA graph.
 
-        The graph covers: fork -> wavefront SpMMs -> join -> perm gather.
-        sel_T scatter_add runs outside the graph in backward_matmat().
+        The graph covers: fork -> wavefront SpMMs -> join.
+        sel_T scatter_add and perm gather run outside the graph in
+        backward_matmat() via _sel_scatter_add() and _bwd_gather().
         Level bufs must be pre-filled with sel_T data before graph launch.
         """
         cp = self._cp
@@ -585,7 +598,7 @@ class CusparseBackend(Backend):
                            a1, b1, cdt, self._bwd_ext[h][j].data.ptr)
                 s.synchronize()
 
-        # Perm gather warmup
+        # Perm gather warmup (exercises CuPy JIT kernels)
         with self._stream:
             self._bwd_result_gpu[:] = 0
             for h in range(self._H):
@@ -594,6 +607,10 @@ class CusparseBackend(Backend):
                             out=self._bwd_gather_temp[h])
                     self._bwd_result_gpu[self._bwd_gather_dst[h]] = \
                         self._bwd_gather_temp[h]
+        self._stream.synchronize()
+
+        # Also warm up _bwd_gather() on main stream (used after graph launch)
+        self._bwd_gather()
         self._stream.synchronize()
 
         if self._verbose:
@@ -643,15 +660,7 @@ class CusparseBackend(Backend):
         for h in range(self._H):
             self._stream.wait_event(ready[h])
 
-        # --- Inverse permutation (gather) on main stream ---
-        with self._stream:
-            self._bwd_result_gpu[:] = 0
-            for h in range(self._H):
-                if self._bwd_gather_temp[h] is not None:
-                    cp.take(self._level_bufs[h], self._bwd_gather_src[h], axis=0,
-                            out=self._bwd_gather_temp[h])
-                    self._bwd_result_gpu[self._bwd_gather_dst[h]] = \
-                        self._bwd_gather_temp[h]
+        # NOTE: perm gather is NOT captured — runs outside in backward_matmat()
 
         return self._stream.end_capture()
 
@@ -710,7 +719,10 @@ class CusparseBackend(Backend):
             if timer: timer.mark('sel_T')
             self._bwd_exec.launch(stream=self._stream)
             self._stream.synchronize()
-            if timer: timer.mark('wavefront+perm')
+            if timer: timer.mark('wavefront')
+            self._bwd_gather()
+            self._stream.synchronize()
+            if timer: timer.mark('perm')
             result = self._bwd_result_gpu.get()
             if timer:
                 timer.mark('D2H')
