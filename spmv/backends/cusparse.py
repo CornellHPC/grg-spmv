@@ -1,0 +1,877 @@
+"""
+cuSPARSE Backend - GPU-accelerated block-wise SpMM using NVIDIA cuSPARSE.
+
+Uses per-level dense buffers (one per height level) to ensure 128-byte
+alignment without padding.  In graph mode, captures the entire
+forward/backward wavefront pipeline as a CUDA graph with multi-stream
+parallelism; sel gather/scatter runs outside the graph since CuPy fancy
+indexing is not reliably graph-capture-safe.
+
+Requires CuPy for GPU memory management and CUDA stream/graph APIs.
+Uses ctypes to call cuSPARSE directly for the fine-grained control
+needed by CUDA graph capture (CuPy's high-level sparse @ dense
+bundles buffer-size queries + compute, breaking graph capture).
+"""
+
+from ctypes import c_int, c_int64, c_size_t, c_void_p, byref
+from typing import List, Optional
+
+import numpy as np
+import scipy.sparse as sp
+
+from spmv.backends import Backend
+from spmv.backends.cuda_utils import (
+    load_cusparse, check_status, cuda_dtype, parse_algorithm, GpuTimer,
+    CUSPARSE_OPERATION_NON_TRANSPOSE,
+    CUSPARSE_ORDER_ROW,
+    CUSPARSE_INDEX_32I,
+    CUSPARSE_INDEX_BASE_ZERO,
+    CUSPARSE_POINTER_MODE_DEVICE,
+)
+
+_OP_N = CUSPARSE_OPERATION_NON_TRANSPOSE
+
+
+class CusparseBackend(Backend):
+    """
+    GPU backend using NVIDIA cuSPARSE for block-wise SpMM.
+
+    Parameters
+    ----------
+    fmt : str
+        Sparse storage format: 'csr', 'csc', or 'coo'.
+    k : int or None
+        If set, CUDA graphs are captured for this many dense columns.
+    algorithm : str or int
+        cuSPARSE SpMM algorithm name or integer constant.
+    verbose : bool
+        Print timing and profiling info.
+    """
+
+    def __init__(self, fmt: str = 'csr', k: Optional[int] = None,
+                 algorithm: str = 'default', verbose: bool = False):
+        self._fmt = fmt
+        self._graph_k = k
+        self._algorithm = parse_algorithm(algorithm)
+        self._verbose = verbose
+
+        # Algorithm-format validation
+        from spmv.backends.cuda_utils import (
+            CUSPARSE_SPMM_COO_ALG1, CUSPARSE_SPMM_COO_ALG2,
+            CUSPARSE_SPMM_COO_ALG3, CUSPARSE_SPMM_COO_ALG4,
+            CUSPARSE_SPMM_CSR_ALG3,
+        )
+        coo_only = {CUSPARSE_SPMM_COO_ALG1, CUSPARSE_SPMM_COO_ALG2,
+                    CUSPARSE_SPMM_COO_ALG3, CUSPARSE_SPMM_COO_ALG4}
+        if self._algorithm in coo_only and fmt != 'coo':
+            raise ValueError(f"Algorithm {algorithm} requires fmt='coo', got '{fmt}'")
+        if self._algorithm == CUSPARSE_SPMM_CSR_ALG3 and fmt != 'csr':
+            raise ValueError(f"Algorithm {algorithm} requires fmt='csr', got '{fmt}'")
+
+        try:
+            import cupy as cp
+            self._cp = cp
+        except ImportError:
+            raise ImportError("CuPy required: pip install cupy-cuda12x")
+
+        self._lib = load_cusparse()
+
+        self._handle = c_void_p()
+        check_status(self._lib.cusparseCreate(byref(self._handle)), 'cusparseCreate')
+        check_status(
+            self._lib.cusparseSetPointerMode(self._handle, CUSPARSE_POINTER_MODE_DEVICE),
+            'cusparseSetPointerMode',
+        )
+
+        self._stream = cp.cuda.Stream(non_blocking=True)
+
+        # Will be populated in setup()
+        self._H = self._n = self._K = self._m = 0
+        self._dtype = np.float64
+        self._level_offsets = None
+
+        # Graph mode state
+        self._fwd_exec = None
+        self._bwd_exec = None
+        self._k = None
+
+    # ------------------------------------------------------------------
+    # setup
+    # ------------------------------------------------------------------
+
+    def setup(
+        self,
+        A_blocks: List[List[sp.csr_matrix]],
+        AT_blocks: List[List[sp.csr_matrix]],
+        level_offsets: np.ndarray,
+        n: int,
+        K: int,
+        sel: sp.csr_matrix,
+        sel_T: sp.csr_matrix,  # unused; kept for Backend interface compat
+        sample_perm: np.ndarray,
+        inv_sample_perm: np.ndarray,
+        dtype: np.dtype,
+    ) -> None:
+        cp = self._cp
+        off = level_offsets
+        self._level_offsets = off
+        self._H = len(off) - 1
+        self._n = n
+        self._K = K
+        self._m = sel.shape[0]
+        self._dtype = np.dtype(dtype)
+
+        # Device scalars (DEVICE pointers for graph-safe SpMM)
+        self._alpha = cp.ones(1, dtype=dtype)
+        self._beta_zero = cp.zeros(1, dtype=dtype)
+        self._beta_one = cp.ones(1, dtype=dtype)
+
+        # --- Upload forward and backward blocks ---
+        self._fwd_sp, self._fwd_gpu = self._upload_blocks(A_blocks)
+        self._bwd_sp, self._bwd_gpu = self._upload_blocks(AT_blocks)
+
+        # --- Sel index arrays (gather/scatter instead of SpMM) ---
+        self._sel_mut_idx = []
+        self._sel_node_local = []
+        for h in range(self._H):
+            lo, hi = int(off[h]), int(off[h + 1])
+            sb = sel[:, lo:hi].tocoo()
+            self._sel_mut_idx.append(cp.array(sb.row.astype(np.int32)))
+            self._sel_node_local.append(cp.array(sb.col.astype(np.int32)))
+
+        # --- Permutation indices on GPU ---
+        # Forward scatter: level_bufs[h][:ns] = X_gpu[src_indices]
+        self._fwd_scatter_ns = []
+        self._fwd_scatter_src = []
+        for h in range(self._H):
+            lo, hi = int(off[h]), int(off[h + 1])
+            ns = max(0, min(hi, n) - lo)
+            src = cp.array(sample_perm[lo:lo + ns]) if ns > 0 else None
+            self._fwd_scatter_ns.append(ns)
+            self._fwd_scatter_src.append(src)
+
+        # Backward gather: result[dst] = level_bufs[h][src]
+        self._bwd_gather_dst = []
+        self._bwd_gather_src = []
+        for h in range(self._H):
+            lo, hi = int(off[h]), int(off[h + 1])
+            mask = (inv_sample_perm >= lo) & (inv_sample_perm < hi)
+            dst = cp.array(np.where(mask)[0])
+            src = cp.array(inv_sample_perm[mask] - lo)
+            self._bwd_gather_dst.append(dst)
+            self._bwd_gather_src.append(src)
+
+        # --- Per-level CUDA streams (for wavefront parallelism) ---
+        self._level_streams = [cp.cuda.Stream(non_blocking=True)
+                               for _ in range(self._H)]
+
+        if self._verbose:
+            nblk_fwd = sum(1 for h in range(self._H) for d in self._fwd_sp[h] if d is not None)
+            nblk_bwd = sum(1 for h in range(self._H) for d in self._bwd_sp[h] if d is not None)
+            nnz_fwd = sum(b.nnz for blocks in A_blocks for b in blocks)
+            nnz_bwd = sum(b.nnz for blocks in AT_blocks for b in blocks)
+            print(f"CusparseBackend setup: H={self._H}, K={K}, n={n}, m={self._m}, "
+                  f"fmt={self._fmt}, graph_k={self._graph_k}")
+            print(f"  Forward: {nblk_fwd} active blocks, {nnz_fwd:,} total nnz")
+            print(f"  Backward: {nblk_bwd} active blocks, {nnz_bwd:,} total nnz")
+
+        if self._graph_k is not None:
+            self._prepare_graphs(self._graph_k, self._dtype)
+
+    # ------------------------------------------------------------------
+    # upload helpers
+    # ------------------------------------------------------------------
+
+    def _upload_blocks(self, blocks_list):
+        """Upload sparse blocks to GPU, returning (descriptors, gpu_arrays) per level."""
+        all_descs, all_arrs = [], []
+        for h in range(self._H):
+            descs, arrs = [], []
+            for blk in blocks_list[h]:
+                if blk.nnz > 0:
+                    d, a = self._upload_sparse(blk)
+                    descs.append(d); arrs.append(a)
+                else:
+                    descs.append(None); arrs.append(None)
+            all_descs.append(descs)
+            all_arrs.append(arrs)
+        return all_descs, all_arrs
+
+    def _upload_sparse(self, A_scipy):
+        """Upload a scipy sparse matrix to GPU and create cuSPARSE descriptor."""
+        cp = self._cp
+        lib = self._lib
+        cdt = cuda_dtype(self._dtype)
+
+        if self._fmt == 'csc':
+            A = A_scipy.tocsc()
+            indptr = cp.array(A.indptr.astype(np.int32))
+            indices = cp.array(A.indices.astype(np.int32))
+            data = cp.array(A.data.astype(self._dtype))
+            desc = c_void_p()
+            check_status(lib.cusparseCreateCsc(
+                byref(desc),
+                c_int64(A.shape[0]), c_int64(A.shape[1]), c_int64(A.nnz),
+                c_void_p(indptr.data.ptr), c_void_p(indices.data.ptr),
+                c_void_p(data.data.ptr),
+                c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_32I),
+                c_int(CUSPARSE_INDEX_BASE_ZERO), c_int(cdt),
+            ), 'cusparseCreateCsc')
+        elif self._fmt == 'coo':
+            A = A_scipy.tocoo()
+            row_idx = cp.array(A.row.astype(np.int32))
+            col_idx = cp.array(A.col.astype(np.int32))
+            data = cp.array(A.data.astype(self._dtype))
+            desc = c_void_p()
+            check_status(lib.cusparseCreateCoo(
+                byref(desc),
+                c_int64(A.shape[0]), c_int64(A.shape[1]), c_int64(A.nnz),
+                c_void_p(row_idx.data.ptr), c_void_p(col_idx.data.ptr),
+                c_void_p(data.data.ptr),
+                c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_BASE_ZERO),
+                c_int(cdt),
+            ), 'cusparseCreateCoo')
+            return desc, (row_idx, col_idx, data)
+        else:  # csr
+            A = sp.csr_matrix(A_scipy).astype(self._dtype)
+            indptr = cp.array(A.indptr.astype(np.int32))
+            indices = cp.array(A.indices.astype(np.int32))
+            data = cp.array(A.data)
+            desc = c_void_p()
+            check_status(lib.cusparseCreateCsr(
+                byref(desc),
+                c_int64(A.shape[0]), c_int64(A.shape[1]), c_int64(A.nnz),
+                c_void_p(indptr.data.ptr), c_void_p(indices.data.ptr),
+                c_void_p(data.data.ptr),
+                c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_32I),
+                c_int(CUSPARSE_INDEX_BASE_ZERO), c_int(cdt),
+            ), 'cusparseCreateCsr')
+        return desc, (indptr, indices, data)
+
+    # ------------------------------------------------------------------
+    # dense descriptor helpers
+    # ------------------------------------------------------------------
+
+    def _create_level_dnmat(self, gpu_buf, k, dtype):
+        """Create DnMat descriptor for an entire per-level buffer (aligned)."""
+        nrows = gpu_buf.shape[0]
+        desc = c_void_p()
+        check_status(self._lib.cusparseCreateDnMat(
+            byref(desc),
+            c_int64(nrows), c_int64(k), c_int64(k),
+            c_void_p(gpu_buf.data.ptr),
+            c_int(cuda_dtype(dtype)), c_int(CUSPARSE_ORDER_ROW),
+        ), 'cusparseCreateDnMat')
+        return desc
+
+    # ------------------------------------------------------------------
+    # SpMM helpers
+    # ------------------------------------------------------------------
+
+    def _spmm_bufsize(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt):
+        """Query buffer size and allocate workspace."""
+        buf_size = c_size_t(0)
+        check_status(self._lib.cusparseSpMM_bufferSize(
+            self._handle, c_int(_OP_N), c_int(_OP_N),
+            c_void_p(alpha_ptr), sp_desc, B_desc,
+            c_void_p(beta_ptr), C_desc,
+            c_int(cdt), c_int(self._algorithm), byref(buf_size),
+        ), 'cusparseSpMM_bufferSize')
+        return self._cp.zeros(max(buf_size.value, 4), dtype=self._cp.uint8)
+
+    def _spmm_preprocess(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt, ext_buf):
+        """Run cusparseSpMM_preprocess on an already-allocated workspace."""
+        check_status(self._lib.cusparseSpMM_preprocess(
+            self._handle, c_int(_OP_N), c_int(_OP_N),
+            c_void_p(alpha_ptr), sp_desc, B_desc,
+            c_void_p(beta_ptr), C_desc,
+            c_int(cdt), c_int(self._algorithm), c_void_p(ext_buf.data.ptr),
+        ), 'cusparseSpMM_preprocess')
+
+    def _preprocess_one(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt):
+        """Allocate workspace, preprocess, and return the buffer."""
+        buf = self._spmm_bufsize(sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt)
+        self._spmm_preprocess(sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt, buf)
+        return buf
+
+    def _spmm(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt, ext_buf_ptr):
+        """Launch a single cusparseSpMM kernel."""
+        check_status(self._lib.cusparseSpMM(
+            self._handle, c_int(_OP_N), c_int(_OP_N),
+            c_void_p(alpha_ptr), sp_desc, B_desc,
+            c_void_p(beta_ptr), C_desc,
+            c_int(cdt), c_int(self._algorithm), c_void_p(ext_buf_ptr),
+        ), 'cusparseSpMM')
+
+    # ------------------------------------------------------------------
+    # sel gather / scatter_add  (run OUTSIDE CUDA graph)
+    # ------------------------------------------------------------------
+
+    def _sel_gather(self, result_gpu, level_bufs):
+        """Forward sel: result[mut] = level_bufs[h][node].  (Outside graph.)"""
+        with self._stream:
+            result_gpu[:] = 0
+            for h in range(self._H):
+                idx = self._sel_mut_idx[h]
+                if len(idx) > 0:
+                    result_gpu[idx] = level_bufs[h][self._sel_node_local[h]]
+
+    def _sel_scatter_add(self, X_gpu, level_bufs):
+        """Backward sel_T: level_bufs[h][node] += X[mut].  (Outside graph.)"""
+        cp = self._cp
+        with self._stream:
+            for h in range(self._H):
+                level_bufs[h][:] = 0
+                idx = self._sel_mut_idx[h]
+                if len(idx) > 0:
+                    cp.add.at(level_bufs[h], self._sel_node_local[h], X_gpu[idx])
+
+    def _fwd_scatter(self):
+        """Zero level_bufs and scatter X_gpu rows into them.  (Outside graph.)"""
+        cp = self._cp
+        with self._stream:
+            for h in range(self._H):
+                self._level_bufs[h][:] = 0
+                ns = self._fwd_scatter_ns[h]
+                if ns > 0:
+                    cp.take(self._fwd_X_gpu, self._fwd_scatter_src[h], axis=0,
+                            out=self._level_bufs[h][:ns])
+
+    # ------------------------------------------------------------------
+    # CUDA graph preparation (multi-stream wavefront)
+    # ------------------------------------------------------------------
+
+    def _prepare_graphs(self, k, dtype):
+        """Allocate persistent buffers, preprocess, warm up, capture graphs."""
+        cp = self._cp
+        off = self._level_offsets
+        cdt = cuda_dtype(dtype)
+        self._k = k
+
+        a1 = self._alpha.data.ptr
+        b1 = self._beta_one.data.ptr
+
+        # --- Per-level dense buffers (auto-aligned, no padding!) ---
+        self._level_bufs = []
+        for h in range(self._H):
+            sz = int(off[h + 1]) - int(off[h])
+            self._level_bufs.append(cp.zeros((sz, k), dtype=dtype, order='C'))
+
+        # --- I/O buffers ---
+        self._fwd_X_gpu = cp.zeros((self._n, k), dtype=dtype, order='C')
+        self._fwd_result_gpu = cp.zeros((self._m, k), dtype=dtype, order='C')
+        self._bwd_X_gpu = cp.zeros((self._m, k), dtype=dtype, order='C')
+        self._bwd_result_gpu = cp.zeros((self._n, k), dtype=dtype, order='C')
+
+        # Pre-allocate backward gather temps (persistent, reusable across replays)
+        self._bwd_gather_temp = []
+        for h in range(self._H):
+            ng = len(self._bwd_gather_dst[h])
+            self._bwd_gather_temp.append(
+                cp.zeros((ng, k), dtype=dtype, order='C') if ng > 0 else None)
+
+        # --- Dense descriptors for level buffers ---
+        self._level_dn = [self._create_level_dnmat(self._level_bufs[h], k, dtype)
+                          for h in range(self._H)]
+
+        if self._verbose:
+            mp = cp.get_default_memory_pool()
+            print(f"  GPU memory after level bufs: {mp.used_bytes() / 1e9:.2f} GB")
+
+        # --- bufferSize + preprocess for EVERY block ---
+        # Forward blocks (beta=1, accumulate)
+        self._fwd_ext = []
+        for h in range(self._H):
+            row = []
+            for j in range(h):
+                if self._fwd_sp[h][j] is None:
+                    row.append(None); continue
+                row.append(self._preprocess_one(
+                    self._fwd_sp[h][j], self._level_dn[j], self._level_dn[h],
+                    a1, b1, cdt))
+            self._fwd_ext.append(row)
+
+        # Backward blocks (beta=1, accumulate)
+        self._bwd_ext = []
+        for h in range(self._H):
+            row = []
+            for j in range(len(self._bwd_sp[h])):
+                if self._bwd_sp[h][j] is None:
+                    row.append(None); continue
+                src_level = h + 1 + j
+                row.append(self._preprocess_one(
+                    self._bwd_sp[h][j], self._level_dn[src_level], self._level_dn[h],
+                    a1, b1, cdt))
+            self._bwd_ext.append(row)
+
+        if self._verbose:
+            mp = cp.get_default_memory_pool()
+            print(f"  GPU memory after preprocess: {mp.used_bytes() / 1e9:.2f} GB")
+
+        # --- Warm up + capture graphs ---
+        self._fwd_exec = self._capture_fwd_graph(dtype)
+        self._bwd_exec = self._capture_bwd_graph(dtype)
+
+        if self._verbose:
+            print(f"  CUDA graphs captured for k={k}")
+            self._debug_dump_graph(self._fwd_exec, 'fwd')
+            self._debug_dump_graph(self._bwd_exec, 'bwd')
+
+    # ------------------------------------------------------------------
+    # graph debug output
+    # ------------------------------------------------------------------
+
+    def _debug_dump_graph(self, graph, label):
+        """Try to write CUDA graph DOT file for debugging (verbose only)."""
+        try:
+            import ctypes as ct
+            cudart = ct.cdll.LoadLibrary('libcudart.so')
+            cudart.cudaGraphDebugDotPrint.argtypes = [
+                ct.c_void_p, ct.c_char_p, ct.c_uint]
+            cudart.cudaGraphDebugDotPrint.restype = ct.c_int
+            # CuPy Graph object stores cudaGraph_t as ._graph (intptr_t)
+            graph_ptr = getattr(graph, '_graph', None)
+            if graph_ptr is None:
+                print(f"  [{label}] Graph object has no _graph attr "
+                      f"(type={type(graph).__name__})")
+                return
+            path = f'/tmp/cuda_{label}_graph.dot'
+            status = cudart.cudaGraphDebugDotPrint(
+                ct.c_void_p(int(graph_ptr)), path.encode(), ct.c_uint(0))
+            if status == 0:
+                print(f"  [{label}] Graph DOT written to {path}")
+            else:
+                print(f"  [{label}] cudaGraphDebugDotPrint status={status}")
+        except Exception as e:
+            print(f"  [{label}] Could not dump graph: {e}")
+
+    # ------------------------------------------------------------------
+    # graph capture (forward wavefront only — sel gather runs outside)
+    # ------------------------------------------------------------------
+
+    def _capture_fwd_graph(self, dtype):
+        """Warm up forward wavefront, then capture as CUDA graph.
+
+        The graph covers: fork -> wavefront SpMMs -> join.
+        Scatter (zero + cp.take) and sel gather run outside the graph
+        in forward_matmat() via _fwd_scatter() and _sel_gather().
+        """
+        cp = self._cp
+        lib = self._lib
+        cdt = cuda_dtype(dtype)
+        a1, b1 = self._alpha.data.ptr, self._beta_one.data.ptr
+        streams = self._level_streams
+
+        # --- Warmup pass (per-call sync, outside graph capture) ---
+        if self._verbose:
+            print("  Warming up forward...")
+
+        for h in range(self._H):
+            s = streams[h]
+            check_status(lib.cusparseSetStream(self._handle, c_size_t(s.ptr)),
+                         'cusparseSetStream')
+            with s:
+                self._level_bufs[h][:] = 0
+                ns = self._fwd_scatter_ns[h]
+                if ns > 0:
+                    cp.take(self._fwd_X_gpu, self._fwd_scatter_src[h], axis=0,
+                            out=self._level_bufs[h][:ns])
+            s.synchronize()
+
+            for j in range(h):
+                if self._fwd_sp[h][j] is None:
+                    continue
+                check_status(lib.cusparseSetStream(self._handle, c_size_t(s.ptr)),
+                             'cusparseSetStream')
+                self._spmm(self._fwd_sp[h][j],
+                           self._level_dn[j], self._level_dn[h],
+                           a1, b1, cdt, self._fwd_ext[h][j].data.ptr)
+                s.synchronize()
+
+        # Sel gather warmup (outside graph, exercises CuPy fancy indexing JIT)
+        self._sel_gather(self._fwd_result_gpu, self._level_bufs)
+        self._stream.synchronize()
+
+        # Exercise _fwd_scatter on main stream (used in forward_matmat)
+        self._fwd_scatter()
+        self._stream.synchronize()
+
+        if self._verbose:
+            print("    Forward warmup OK")
+
+        # --- Reset and capture ---
+        for h in range(self._H):
+            self._level_bufs[h][:] = 0
+        cp.cuda.Device().synchronize()
+
+        # Begin capture on main stream
+        check_status(lib.cusparseSetStream(self._handle, c_size_t(self._stream.ptr)),
+                     'cusparseSetStream')
+        self._stream.begin_capture()
+
+        # Fork: main -> all level streams
+        fork_ev = cp.cuda.Event()
+        fork_ev.record(self._stream)
+        for h in range(self._H):
+            streams[h].wait_event(fork_ev)
+
+        # NOTE: scatter (zero + cp.take) runs OUTSIDE the graph in
+        # forward_matmat() via _fwd_scatter().  Level bufs are already
+        # initialized before graph launch; fork event guarantees visibility.
+
+        # ready_events[h]: fired when level_bufs[h] is fully computed
+        ready = [cp.cuda.Event() for _ in range(self._H)]
+
+        # Level 0: ready after fork (scatter done before graph launch)
+        ready[0].record(streams[0])
+
+        # --- Wavefront: for each level h, queue blocks with event waits ---
+        for h in range(1, self._H):
+            check_status(lib.cusparseSetStream(self._handle, c_size_t(streams[h].ptr)),
+                         'cusparseSetStream')
+            for j in range(h):
+                if self._fwd_sp[h][j] is None:
+                    continue
+                streams[h].wait_event(ready[j])
+                self._spmm(self._fwd_sp[h][j],
+                           self._level_dn[j], self._level_dn[h],
+                           a1, b1, cdt, self._fwd_ext[h][j].data.ptr)
+            ready[h].record(streams[h])
+
+        # --- Join all level streams -> main stream ---
+        for h in range(self._H):
+            self._stream.wait_event(ready[h])
+
+        # NOTE: sel gather is NOT captured — runs outside in forward_matmat()
+
+        return self._stream.end_capture()
+
+    # ------------------------------------------------------------------
+    # graph capture (backward wavefront only — sel_T runs outside)
+    # ------------------------------------------------------------------
+
+    def _capture_bwd_graph(self, dtype):
+        """Warm up backward wavefront, then capture as CUDA graph.
+
+        The graph covers: fork -> wavefront SpMMs -> join -> perm gather.
+        sel_T scatter_add runs outside the graph in backward_matmat().
+        Level bufs must be pre-filled with sel_T data before graph launch.
+        """
+        cp = self._cp
+        lib = self._lib
+        cdt = cuda_dtype(dtype)
+        a1, b1 = self._alpha.data.ptr, self._beta_one.data.ptr
+        streams = self._level_streams
+
+        # --- Warmup pass ---
+        if self._verbose:
+            print("  Warming up backward...")
+
+        # sel_T scatter_add warmup (outside graph, exercises CuPy add.at JIT)
+        self._sel_scatter_add(self._bwd_X_gpu, self._level_bufs)
+        self._stream.synchronize()
+
+        # Backward blocks (reverse level order)
+        for h in range(self._H - 2, -1, -1):
+            s = streams[h]
+            for j in reversed(range(len(self._bwd_sp[h]))):
+                if self._bwd_sp[h][j] is None:
+                    continue
+                check_status(lib.cusparseSetStream(self._handle, c_size_t(s.ptr)),
+                             'cusparseSetStream')
+                src = h + 1 + j
+                self._spmm(self._bwd_sp[h][j],
+                           self._level_dn[src], self._level_dn[h],
+                           a1, b1, cdt, self._bwd_ext[h][j].data.ptr)
+                s.synchronize()
+
+        # Perm gather warmup
+        with self._stream:
+            self._bwd_result_gpu[:] = 0
+            for h in range(self._H):
+                if self._bwd_gather_temp[h] is not None:
+                    cp.take(self._level_bufs[h], self._bwd_gather_src[h], axis=0,
+                            out=self._bwd_gather_temp[h])
+                    self._bwd_result_gpu[self._bwd_gather_dst[h]] = \
+                        self._bwd_gather_temp[h]
+        self._stream.synchronize()
+
+        if self._verbose:
+            print("    Backward warmup OK")
+
+        # --- Reset and capture ---
+        # Level bufs will be pre-filled by sel_T scatter_add before graph launch.
+        # During capture they're zero — this is fine, the graph records kernel
+        # code + addresses, not data values.
+        for h in range(self._H):
+            self._level_bufs[h][:] = 0
+        self._bwd_result_gpu[:] = 0
+        cp.cuda.Device().synchronize()
+
+        # Begin capture on main stream
+        check_status(lib.cusparseSetStream(self._handle, c_size_t(self._stream.ptr)),
+                     'cusparseSetStream')
+        self._stream.begin_capture()
+
+        # Fork: main -> all level streams
+        fork_ev = cp.cuda.Event()
+        fork_ev.record(self._stream)
+        for h in range(self._H):
+            streams[h].wait_event(fork_ev)
+
+        # Level H-1: immediately ready (sel_T data already in level_bufs
+        # from before graph launch; no backward SpMMs target it)
+        ready = [cp.cuda.Event() for _ in range(self._H)]
+        ready[self._H - 1].record(streams[self._H - 1])
+
+        # --- Wavefront (reverse): process from H-2 down to 0 ---
+        # SpMMs accumulate (beta=1) into level_bufs which already hold sel_T data
+        for h in range(self._H - 2, -1, -1):
+            check_status(lib.cusparseSetStream(self._handle, c_size_t(streams[h].ptr)),
+                         'cusparseSetStream')
+            for j in reversed(range(len(self._bwd_sp[h]))):
+                if self._bwd_sp[h][j] is None:
+                    continue
+                src = h + 1 + j
+                streams[h].wait_event(ready[src])
+                self._spmm(self._bwd_sp[h][j],
+                           self._level_dn[src], self._level_dn[h],
+                           a1, b1, cdt, self._bwd_ext[h][j].data.ptr)
+            ready[h].record(streams[h])
+
+        # --- Join all level streams -> main stream ---
+        for h in range(self._H):
+            self._stream.wait_event(ready[h])
+
+        # --- Inverse permutation (gather) on main stream ---
+        with self._stream:
+            self._bwd_result_gpu[:] = 0
+            for h in range(self._H):
+                if self._bwd_gather_temp[h] is not None:
+                    cp.take(self._level_bufs[h], self._bwd_gather_src[h], axis=0,
+                            out=self._bwd_gather_temp[h])
+                    self._bwd_result_gpu[self._bwd_gather_dst[h]] = \
+                        self._bwd_gather_temp[h]
+
+        return self._stream.end_capture()
+
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
+
+    def forward_matmat(self, X: np.ndarray) -> np.ndarray:
+        cp = self._cp
+        X = np.atleast_2d(X)
+        k = X.shape[1]
+        dtype = self._dtype
+        use_graph = (self._fwd_exec is not None and k == self._k)
+
+        if use_graph:
+            timer = GpuTimer(cp, self._stream) if self._verbose else None
+            if timer: timer.mark()
+            self._fwd_X_gpu.set(X)
+            if timer: timer.mark('H2D')
+            # Scatter into level_bufs (outside graph — CuPy ops not capture-safe)
+            self._fwd_scatter()
+            self._stream.synchronize()
+            if timer: timer.mark('scatter')
+            # Graph: SpMM wavefront only (no CuPy ops inside)
+            self._fwd_exec.launch(stream=self._stream)
+            self._stream.synchronize()
+            if timer: timer.mark('wavefront')
+            # Sel gather (outside graph)
+            self._sel_gather(self._fwd_result_gpu, self._level_bufs)
+            self._stream.synchronize()
+            if timer: timer.mark('sel')
+            result = self._fwd_result_gpu.get()
+            if timer:
+                timer.mark('D2H')
+                timer.report('forward (graph)')
+            return result
+        else:
+            return self._run_fwd_dynamic(X, k, dtype)
+
+    def backward_matmat(self, X: np.ndarray) -> np.ndarray:
+        cp = self._cp
+        X = np.atleast_2d(X)
+        k = X.shape[1]
+        dtype = self._dtype
+        use_graph = (self._bwd_exec is not None and k == self._k)
+
+        if use_graph:
+            timer = GpuTimer(cp, self._stream) if self._verbose else None
+            if timer: timer.mark()
+            self._bwd_X_gpu.set(X)
+            self._stream.synchronize()
+            if timer: timer.mark('H2D')
+            # sel_T scatter_add (outside graph — not capture-safe)
+            self._sel_scatter_add(self._bwd_X_gpu, self._level_bufs)
+            self._stream.synchronize()
+            if timer: timer.mark('sel_T')
+            self._bwd_exec.launch(stream=self._stream)
+            self._stream.synchronize()
+            if timer: timer.mark('wavefront+perm')
+            result = self._bwd_result_gpu.get()
+            if timer:
+                timer.mark('D2H')
+                timer.report('backward (graph)')
+            return result
+        else:
+            return self._run_bwd_dynamic(X, k, dtype)
+
+    # ------------------------------------------------------------------
+    # dynamic (non-graph) execution
+    # ------------------------------------------------------------------
+
+    def _run_fwd_dynamic(self, X, k, dtype):
+        """Forward pass without CUDA graphs (any k)."""
+        cp = self._cp
+        lib = self._lib
+        off = self._level_offsets
+        cdt = cuda_dtype(dtype)
+        a1, b1 = self._alpha.data.ptr, self._beta_one.data.ptr
+
+        timer = GpuTimer(cp, self._stream) if self._verbose else None
+        if timer: timer.mark()
+
+        # Allocate per-level buffers
+        level_bufs = []
+        for h in range(self._H):
+            sz = int(off[h + 1]) - int(off[h])
+            level_bufs.append(cp.zeros((sz, k), dtype=dtype, order='C'))
+
+        # Scatter permuted input
+        X_gpu = cp.asarray(X, dtype=dtype, order='C')
+        for h in range(self._H):
+            ns = self._fwd_scatter_ns[h]
+            if ns > 0:
+                cp.take(X_gpu, self._fwd_scatter_src[h], axis=0,
+                        out=level_bufs[h][:ns])
+
+        if timer: timer.mark('H2D+scatter')
+
+        # Block SpMMs (single stream)
+        check_status(lib.cusparseSetStream(self._handle, c_size_t(self._stream.ptr)),
+                     'cusparseSetStream')
+        with self._stream:
+            for h in range(1, self._H):
+                for j in range(h):
+                    if self._fwd_sp[h][j] is None:
+                        continue
+                    B_desc = self._create_level_dnmat(level_bufs[j], k, dtype)
+                    C_desc = self._create_level_dnmat(level_bufs[h], k, dtype)
+                    ext = self._spmm_bufsize(
+                        self._fwd_sp[h][j], B_desc, C_desc, a1, b1, cdt)
+                    self._spmm(self._fwd_sp[h][j], B_desc, C_desc,
+                               a1, b1, cdt, ext.data.ptr)
+                    lib.cusparseDestroyDnMat(B_desc)
+                    lib.cusparseDestroyDnMat(C_desc)
+        self._stream.synchronize()
+
+        if timer: timer.mark('wavefront')
+
+        # Sel gather
+        result_gpu = cp.zeros((self._m, k), dtype=dtype, order='C')
+        with self._stream:
+            for h in range(self._H):
+                idx = self._sel_mut_idx[h]
+                if len(idx) > 0:
+                    result_gpu[idx] = level_bufs[h][self._sel_node_local[h]]
+        self._stream.synchronize()
+
+        if timer: timer.mark('sel')
+
+        result = result_gpu.get()
+        if timer:
+            timer.mark('D2H')
+            timer.report('forward (dynamic)')
+        return result
+
+    def _run_bwd_dynamic(self, X, k, dtype):
+        """Backward pass without CUDA graphs (any k)."""
+        cp = self._cp
+        lib = self._lib
+        off = self._level_offsets
+        cdt = cuda_dtype(dtype)
+        a1, b1 = self._alpha.data.ptr, self._beta_one.data.ptr
+
+        timer = GpuTimer(cp, self._stream) if self._verbose else None
+        if timer: timer.mark()
+
+        # Allocate per-level buffers
+        level_bufs = []
+        for h in range(self._H):
+            sz = int(off[h + 1]) - int(off[h])
+            level_bufs.append(cp.zeros((sz, k), dtype=dtype, order='C'))
+
+        # sel_T scatter_add: level_bufs[h] += sel_T rows from X
+        X_gpu = cp.asarray(X, dtype=dtype, order='C')
+        with self._stream:
+            for h in range(self._H):
+                idx = self._sel_mut_idx[h]
+                if len(idx) > 0:
+                    cp.add.at(level_bufs[h], self._sel_node_local[h], X_gpu[idx])
+        self._stream.synchronize()
+
+        if timer: timer.mark('H2D+sel_T')
+
+        # Backward block SpMMs (single stream, reverse level order)
+        check_status(lib.cusparseSetStream(self._handle, c_size_t(self._stream.ptr)),
+                     'cusparseSetStream')
+        with self._stream:
+            for h in range(self._H - 2, -1, -1):
+                for j in reversed(range(len(self._bwd_sp[h]))):
+                    if self._bwd_sp[h][j] is None:
+                        continue
+                    src = h + 1 + j
+                    B_desc = self._create_level_dnmat(level_bufs[src], k, dtype)
+                    C_desc = self._create_level_dnmat(level_bufs[h], k, dtype)
+                    ext = self._spmm_bufsize(
+                        self._bwd_sp[h][j], B_desc, C_desc, a1, b1, cdt)
+                    self._spmm(self._bwd_sp[h][j], B_desc, C_desc,
+                               a1, b1, cdt, ext.data.ptr)
+                    lib.cusparseDestroyDnMat(B_desc)
+                    lib.cusparseDestroyDnMat(C_desc)
+        self._stream.synchronize()
+
+        if timer: timer.mark('wavefront')
+
+        # Inverse permutation (gather)
+        result_gpu = cp.zeros((self._n, k), dtype=dtype, order='C')
+        with self._stream:
+            for h in range(self._H):
+                if len(self._bwd_gather_dst[h]) > 0:
+                    temp = cp.take(level_bufs[h], self._bwd_gather_src[h], axis=0)
+                    result_gpu[self._bwd_gather_dst[h]] = temp
+        self._stream.synchronize()
+
+        result = result_gpu.get()
+        if timer:
+            timer.mark('perm+D2H')
+            timer.report('backward (dynamic)')
+        return result
+
+    # ------------------------------------------------------------------
+    # cleanup
+    # ------------------------------------------------------------------
+
+    def __del__(self):
+        lib = getattr(self, '_lib', None)
+        if lib is None:
+            return
+
+        # Dense descriptors (graph mode)
+        for d in getattr(self, '_level_dn', []):
+            if d is not None:
+                lib.cusparseDestroyDnMat(d)
+
+        # Sparse descriptors
+        for sp_list in (getattr(self, '_fwd_sp', []) +
+                        getattr(self, '_bwd_sp', [])):
+            for d in sp_list:
+                if d is not None:
+                    lib.cusparseDestroySpMat(d)
+
+        handle = getattr(self, '_handle', None)
+        if handle is not None:
+            lib.cusparseDestroy(handle)

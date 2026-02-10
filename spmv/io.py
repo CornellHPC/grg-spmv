@@ -4,19 +4,22 @@ I/O utilities for loading/saving SpMVOperator state.
 import numpy as np
 import scipy.sparse as sp
 
+from spmv import INDEX_DTYPE
 
-def save_operator_npz(op, A_fwd, AT_bwd, npz_path, algo="none"):
+
+def save_operator_npz(op, A_blocks, AT_blocks, npz_path, algo="none"):
     """
     Save SpMVOperator state to NPZ file for fast loading.
-    Stores extracted A_fwd and AT_bwd blocks directly to avoid extraction during load.
+    Stores extracted A_blocks and AT_blocks (list-of-lists) directly.
+
     Parameters
     ----------
     op : SpMVOperator
         The operator to save (for metadata).
-    A_fwd : list of sp.csr_matrix
-        Forward matrices for each level.
-    AT_bwd : list of sp.csr_matrix
-        Backward matrices for each level.
+    A_blocks : list of list of sp.csr_matrix
+        Forward blocks: A_blocks[h][j] for j in range(h).
+    AT_blocks : list of list of sp.csr_matrix
+        Backward blocks: AT_blocks[h][j] for j in range(num_levels-1-h).
     npz_path : str or Path
         Path to save the NPZ file.
     algo : str
@@ -34,27 +37,31 @@ def save_operator_npz(op, A_fwd, AT_bwd, npz_path, algo="none"):
         'sel_T_indices': op.sel_T.indices,
         'sel_T_indptr': op.sel_T.indptr,
     }
-    for h, A in enumerate(A_fwd):
-        save_dict[f'A_fwd_{h}_indices'] = A.indices
-        save_dict[f'A_fwd_{h}_indptr'] = A.indptr
-        save_dict[f'A_fwd_{h}_shape'] = np.array(A.shape)
-    for h, AT in enumerate(AT_bwd):
-        save_dict[f'AT_bwd_{h}_indices'] = AT.indices
-        save_dict[f'AT_bwd_{h}_indptr'] = AT.indptr
-        save_dict[f'AT_bwd_{h}_shape'] = np.array(AT.shape)
+    for h, blocks in enumerate(A_blocks):
+        for j, A in enumerate(blocks):
+            save_dict[f'A_blocks_{h}_{j}_indices'] = A.indices
+            save_dict[f'A_blocks_{h}_{j}_indptr'] = A.indptr
+            save_dict[f'A_blocks_{h}_{j}_shape'] = np.array(A.shape)
+    for h, blocks in enumerate(AT_blocks):
+        for j, AT in enumerate(blocks):
+            save_dict[f'AT_blocks_{h}_{j}_indices'] = AT.indices
+            save_dict[f'AT_blocks_{h}_{j}_indptr'] = AT.indptr
+            save_dict[f'AT_blocks_{h}_{j}_shape'] = np.array(AT.shape)
     np.savez(npz_path, **save_dict)
 
 
 def load_operator_npz(npz_path, dtype):
     """
     Load SpMVOperator state from NPZ file.
-    Loads extracted A_fwd and AT_bwd blocks directly.
+    Loads extracted A_blocks and AT_blocks (list-of-lists) directly.
+
     Parameters
     ----------
     npz_path : str or Path
         Path to the NPZ file.
     dtype : numpy dtype
         Data type for sparse matrix values.
+
     Returns
     -------
     dict
@@ -70,7 +77,7 @@ def load_operator_npz(npz_path, dtype):
         'sample_perm': data['sample_perm'],
     }
     n = result['n']
-    inv_sample_perm = np.empty(n, dtype=np.uint32)
+    inv_sample_perm = np.empty(n, dtype=INDEX_DTYPE)
     inv_sample_perm[result['sample_perm']] = np.arange(n)
     result['_inv_sample_perm'] = inv_sample_perm
 
@@ -88,27 +95,34 @@ def load_operator_npz(npz_path, dtype):
         shape=(result['K'], result['m'])
     )
 
-    result['A_fwd'] = []
+    # Reconstruct list-of-lists: A_blocks[h] has h blocks, AT_blocks[h] has (n_levels-1-h) blocks
+    result['A_blocks'] = []
     for h in range(n_levels):
-        indices = data[f'A_fwd_{h}_indices']
-        indptr = data[f'A_fwd_{h}_indptr']
-        shape = tuple(data[f'A_fwd_{h}_shape'])
-        nnz = len(indices)
-        result['A_fwd'].append(sp.csr_matrix(
-            (np.ones(nnz, dtype=dtype), indices, indptr),
-            shape=shape
-        ))
+        level_blocks = []
+        for j in range(h):
+            indices = data[f'A_blocks_{h}_{j}_indices']
+            indptr = data[f'A_blocks_{h}_{j}_indptr']
+            shape = tuple(data[f'A_blocks_{h}_{j}_shape'])
+            nnz = len(indices)
+            level_blocks.append(sp.csr_matrix(
+                (np.ones(nnz, dtype=dtype), indices, indptr),
+                shape=shape
+            ))
+        result['A_blocks'].append(level_blocks)
 
-    result['AT_bwd'] = []
+    result['AT_blocks'] = []
     for h in range(n_levels):
-        indices = data[f'AT_bwd_{h}_indices']
-        indptr = data[f'AT_bwd_{h}_indptr']
-        shape = tuple(data[f'AT_bwd_{h}_shape'])
-        nnz = len(indices)
-        result['AT_bwd'].append(sp.csr_matrix(
-            (np.ones(nnz, dtype=dtype), indices, indptr),
-            shape=shape
-        ))
+        level_blocks = []
+        for j in range(n_levels - 1 - h):
+            indices = data[f'AT_blocks_{h}_{j}_indices']
+            indptr = data[f'AT_blocks_{h}_{j}_indptr']
+            shape = tuple(data[f'AT_blocks_{h}_{j}_shape'])
+            nnz = len(indices)
+            level_blocks.append(sp.csr_matrix(
+                (np.ones(nnz, dtype=dtype), indices, indptr),
+                shape=shape
+            ))
+        result['AT_blocks'].append(level_blocks)
 
     return result
 
@@ -130,11 +144,11 @@ def _extract_block(M, row_lo, row_hi, col_lo, col_hi, dtype):
     indptr = M.indptr[row_lo:row_hi + 1] - start
     mask = (indices >= col_lo) & (indices < col_hi)
     new_indices = indices[mask] - col_lo
-    mask_uint = mask.astype(np.uint32)
-    cumsum_full = np.zeros(len(mask) + 1, dtype=np.uint32)
+    mask_uint = mask.astype(INDEX_DTYPE)
+    cumsum_full = np.zeros(len(mask) + 1, dtype=INDEX_DTYPE)
     np.cumsum(mask_uint, out=cumsum_full[1:])
     row_counts = cumsum_full[indptr[1:]] - cumsum_full[indptr[:-1]]
-    new_indptr = np.zeros(nrows + 1, dtype=np.uint32)
+    new_indptr = np.zeros(nrows + 1, dtype=INDEX_DTYPE)
     new_indptr[1:] = np.cumsum(row_counts)
     new_data = np.ones(len(new_indices), dtype=dtype)
     return sp.csr_matrix(

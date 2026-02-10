@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from pathlib import Path
 
-from spmv import SpMVOperator
+from spmv import SpMVOperator, DATA_DTYPE
 
 
 # Use small file for faster tests
@@ -46,21 +46,21 @@ def spmv_seq(grg_path):
     for f in path.parent.glob(f"{path.stem}*.npz"):
         f.unlink()
     backend_config = {'type': 'multithread', 'n_workers': 1, 'chunk_size': 4096, 'verbose': True}
-    return SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False)
+    return SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False, dtype=DATA_DTYPE)
 
 
 @pytest.fixture(scope="session")
 def spmv_par(grg_path):
     """Parallel SpMVOperator (n_workers=4)."""
     backend_config = {'type': 'multithread', 'n_workers': 4, 'chunk_size': 4096, 'verbose': False}
-    return SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False)
+    return SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False, dtype=DATA_DTYPE)
 
 
 @pytest.fixture(scope="session")
 def spmv_rcm(grg_path):
     """SpMVOperator with RCM reordering."""
     backend_config = {'type': 'multithread', 'n_workers': 1, 'chunk_size': 4096, 'verbose': False}
-    return SpMVOperator(grg_path, backend_config=backend_config, use_rcm=True)
+    return SpMVOperator(grg_path, backend_config=backend_config, use_rcm=True, dtype=DATA_DTYPE)
 
 
 @pytest.fixture
@@ -69,17 +69,17 @@ def vecs(spmv_seq):
     rng = np.random.default_rng(42)
     n, m = spmv_seq.shape
     return dict(
-        v=rng.standard_normal(n, dtype=np.float32),
-        w=rng.standard_normal(m, dtype=np.float32),
-        V=rng.standard_normal((n, 5), dtype=np.float32),
-        W=rng.standard_normal((m, 5), dtype=np.float32),
+        v=rng.standard_normal(n, dtype=DATA_DTYPE),
+        w=rng.standard_normal(m, dtype=DATA_DTYPE),
+        V=rng.standard_normal((n, 5), dtype=DATA_DTYPE),
+        W=rng.standard_normal((m, 5), dtype=DATA_DTYPE),
     )
 
 
 # ---------------------------------------------------------------------------
 class TestStructure:
     """Tests for operator structure."""
-    
+
     def test_shape(self, example_grg, spmv_seq):
         assert spmv_seq.shape == (example_grg.num_samples, example_grg.num_mutations)
 
@@ -89,15 +89,14 @@ class TestStructure:
         assert np.all(np.diff(off) > 0)
 
     def test_slices_structure(self, spmv_seq):
-        """Forward/backward slices cover all edges with matching nnz."""
+        """Forward/backward blocks cover all edges with matching nnz."""
         off = spmv_seq.level_offsets
         num_levels = len(off) - 1
-        # A_fwd and AT_bwd are now owned by the backend
         backend = spmv_seq._backend
-        assert len(backend._A_fwd) == num_levels
-        assert len(backend._AT_bwd) == num_levels
-        total_fwd = sum(s.nnz for s in backend._A_fwd)
-        total_bwd = sum(s.nnz for s in backend._AT_bwd)
+        assert len(backend._A_blocks) == num_levels
+        assert len(backend._AT_blocks) == num_levels
+        total_fwd = sum(blk.nnz for blocks in backend._A_blocks for blk in blocks)
+        total_bwd = sum(blk.nnz for blocks in backend._AT_blocks for blk in blocks)
         assert total_fwd == total_bwd
         assert total_fwd > 0
 
@@ -110,7 +109,7 @@ class TestStructure:
 # ---------------------------------------------------------------------------
 class TestSequentialVsReference:
     """Test sequential SpMVOperator matches golden standard."""
-    
+
     def test_matvec_G(self, spmv_seq, ref_op, vecs):
         """G @ w matches reference."""
         result = spmv_seq @ vecs['w']
@@ -139,7 +138,7 @@ class TestSequentialVsReference:
 # ---------------------------------------------------------------------------
 class TestParallelVsReference:
     """Test parallel SpMVOperator matches golden standard."""
-    
+
     def test_matvec_G(self, spmv_par, ref_op, vecs):
         """Parallel G @ w matches reference."""
         result = spmv_par @ vecs['w']
@@ -168,7 +167,7 @@ class TestParallelVsReference:
 # ---------------------------------------------------------------------------
 class TestSequentialVsParallel:
     """Test that sequential and parallel produce identical results."""
-    
+
     def test_matvec_G(self, spmv_seq, spmv_par, vecs):
         """Sequential and parallel G @ w are identical."""
         result_seq = spmv_seq @ vecs['w']
@@ -197,7 +196,7 @@ class TestSequentialVsParallel:
 # ---------------------------------------------------------------------------
 class TestAlgebraic:
     """Algebraic property tests."""
-    
+
     def test_adjoint(self, spmv_seq, vecs):
         """<Gw, v> = <w, G^T v>."""
         lhs = np.dot(spmv_seq @ vecs['w'], vecs['v'])
@@ -213,7 +212,7 @@ class TestAlgebraic:
 
     def test_allele_counts(self, spmv_seq):
         """G^T @ 1 gives non-negative integer counts."""
-        counts = spmv_seq.H @ np.ones(spmv_seq.shape[0], dtype=np.float32)
+        counts = spmv_seq.H @ np.ones(spmv_seq.shape[0], dtype=DATA_DTYPE)
         assert np.all(counts >= 0)
         assert np.allclose(counts, np.round(counts))
 
@@ -221,14 +220,14 @@ class TestAlgebraic:
 # ---------------------------------------------------------------------------
 class TestDifferentWorkerCounts:
     """Test correctness with various worker counts."""
-    
+
     @pytest.mark.parametrize("n_workers", [1, 2, 4, 8])
     def test_matvec_G_workers(self, grg_path, ref_op, n_workers):
         """G @ w is correct for different worker counts."""
         backend_config = {'type': 'multithread', 'n_workers': n_workers, 'chunk_size': 4096, 'verbose': False}
-        op = SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False)
+        op = SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False, dtype=DATA_DTYPE)
         rng = np.random.default_rng(123)
-        w = rng.standard_normal(op.m, dtype=np.float32)
+        w = rng.standard_normal(op.m, dtype=DATA_DTYPE)
         result = op @ w
         expected = ref_op @ w
         assert np.allclose(result, expected), f"n_workers={n_workers}, max diff: {np.max(np.abs(result - expected))}"
@@ -237,9 +236,9 @@ class TestDifferentWorkerCounts:
     def test_matvec_GT_workers(self, grg_path, ref_op, n_workers):
         """G^T @ v is correct for different worker counts."""
         backend_config = {'type': 'multithread', 'n_workers': n_workers, 'chunk_size': 4096, 'verbose': False}
-        op = SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False)
+        op = SpMVOperator(grg_path, backend_config=backend_config, use_rcm=False, dtype=DATA_DTYPE)
         rng = np.random.default_rng(123)
-        v = rng.standard_normal(op.n, dtype=np.float32)
+        v = rng.standard_normal(op.n, dtype=DATA_DTYPE)
         result = op.H @ v
         expected = ref_op.H @ v
         assert np.allclose(result, expected), f"n_workers={n_workers}, max diff: {np.max(np.abs(result - expected))}"
@@ -248,7 +247,7 @@ class TestDifferentWorkerCounts:
 # ---------------------------------------------------------------------------
 class TestRCMReordering:
     """Test RCM reordering produces correct results."""
-    
+
     def test_rcm_matvec_G(self, spmv_rcm, ref_op, vecs):
         """RCM G @ w matches reference."""
         result = spmv_rcm @ vecs['w']

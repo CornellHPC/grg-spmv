@@ -11,8 +11,8 @@ import scipy.sparse as sp
 from scipy.sparse.csgraph import reverse_cuthill_mckee
 from scipy.sparse.linalg import LinearOperator
 
+from spmv import INDEX_DTYPE
 from spmv.io import save_operator_npz, load_operator_npz, _extract_block
-from spmv.backends.thread import ThreadBackend
 from spmv.backends.multithread import MultithreadBackend
 
 
@@ -24,7 +24,7 @@ def _create_backend(config: dict[str, Any]):
     ----------
     config : dict
         Backend configuration with keys:
-        - 'type': str - Backend type ('multithread', 'gpu', etc.)
+        - 'type': str - Backend type ('multithread', 'cusparse')
         - Additional backend-specific parameters
 
     Returns
@@ -32,22 +32,26 @@ def _create_backend(config: dict[str, Any]):
     Backend
         Instantiated backend.
     """
-    backend_type = config.get('type', 'thread')
+    backend_type = config.get('type', 'multithread')
     verbose = config.get('verbose', False)
 
-    if backend_type == 'thread':
-        return ThreadBackend(verbose)
-    elif backend_type == 'multithread':
+    if backend_type == 'multithread':
         n_workers = config.get('n_workers', 1)
         chunk_size = config.get('chunk_size', 4096)
         return MultithreadBackend(n_workers, chunk_size, verbose)
+    elif backend_type == 'cusparse':
+        from spmv.backends.cusparse import CusparseBackend
+        fmt = config.get('fmt', 'csr')
+        k = config.get('k', None)
+        algorithm = config.get('algorithm', 'default')
+        return CusparseBackend(fmt=fmt, k=k, algorithm=algorithm, verbose=verbose)
     else:
         raise ValueError(f"Unknown backend type: {backend_type}")
 
 
 class SpMVOperator(LinearOperator):
     """
-    LinearOperator for GRG-based genotype matrix G (n × m).
+    LinearOperator for GRG-based genotype matrix G (n x m).
 
     Replaces a single SpTRSV with H level-wise SpMVs, where H is the
     maximum node height.
@@ -58,12 +62,12 @@ class SpMVOperator(LinearOperator):
         Path to a .grg file.
     backend_config : dict
         Backend configuration with keys:
-        - 'type': str - Backend type ('thread', 'multithread', 'gpu', etc.)
+        - 'type': str - Backend type ('multithread', 'cusparse')
         - Additional backend-specific parameters (e.g., 'n_workers', 'chunk_size')
     use_rcm : bool
-        Apply Reverse Cuthill-McKee reordering for cache locality (default: True).
+        Apply Reverse Cuthill-McKee reordering for cache locality.
     dtype : numpy dtype
-        Data type for computation (default: np.float32).
+        Data type for computation.
 
     Public Attributes
     -----------------
@@ -72,11 +76,11 @@ class SpMVOperator(LinearOperator):
     K : int - Total number of nodes in the GRG.
     level_offsets : ndarray - Boundary indices for height levels.
     sample_perm : ndarray - Maps new sample indices to original.
-    sel : csr_matrix - Selector matrix (m × K).
-    sel_T : csr_matrix - Transposed selector (K × m).
+    sel : csr_matrix - Selector matrix (m x K).
+    sel_T : csr_matrix - Transposed selector (K x m).
     """
 
-    def __init__(self, path, backend_config: dict[str, Any], use_rcm: bool = True, dtype = np.float32):
+    def __init__(self, path, backend_config: dict[str, Any], use_rcm: bool = True, dtype=np.float64):
         self._use_rcm = use_rcm
         self._dtype = np.dtype(dtype)
         self._backend = _create_backend(backend_config)
@@ -93,11 +97,15 @@ class SpMVOperator(LinearOperator):
             print(f"Building SpMVOperator with {path}")
             grg = pygrgl.load_immutable_grg(str(path))
             self._build_from_grg(grg)
-            save_operator_npz(self, self.A_fwd, self.AT_bwd, npz_path, algo)
+            save_operator_npz(self, self.A_blocks, self.AT_blocks, npz_path, algo)
 
-        # Initialize backend with matrices, then release operator references
-        self._backend.setup(self.A_fwd, self.AT_bwd, self.level_offsets)
-        del self.A_fwd, self.AT_bwd
+        # Initialize backend with block-wise matrices and permutations
+        self._backend.setup(
+            self.A_blocks, self.AT_blocks, self.level_offsets,
+            self.n, self.K, self.sel, self.sel_T,
+            self.sample_perm, self._inv_sample_perm, self._dtype,
+        )
+        del self.A_blocks, self.AT_blocks
 
     def _build_from_grg(self, grg):
         """Build SpMVOperator from a GRG object."""
@@ -106,7 +114,7 @@ class SpMVOperator(LinearOperator):
 
         # 1. Extract edges and compute heights
         rows, cols = [], []
-        heights = np.zeros(K, dtype=np.uint32)
+        heights = np.zeros(K, dtype=INDEX_DTYPE)
         for i in range(K):
             children = grg.get_down_edges(i)
             for c in children:
@@ -115,8 +123,8 @@ class SpMVOperator(LinearOperator):
             if children:
                 heights[i] = max(heights[c] for c in children) + 1
         E = len(rows)
-        rows = np.array(rows, dtype=np.uint32)
-        cols = np.array(cols, dtype=np.uint32)
+        rows = np.array(rows, dtype=INDEX_DTYPE)
+        cols = np.array(cols, dtype=INDEX_DTYPE)
 
         # 2. Height-sorted permutation
         perm_height = np.argsort(heights, kind='stable')
@@ -128,7 +136,7 @@ class SpMVOperator(LinearOperator):
         num_levels = len(self.level_offsets) - 1
 
         # 3. Build height-sorted adjacency matrix
-        inv_perm_height = np.empty(K, dtype=np.uint32)
+        inv_perm_height = np.empty(K, dtype=INDEX_DTYPE)
         inv_perm_height[perm_height] = np.arange(K)
         rows_h = inv_perm_height[rows]
         cols_h = inv_perm_height[cols]
@@ -159,13 +167,13 @@ class SpMVOperator(LinearOperator):
                     level_perms[h] = self._min_col_perm(A_block)
 
         # 5. Compose permutations
-        within_perm = np.arange(K, dtype=np.uint32)
+        within_perm = np.arange(K, dtype=INDEX_DTYPE)
         for h in range(num_levels):
             lo, hi = self.level_offsets[h], self.level_offsets[h + 1]
             within_perm[lo:hi] = lo + level_perms[h]
 
         final_perm = perm_height[within_perm]
-        inv_final_perm = np.empty(K, dtype=np.uint32)
+        inv_final_perm = np.empty(K, dtype=INDEX_DTYPE)
         inv_final_perm[final_perm] = np.arange(K)
 
         self.sample_perm = final_perm[:n].copy()
@@ -175,20 +183,35 @@ class SpMVOperator(LinearOperator):
         new_cols = inv_final_perm[cols]
         del rows, cols, A_h
 
-        # 6. Build A and extract blocks with column ranges
-        # Forward: A_fwd[h] has shape (level_size) × (lo) - only needs columns [0:lo]
-        # Backward: AT_bwd[h] has shape (level_size) × (K-hi) - only needs columns [hi:K]
+        # 6. Build A/AT and extract block-wise matrices
+        off = self.level_offsets
         A = sp.csr_matrix((ones_E, (new_rows, new_cols)), shape=(K, K))
-
-        self.A_fwd = []
-        for h in range(num_levels):
-            lo, hi = self.level_offsets[h], self.level_offsets[h + 1]
-            self.A_fwd.append(_extract_block(A, lo, hi, 0, lo, dtype))
         AT = A.T.tocsr()
-        self.AT_bwd = []
+
+        self.A_blocks = []
         for h in range(num_levels):
-            lo, hi = self.level_offsets[h], self.level_offsets[h + 1]
-            self.AT_bwd.append(_extract_block(AT, lo, hi, hi, K, dtype))
+            lo, hi = off[h], off[h + 1]
+            self.A_blocks.append([
+                _extract_block(A, lo, hi, off[j], off[j + 1], dtype)
+                for j in range(h)
+            ])
+
+        self.AT_blocks = []
+        for h in range(num_levels):
+            lo, hi = off[h], off[h + 1]
+            self.AT_blocks.append([
+                _extract_block(AT, lo, hi, off[j], off[j + 1], dtype)
+                for j in range(h + 1, num_levels)
+            ])
+
+        # Assert block shapes
+        for h in range(num_levels):
+            assert len(self.A_blocks[h]) == h
+            for j, blk in enumerate(self.A_blocks[h]):
+                assert blk.shape == (off[h+1]-off[h], off[j+1]-off[j])
+            assert len(self.AT_blocks[h]) == num_levels - 1 - h
+            for j, blk in enumerate(self.AT_blocks[h]):
+                assert blk.shape == (off[h+1]-off[h], off[h+2+j]-off[h+1+j])
 
         # 7. Selector matrix
         pairs = grg.get_mutation_node_pairs()
@@ -199,8 +222,8 @@ class SpMVOperator(LinearOperator):
                 pair_mut_ids.append(mid)
                 pair_node_ids_orig.append(nid)
 
-        pair_mut_ids = np.array(pair_mut_ids, dtype=np.uint32)
-        pair_node_ids = inv_final_perm[np.array(pair_node_ids_orig, dtype=np.uint32)]
+        pair_mut_ids = np.array(pair_mut_ids, dtype=INDEX_DTYPE)
+        pair_node_ids = inv_final_perm[np.array(pair_node_ids_orig, dtype=INDEX_DTYPE)]
         del pair_node_ids_orig
 
         sel_ones = np.ones(len(pair_mut_ids), dtype=dtype)
@@ -248,7 +271,7 @@ class SpMVOperator(LinearOperator):
             if i not in col_set:
                 col_indices.append(i)
 
-        return np.array(row_indices, dtype=np.uint32), np.array(col_indices, dtype=np.uint32)
+        return np.array(row_indices, dtype=INDEX_DTYPE), np.array(col_indices, dtype=INDEX_DTYPE)
 
     @staticmethod
     def _min_col_perm(A):
@@ -260,7 +283,7 @@ class SpMVOperator(LinearOperator):
             s, e = A_csr.indptr[i], A_csr.indptr[i + 1]
             if e > s:
                 min_col[i] = A_csr.indices[s:e].min()
-        return np.argsort(min_col, kind='stable').astype(np.uint32)
+        return np.argsort(min_col, kind='stable').astype(INDEX_DTYPE)
 
     def _load_from_npz(self, npz_path):
         """Load operator state from NPZ file."""
@@ -273,22 +296,14 @@ class SpMVOperator(LinearOperator):
         self._inv_sample_perm = data['_inv_sample_perm']
         self.sel = data['sel']
         self.sel_T = data['sel_T']
-        self.A_fwd = data['A_fwd']
-        self.AT_bwd = data['AT_bwd']
+        self.A_blocks = data['A_blocks']
+        self.AT_blocks = data['AT_blocks']
         super().__init__(dtype=self._dtype, shape=(self.n, self.m))
 
     def _matmat(self, X):
-        """G @ X for matrix X (m × k)."""
-        X_arr = np.atleast_2d(X)
-        R = self.sel_T @ X_arr
-        R = self._backend.backward_matmat(R)
-        return R[self._inv_sample_perm, :]
+        """G @ X for matrix X (m x k)."""
+        return self._backend.backward_matmat(np.atleast_2d(X))
 
     def _rmatmat(self, X):
-        """G^T @ X for matrix X (n × k)."""
-        X_arr = np.atleast_2d(X)
-        n_vecs = X_arr.shape[1]
-        U = np.zeros((self.K, n_vecs), dtype=self._dtype)
-        U[:self.n, :] = X_arr[self.sample_perm, :]
-        U = self._backend.forward_matmat(U)
-        return self.sel @ U
+        """G^T @ X for matrix X (n x k)."""
+        return self._backend.forward_matmat(np.atleast_2d(X))

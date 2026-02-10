@@ -36,9 +36,6 @@ class MultithreadBackend(Backend):
         self._n_workers = multiprocessing.cpu_count() if n_workers == 0 else n_workers
         self._chunk_size = chunk_size
         self._verbose = verbose
-        self._A_fwd = None
-        self._AT_bwd = None
-        self._level_offsets = None
 
     @property
     def n_workers(self) -> int:
@@ -46,67 +43,103 @@ class MultithreadBackend(Backend):
 
     def setup(
         self,
-        A_fwd: List[sp.csr_matrix],
-        AT_bwd: List[sp.csr_matrix],
-        level_offsets: np.ndarray
+        A_blocks: List[List[sp.csr_matrix]],
+        AT_blocks: List[List[sp.csr_matrix]],
+        level_offsets: np.ndarray,
+        n: int,
+        K: int,
+        sel: sp.csr_matrix,
+        sel_T: sp.csr_matrix,
+        sample_perm: np.ndarray,
+        inv_sample_perm: np.ndarray,
+        dtype: np.dtype,
     ) -> None:
-        """Store references to the sparse matrices and level offsets."""
-        self._A_fwd = A_fwd
-        self._AT_bwd = AT_bwd
+        """Store references to block-wise sparse matrices and permutations."""
+        self._A_blocks = A_blocks
+        self._AT_blocks = AT_blocks
         self._level_offsets = level_offsets
+        self._n = n
+        self._K = K
+        self._sel = sel
+        self._sel_T = sel_T
+        self._sample_perm = sample_perm
+        self._inv_sample_perm = inv_sample_perm
+        self._dtype = dtype
         if self._verbose:
-            total_nnz_fwd = sum(A.nnz for A in A_fwd)
-            total_nnz_bwd = sum(A.nnz for A in AT_bwd)
-            print(f"MultithreadBackend setup: {len(A_fwd)} levels")
-            print(f"  A_fwd total nnz: {total_nnz_fwd:,}")
-            print(f"  AT_bwd total nnz: {total_nnz_bwd:,}")
-            for h in range(len(A_fwd)):
+            total_nnz_fwd = sum(blk.nnz for blocks in A_blocks for blk in blocks)
+            total_nnz_bwd = sum(blk.nnz for blocks in AT_blocks for blk in blocks)
+            print(f"MultithreadBackend setup: {len(A_blocks)} levels")
+            print(f"  A_blocks total nnz: {total_nnz_fwd:,}")
+            print(f"  AT_blocks total nnz: {total_nnz_bwd:,}")
+            for h in range(len(A_blocks)):
                 lo, hi = level_offsets[h], level_offsets[h + 1]
-                print(f"  Level {h}: A_fwd={A_fwd[h].shape}, AT_bwd={AT_bwd[h].shape}")
+                fwd_shapes = [blk.shape for blk in A_blocks[h]]
+                bwd_shapes = [blk.shape for blk in AT_blocks[h]]
+                print(f"  Level {h}: A_blocks={fwd_shapes}, AT_blocks={bwd_shapes}")
 
-    def forward_matmat(self, U: np.ndarray) -> np.ndarray:
+    def forward_matmat(self, X: np.ndarray) -> np.ndarray:
         """
-        Compute forward pass: U[lo:hi] = A_fwd[h] @ U[:lo] for each level h.
-        
-        A_fwd[h] has shape (hi-lo) × lo, so multiply by U[:lo].
+        Compute G^T @ X: (n x k) -> (m x k).
+
+        1. U = zeros(K, k); U[:n] = X[sample_perm]
+        2. For h=1..H-1: for j<h: U[off[h]:off[h+1]] += A_blocks[h][j] @ U[off[j]:off[j+1]]
+        3. Return sel @ U
         """
         off = self._level_offsets
+        X = np.atleast_2d(X)
+        k = X.shape[1]
+        U = np.zeros((self._K, k), dtype=self._dtype)
+        U[:self._n] = X[self._sample_perm]
+
         if self._verbose:
-            print(f"Forward pass: U.shape={U.shape}")
+            print(f"Forward pass: X.shape={X.shape}")
+
         for h in range(1, len(off) - 1):
             lo, hi = off[h], off[h + 1]
-            if self._verbose:
-                t0 = perf_counter()
-            # A_fwd[h] has columns [0:lo], so multiply by U[:lo]
-            U[lo:hi] = self._spmv(self._A_fwd[h], U[:lo])
-            if self._verbose:
-                elapsed = (perf_counter() - t0) * 1e3
-                print(f"  Level {h}: A_fwd[{h}].shape={self._A_fwd[h].shape}, "
-                      f"nnz={self._A_fwd[h].nnz:,}, time={elapsed:.2f}ms")
-        return U
+            for j, blk in enumerate(self._A_blocks[h]):
+                jlo, jhi = off[j], off[j + 1]
+                if blk.nnz == 0:
+                    continue
+                if self._verbose:
+                    t0 = perf_counter()
+                U[lo:hi] += self._spmv(blk, U[jlo:jhi])
+                if self._verbose:
+                    elapsed = (perf_counter() - t0) * 1e3
+                    print(f"  Level {h}, block {j}: shape={blk.shape}, "
+                          f"nnz={blk.nnz:,}, time={elapsed:.2f}ms")
 
-    def backward_matmat(self, V: np.ndarray) -> np.ndarray:
+        return self._spmv(self._sel, U)
+
+    def backward_matmat(self, X: np.ndarray) -> np.ndarray:
         """
-        Compute backward pass: V[lo:hi] += AT_bwd[h] @ V[hi:] for each level h in reverse.
-        
-        AT_bwd[h] has shape (hi-lo) × (K-hi), so multiply by V[hi:].
+        Compute G @ X: (m x k) -> (n x k).
+
+        1. V = sel_T @ X
+        2. For h=H-2..0: for j, block in AT_blocks[h]: V[off[h]:off[h+1]] += block @ V[off[h+1+j]:off[h+2+j]]
+        3. Return V[inv_sample_perm]
         """
         off = self._level_offsets
-        K = off[-1]
+        X = np.atleast_2d(X)
+        V = self._spmv(self._sel_T, X)
+
         if self._verbose:
-            print(f"Backward pass: V.shape={V.shape}")
-        # Process levels from H-1 down to 0 (inclusive)
+            print(f"Backward pass: X.shape={X.shape}")
+
         for h in range(len(off) - 2, -1, -1):
             lo, hi = off[h], off[h + 1]
-            if self._verbose:
-                t0 = perf_counter()
-            # AT_bwd[h] has columns [hi:K], so multiply by V[hi:]
-            V[lo:hi] += self._spmv(self._AT_bwd[h], V[hi:])
-            if self._verbose:
-                elapsed = (perf_counter() - t0) * 1e3
-                print(f"  Level {h}: AT_bwd[{h}].shape={self._AT_bwd[h].shape}, "
-                      f"nnz={self._AT_bwd[h].nnz:,}, time={elapsed:.2f}ms")
-        return V
+            for j, blk in enumerate(self._AT_blocks[h]):
+                src_lo, src_hi = off[h + 1 + j], off[h + 2 + j]
+                if blk.nnz == 0:
+                    continue
+                if self._verbose:
+                    t0 = perf_counter()
+                V[lo:hi] += self._spmv(blk, V[src_lo:src_hi])
+                if self._verbose:
+                    elapsed = (perf_counter() - t0) * 1e3
+                    print(f"  Level {h}, block {j}: shape={blk.shape}, "
+                          f"nnz={blk.nnz:,}, time={elapsed:.2f}ms")
+
+        return V[self._inv_sample_perm]
 
     @staticmethod
     def _csr_row_slice(A: sp.csr_matrix, start: int, end: int) -> sp.csr_matrix:

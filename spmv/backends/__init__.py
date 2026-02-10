@@ -15,68 +15,71 @@ class Backend(ABC):
     """
     Abstract base class for SpMV backends.
 
-    A backend computes level-wise forward and backward passes for SpMV.
-    Implementations may use CPU threads, GPU, or distributed systems.
-    
-    Block extraction optimization:
-    - A_fwd[h] has shape (level_size) × (level_offsets[h]) 
-      - Contains columns [0:lo], multiplied by U[:lo]
-    - AT_bwd[h] has shape (level_size) × (K - level_offsets[h+1])
-      - Contains columns [hi:K], multiplied by V[hi:]
+    A backend computes the full G^T @ X (forward) and G @ X (backward) pipelines,
+    including pre/post-permutation and the selector multiply.
+
+    Block structure:
+    - A_blocks[h][j] has shape (off[h+1]-off[h]) x (off[j+1]-off[j]) for j < h
+    - AT_blocks[h][j] has shape (off[h+1]-off[h]) x (off[h+2+j]-off[h+1+j])
     """
 
     @abstractmethod
     def setup(
         self,
-        A_fwd: List[sp.csr_matrix],
-        AT_bwd: List[sp.csr_matrix],
-        level_offsets: np.ndarray
+        A_blocks: List[List[sp.csr_matrix]],
+        AT_blocks: List[List[sp.csr_matrix]],
+        level_offsets: np.ndarray,
+        n: int,
+        K: int,
+        sel: sp.csr_matrix,
+        sel_T: sp.csr_matrix,
+        sample_perm: np.ndarray,
+        inv_sample_perm: np.ndarray,
+        dtype: np.dtype,
     ) -> None:
         """
-        Initialize the backend with the sparse matrices.
-        
+        Initialize the backend with block-wise sparse matrices and permutations.
+
         Parameters
         ----------
-        A_fwd : List[csr_matrix]
-            Forward matrices for each level.
-        AT_bwd : List[csr_matrix]
-            Backward matrices for each level.
+        A_blocks : list of list of csr_matrix
+            Forward blocks: A_blocks[h][j] for j in range(h).
+        AT_blocks : list of list of csr_matrix
+            Backward blocks: AT_blocks[h][j] for j in range(num_levels-1-h).
         level_offsets : np.ndarray
             Level boundary indices.
+        n : int
+            Number of samples.
+        K : int
+            Total number of nodes.
+        sel : csr_matrix
+            Selector matrix (m x K).
+        sel_T : csr_matrix
+            Transposed selector (K x m).
+        sample_perm : np.ndarray
+            Maps new sample indices to original.
+        inv_sample_perm : np.ndarray
+            Inverse of sample_perm.
+        dtype : np.dtype
+            Data type for computation.
         """
         pass
 
     @abstractmethod
-    def forward_matmat(self, U: np.ndarray) -> np.ndarray:
+    def forward_matmat(self, X: np.ndarray) -> np.ndarray:
         """
-        Compute forward pass: U[lo:hi] = A_fwd[h] @ U[:lo] for each level h.
+        Compute G^T @ X: (n x k) -> (m x k).
 
-        Parameters
-        ----------
-        U : np.ndarray
-            Input/output matrix (K × k) to update in-place.
-
-        Returns
-        -------
-        np.ndarray
-            Updated U matrix.
+        Full pipeline: permute samples, level-wise forward SpMM, selector multiply.
         """
         pass
 
     @abstractmethod
-    def backward_matmat(self, V: np.ndarray) -> np.ndarray:
+    def backward_matmat(self, X: np.ndarray) -> np.ndarray:
         """
-        Compute backward pass: V[lo:hi] += AT_bwd[h] @ V[hi:] for each level h in reverse.
+        Compute G @ X: (m x k) -> (n x k).
 
-        Parameters
-        ----------
-        V : np.ndarray
-            Input/output matrix (K × k) to update in-place.
-
-        Returns
-        -------
-        np.ndarray
-            Updated V matrix.
+        Full pipeline: selector^T multiply, level-wise backward SpMM, inverse permute.
         """
         pass
 
