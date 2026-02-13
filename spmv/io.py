@@ -4,8 +4,6 @@ I/O utilities for loading/saving SpMVOperator state.
 import numpy as np
 import scipy.sparse as sp
 
-from spmv import INDEX_DTYPE
-
 
 def save_operator_npz(op, A_blocks, AT_blocks, npz_path, algo="none"):
     """
@@ -50,7 +48,7 @@ def save_operator_npz(op, A_blocks, AT_blocks, npz_path, algo="none"):
     np.savez(npz_path, **save_dict)
 
 
-def load_operator_npz(npz_path, dtype):
+def load_operator_npz(npz_path, dtype, index_dtype):
     """
     Load SpMVOperator state from NPZ file.
     Loads extracted A_blocks and AT_blocks (list-of-lists) directly.
@@ -61,6 +59,8 @@ def load_operator_npz(npz_path, dtype):
         Path to the NPZ file.
     dtype : numpy dtype
         Data type for sparse matrix values.
+    index_dtype : numpy dtype
+        Index dtype for permutation arrays.
 
     Returns
     -------
@@ -77,7 +77,7 @@ def load_operator_npz(npz_path, dtype):
         'sample_perm': data['sample_perm'],
     }
     n = result['n']
-    inv_sample_perm = np.empty(n, dtype=INDEX_DTYPE)
+    inv_sample_perm = np.empty(n, dtype=index_dtype)
     inv_sample_perm[result['sample_perm']] = np.arange(n)
     result['_inv_sample_perm'] = inv_sample_perm
 
@@ -127,7 +127,7 @@ def load_operator_npz(npz_path, dtype):
     return result
 
 
-def _extract_block(M, row_lo, row_hi, col_lo, col_hi, dtype):
+def _extract_block(M, row_lo, row_hi, col_lo, col_hi, dtype, index_dtype):
     """
     Extract a block M[row_lo:row_hi, col_lo:col_hi] as an independent CSR matrix.
     """
@@ -144,11 +144,11 @@ def _extract_block(M, row_lo, row_hi, col_lo, col_hi, dtype):
     indptr = M.indptr[row_lo:row_hi + 1] - start
     mask = (indices >= col_lo) & (indices < col_hi)
     new_indices = indices[mask] - col_lo
-    mask_uint = mask.astype(INDEX_DTYPE)
-    cumsum_full = np.zeros(len(mask) + 1, dtype=INDEX_DTYPE)
+    mask_uint = mask.astype(index_dtype)
+    cumsum_full = np.zeros(len(mask) + 1, dtype=index_dtype)
     np.cumsum(mask_uint, out=cumsum_full[1:])
     row_counts = cumsum_full[indptr[1:]] - cumsum_full[indptr[:-1]]
-    new_indptr = np.zeros(nrows + 1, dtype=INDEX_DTYPE)
+    new_indptr = np.zeros(nrows + 1, dtype=index_dtype)
     new_indptr[1:] = np.cumsum(row_counts)
     new_data = np.ones(len(new_indices), dtype=dtype)
     return sp.csr_matrix(

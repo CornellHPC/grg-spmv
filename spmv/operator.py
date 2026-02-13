@@ -11,7 +11,6 @@ import scipy.sparse as sp
 from scipy.sparse.csgraph import reverse_cuthill_mckee
 from scipy.sparse.linalg import LinearOperator
 
-from spmv import INDEX_DTYPE
 from spmv.io import save_operator_npz, load_operator_npz, _extract_block
 from spmv.backends.multithread import MultithreadBackend
 
@@ -64,10 +63,12 @@ class SpMVOperator(LinearOperator):
         Backend configuration with keys:
         - 'type': str - Backend type ('multithread', 'cusparse')
         - Additional backend-specific parameters (e.g., 'n_workers', 'chunk_size')
-    use_rcm : bool
-        Apply Reverse Cuthill-McKee reordering for cache locality.
     dtype : numpy dtype
         Data type for computation.
+    index_dtype : numpy dtype
+        Index data type for permutation arrays and indices.
+    use_rcm : bool
+        Apply Reverse Cuthill-McKee reordering for cache locality.
 
     Public Attributes
     -----------------
@@ -80,9 +81,10 @@ class SpMVOperator(LinearOperator):
     sel_T : csr_matrix - Transposed selector (K x m).
     """
 
-    def __init__(self, path, backend_config: dict[str, Any], use_rcm: bool = True, dtype=np.float64):
+    def __init__(self, path, backend_config: dict[str, Any], dtype, index_dtype, use_rcm: bool = True):
         self._use_rcm = use_rcm
         self._dtype = np.dtype(dtype)
+        self._index_dtype = np.dtype(index_dtype)
         self._backend = _create_backend(backend_config)
 
         path = Path(path)
@@ -111,10 +113,11 @@ class SpMVOperator(LinearOperator):
         """Build SpMVOperator from a GRG object."""
         n, m, K = grg.num_samples, grg.num_mutations, grg.num_nodes
         dtype = self._dtype
+        index_dtype = self._index_dtype
 
         # 1. Extract edges and compute heights
         rows, cols = [], []
-        heights = np.zeros(K, dtype=INDEX_DTYPE)
+        heights = np.zeros(K, dtype=index_dtype)
         for i in range(K):
             children = grg.get_down_edges(i)
             for c in children:
@@ -123,8 +126,8 @@ class SpMVOperator(LinearOperator):
             if children:
                 heights[i] = max(heights[c] for c in children) + 1
         E = len(rows)
-        rows = np.array(rows, dtype=INDEX_DTYPE)
-        cols = np.array(cols, dtype=INDEX_DTYPE)
+        rows = np.array(rows, dtype=index_dtype)
+        cols = np.array(cols, dtype=index_dtype)
 
         # 2. Height-sorted permutation
         perm_height = np.argsort(heights, kind='stable')
@@ -136,7 +139,7 @@ class SpMVOperator(LinearOperator):
         num_levels = len(self.level_offsets) - 1
 
         # 3. Build height-sorted adjacency matrix
-        inv_perm_height = np.empty(K, dtype=INDEX_DTYPE)
+        inv_perm_height = np.empty(K, dtype=index_dtype)
         inv_perm_height[perm_height] = np.arange(K)
         rows_h = inv_perm_height[rows]
         cols_h = inv_perm_height[cols]
@@ -159,21 +162,21 @@ class SpMVOperator(LinearOperator):
                 if h == 1:
                     # Level 1: jointly permute rows (level 1) AND columns (level 0)
                     # via bipartite RCM for optimal cache locality
-                    row_perm, col_perm = self._rcm_bipartite(A_block)
+                    row_perm, col_perm = self._rcm_bipartite(A_block, index_dtype)
                     level_perms[1] = row_perm
                     level_perms[0] = col_perm
                 else:
                     # Levels 2+: columns already fixed; sort rows by min column index
-                    level_perms[h] = self._min_col_perm(A_block)
+                    level_perms[h] = self._min_col_perm(A_block, index_dtype)
 
         # 5. Compose permutations
-        within_perm = np.arange(K, dtype=INDEX_DTYPE)
+        within_perm = np.arange(K, dtype=index_dtype)
         for h in range(num_levels):
             lo, hi = self.level_offsets[h], self.level_offsets[h + 1]
             within_perm[lo:hi] = lo + level_perms[h]
 
         final_perm = perm_height[within_perm]
-        inv_final_perm = np.empty(K, dtype=INDEX_DTYPE)
+        inv_final_perm = np.empty(K, dtype=index_dtype)
         inv_final_perm[final_perm] = np.arange(K)
 
         self.sample_perm = final_perm[:n].copy()
@@ -192,7 +195,7 @@ class SpMVOperator(LinearOperator):
         for h in range(num_levels):
             lo, hi = off[h], off[h + 1]
             self.A_blocks.append([
-                _extract_block(A, lo, hi, off[j], off[j + 1], dtype)
+                _extract_block(A, lo, hi, off[j], off[j + 1], dtype, index_dtype)
                 for j in range(h)
             ])
 
@@ -200,7 +203,7 @@ class SpMVOperator(LinearOperator):
         for h in range(num_levels):
             lo, hi = off[h], off[h + 1]
             self.AT_blocks.append([
-                _extract_block(AT, lo, hi, off[j], off[j + 1], dtype)
+                _extract_block(AT, lo, hi, off[j], off[j + 1], dtype, index_dtype)
                 for j in range(h + 1, num_levels)
             ])
 
@@ -222,8 +225,8 @@ class SpMVOperator(LinearOperator):
                 pair_mut_ids.append(mid)
                 pair_node_ids_orig.append(nid)
 
-        pair_mut_ids = np.array(pair_mut_ids, dtype=INDEX_DTYPE)
-        pair_node_ids = inv_final_perm[np.array(pair_node_ids_orig, dtype=INDEX_DTYPE)]
+        pair_mut_ids = np.array(pair_mut_ids, dtype=index_dtype)
+        pair_node_ids = inv_final_perm[np.array(pair_node_ids_orig, dtype=index_dtype)]
         del pair_node_ids_orig
 
         sel_ones = np.ones(len(pair_mut_ids), dtype=dtype)
@@ -236,7 +239,7 @@ class SpMVOperator(LinearOperator):
         super().__init__(dtype=dtype, shape=(n, m))
 
     @staticmethod
-    def _rcm_bipartite(A):
+    def _rcm_bipartite(A, index_dtype):
         """
         Bipartite RCM for a rectangular block A_{h,h-1}.
 
@@ -271,10 +274,10 @@ class SpMVOperator(LinearOperator):
             if i not in col_set:
                 col_indices.append(i)
 
-        return np.array(row_indices, dtype=INDEX_DTYPE), np.array(col_indices, dtype=INDEX_DTYPE)
+        return np.array(row_indices, dtype=index_dtype), np.array(col_indices, dtype=index_dtype)
 
     @staticmethod
-    def _min_col_perm(A):
+    def _min_col_perm(A, index_dtype):
         """Sort rows by their minimum column index (cache-friendly ordering)."""
         A_csr = sp.csr_matrix(A)
         nrows, ncols = A_csr.shape
@@ -283,11 +286,11 @@ class SpMVOperator(LinearOperator):
             s, e = A_csr.indptr[i], A_csr.indptr[i + 1]
             if e > s:
                 min_col[i] = A_csr.indices[s:e].min()
-        return np.argsort(min_col, kind='stable').astype(INDEX_DTYPE)
+        return np.argsort(min_col, kind='stable').astype(index_dtype)
 
     def _load_from_npz(self, npz_path):
         """Load operator state from NPZ file."""
-        data = load_operator_npz(npz_path, self._dtype)
+        data = load_operator_npz(npz_path, self._dtype, self._index_dtype)
         self.n = data['n']
         self.m = data['m']
         self.K = data['K']

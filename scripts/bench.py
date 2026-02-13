@@ -7,19 +7,19 @@ from time import perf_counter
 
 import numpy as np
 
-from spmv import SpMVOperator, DATA_DTYPE
+from spmv import SpMVOperator
+from spmv.backends.cusparse import is_valid_combo
+
+DTYPE = np.float64
+INDEX_DTYPE = np.uintp
 
 
 def _make_vectors(op, k, seed=42):
     """Create random test vectors."""
     rng = np.random.default_rng(seed)
     n, m = op.n, op.m
-    if k == 1:
-        W = rng.standard_normal(m, dtype=DATA_DTYPE)
-        V = rng.standard_normal(n, dtype=DATA_DTYPE)
-    else:
-        W = rng.standard_normal((m, k), dtype=DATA_DTYPE)
-        V = rng.standard_normal((n, k), dtype=DATA_DTYPE)
+    W = rng.standard_normal((m, k), dtype=DTYPE)
+    V = rng.standard_normal((n, k), dtype=DTYPE)
     return W, V
 
 
@@ -32,19 +32,21 @@ def _time_op(op, W, V, n_warmup, n_trials):
 
     # Time G @ W (backward_matmat in the backend)
     times_fwd = []
+    result_fwd = None
     for _ in range(n_trials):
         t0 = perf_counter()
-        _ = op @ W
+        result_fwd = op @ W
         times_fwd.append(perf_counter() - t0)
 
     # Time G^T @ V (forward_matmat in the backend)
     times_bwd = []
+    result_bwd = None
     for _ in range(n_trials):
         t0 = perf_counter()
-        _ = op.H @ V
+        result_bwd = op.H @ V
         times_bwd.append(perf_counter() - t0)
 
-    return times_fwd, times_bwd
+    return times_fwd, times_bwd, result_fwd, result_bwd
 
 
 def benchmark_cpu(grg_path, k, n_trials, n_warmup, worker_counts, chunk_size):
@@ -60,11 +62,11 @@ def benchmark_cpu(grg_path, k, n_trials, n_warmup, worker_counts, chunk_size):
             'type': 'multithread', 'n_workers': n_workers,
             'chunk_size': chunk_size, 'verbose': True
         }
-        op = SpMVOperator(grg_path, backend_config=backend_config, use_rcm=True, dtype=DATA_DTYPE)
+        op = SpMVOperator(grg_path, backend_config, DTYPE, INDEX_DTYPE, use_rcm=True)
         build_time = perf_counter() - t0
 
         W, V = _make_vectors(op, k)
-        times_fwd, times_bwd = _time_op(op, W, V, n_warmup, n_trials)
+        times_fwd, times_bwd, result_fwd, result_bwd = _time_op(op, W, V, n_warmup, n_trials)
 
         results.append({
             'label': f'cpu-{n_workers}w',
@@ -73,6 +75,8 @@ def benchmark_cpu(grg_path, k, n_trials, n_warmup, worker_counts, chunk_size):
             'fwd_std': np.std(times_fwd) * 1000,
             'bwd_mean': np.mean(times_bwd) * 1000,
             'bwd_std': np.std(times_bwd) * 1000,
+            'fwd_cksum': np.linalg.norm(result_fwd),
+            'bwd_cksum': np.linalg.norm(result_bwd),
         })
 
         print(f"  Build: {build_time:.2f}s")
@@ -84,18 +88,8 @@ def benchmark_cpu(grg_path, k, n_trials, n_warmup, worker_counts, chunk_size):
 
 def filter_valid_combinations(fmts, algorithms):
     """Filter out invalid (format, algorithm) combinations."""
-    valid = []
-    for fmt in fmts:
-        for alg in algorithms:
-            # COO algorithms only work with COO format
-            if alg.startswith('coo_') and fmt != 'coo':
-                continue
-            # CSR_ALG3 only works with CSR format
-            if alg == 'csr_alg3' and fmt != 'csr':
-                continue
-            # CSR_ALG1/2 and default work with any format
-            valid.append((fmt, alg))
-    return valid
+    return [(fmt, alg) for fmt in fmts for alg in algorithms
+            if is_valid_combo(fmt, alg)]
 
 
 def _parse_verbose_timing(line):
@@ -148,7 +142,7 @@ def benchmark_gpu(grg_path, k, n_trials, n_warmup, fmts, graph_ks, algorithms):
                 op_verbose = SpMVOperator(grg_path, {
                     'type': 'cusparse', 'fmt': fmt, 'k': graph_k,
                     'algorithm': algorithm, 'verbose': True
-                }, use_rcm=True, dtype=DATA_DTYPE)
+                }, DTYPE, INDEX_DTYPE, use_rcm=True)
                 build_time = perf_counter() - t0
 
                 W, V = _make_vectors(op_verbose, k)
@@ -182,9 +176,9 @@ def benchmark_gpu(grg_path, k, n_trials, n_warmup, fmts, graph_ks, algorithms):
             op = SpMVOperator(grg_path, {
                 'type': 'cusparse', 'fmt': fmt, 'k': graph_k,
                 'algorithm': algorithm, 'verbose': False
-            }, use_rcm=True, dtype=DATA_DTYPE)
+            }, DTYPE, INDEX_DTYPE, use_rcm=True)
             W, V = _make_vectors(op, k)
-            times_fwd, times_bwd = _time_op(op, W, V, n_warmup, n_trials)
+            times_fwd, times_bwd, result_fwd, result_bwd = _time_op(op, W, V, n_warmup, n_trials)
 
             result = {
                 'label': label,
@@ -193,6 +187,8 @@ def benchmark_gpu(grg_path, k, n_trials, n_warmup, fmts, graph_ks, algorithms):
                 'fwd_std': np.std(times_fwd) * 1000,
                 'bwd_mean': np.mean(times_bwd) * 1000,
                 'bwd_std': np.std(times_bwd) * 1000,
+                'fwd_cksum': np.linalg.norm(result_fwd),
+                'bwd_cksum': np.linalg.norm(result_bwd),
             }
 
             # Add timing components if available
@@ -285,6 +281,19 @@ def print_summary_detailed(results, k):
               f"{total_bwd:>14.2f}")
 
 
+def print_checksums(results, k):
+    """Print checksum comparison table for sanity checking results."""
+    print("\n" + "=" * 75)
+    print(f"CHECKSUMS (k={k})")
+    print("=" * 75)
+    print(f"{'Config':<32} {'G@W norm':>16} {'G^T@V norm':>16}")
+    print("-" * 75)
+    for r in results:
+        print(f"{r['label']:<32} "
+              f"{r['fwd_cksum']:>16.4f} "
+              f"{r['bwd_cksum']:>16.4f}")
+
+
 def _parse_graph_ks(s):
     """Parse comma-separated graph_k values ('none,1,4' -> [None, 1, 4])."""
     out = []
@@ -350,6 +359,7 @@ if __name__ == "__main__":
         all_results.extend(gpu_results)
 
     print_summary(all_results, args.k)
+    print_checksums(all_results, args.k)
 
     # Print detailed breakdown for GPU results if available
     if args.backend in ("cusparse", "all"):

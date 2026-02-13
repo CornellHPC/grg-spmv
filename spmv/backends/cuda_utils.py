@@ -83,6 +83,10 @@ def parse_algorithm(alg_str):
 def setup_cusparse_signatures(lib):
     """Set argtypes/restype on all cuSPARSE functions we use."""
 
+    # cusparseGetVersion
+    lib.cusparseGetVersion.argtypes = [c_void_p, POINTER(c_int)]
+    lib.cusparseGetVersion.restype = c_int
+
     # cusparseCreate / cusparseDestroy
     lib.cusparseCreate.argtypes = [POINTER(c_void_p)]
     lib.cusparseCreate.restype = c_int
@@ -165,6 +169,14 @@ def load_cusparse():
     lib = ctypes.cdll.LoadLibrary('libcusparse.so')
     setup_cusparse_signatures(lib)
     return lib
+
+
+def get_cusparse_version(lib, handle):
+    """Return cuSPARSE version string (e.g. '12.6.1')."""
+    ver = c_int(0)
+    check_status(lib.cusparseGetVersion(handle, byref(ver)), 'cusparseGetVersion')
+    v = ver.value
+    return f"{v // 10000}.{(v % 10000) // 100}.{v % 100}"
 
 
 # ---------------------------------------------------------------------------
