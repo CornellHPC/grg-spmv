@@ -5,7 +5,7 @@ description = "GRG matvec/matmat with SpMV"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "cupy-cuda13x>=13.6.0",
+    "cupy-cuda12x>=13.6.0",
     "grapp>=0.2",
     "igdtools>=2.6",
     "matplotlib>=3.10.8",
@@ -26,4 +26,4 @@ markers = [
 venvPath = "."
 venv = ".venv"
 pythonVersion = "3.13"
-pythonPlatform = "aarch64-apple-darwin"
+pythonPlatform = "x86_64-unknown-linux-gnu"

@@ -100,7 +100,6 @@ class TestStructure:
     def test_selector_shape(self, spmv_seq):
         n, m = spmv_seq.shape
         assert spmv_seq.sel.shape == (m, spmv_seq.K)
-        assert spmv_seq.sel_T.shape == (spmv_seq.K, m)
 
 
 # ---------------------------------------------------------------------------

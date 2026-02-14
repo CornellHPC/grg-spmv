@@ -15,6 +15,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 CUSPARSE_STATUS_SUCCESS = 0
 CUSPARSE_OPERATION_NON_TRANSPOSE = 0
+CUSPARSE_OPERATION_TRANSPOSE = 1
 CUSPARSE_ORDER_ROW = 2              # row-major (C-contiguous) dense layout
 CUSPARSE_INDEX_32I = 2              # int32 index type
 CUSPARSE_INDEX_BASE_ZERO = 0
@@ -39,7 +40,7 @@ CUSPARSE_SPMM_CSR_ALG3 = 12
 # Helpers
 # ---------------------------------------------------------------------------
 
-def check_status(status, func_name):
+def _check_status(status, func_name):
     """Raise RuntimeError on cuSPARSE error."""
     if status != CUSPARSE_STATUS_SUCCESS:
         raise RuntimeError(f"cuSPARSE {func_name} failed with status {status}")
@@ -80,7 +81,7 @@ def parse_algorithm(alg_str):
 # ctypes signature setup
 # ---------------------------------------------------------------------------
 
-def setup_cusparse_signatures(lib):
+def _setup_cusparse_signatures(lib):
     """Set argtypes/restype on all cuSPARSE functions we use."""
 
     # cusparseGetVersion
@@ -164,19 +165,157 @@ def setup_cusparse_signatures(lib):
     lib.cusparseSpMM.restype = c_int
 
 
-def load_cusparse():
+def _load_cusparse():
     """Load libcusparse.so and configure all ctypes signatures."""
     lib = ctypes.cdll.LoadLibrary('libcusparse.so')
-    setup_cusparse_signatures(lib)
+    _setup_cusparse_signatures(lib)
     return lib
 
 
-def get_cusparse_version(lib, handle):
-    """Return cuSPARSE version string (e.g. '12.6.1')."""
-    ver = c_int(0)
-    check_status(lib.cusparseGetVersion(handle, byref(ver)), 'cusparseGetVersion')
-    v = ver.value
-    return f"{v // 10000}.{(v % 10000) // 100}.{v % 100}"
+# ---------------------------------------------------------------------------
+# CuSparseLib — high-level wrapper around cuSPARSE ctypes FFI
+# ---------------------------------------------------------------------------
+
+class CuSparseLib:
+    """High-level wrapper around cuSPARSE ctypes FFI.
+
+    Owns both the ctypes library handle and the cuSPARSE handle.
+    All methods call _check_status internally — callers never touch
+    raw ctypes or status checking.
+    """
+
+    def __init__(self):
+        self._lib = _load_cusparse()
+        self._handle = c_void_p()
+        _check_status(
+            self._lib.cusparseCreate(byref(self._handle)),
+            'cusparseCreate',
+        )
+        _check_status(
+            self._lib.cusparseSetPointerMode(self._handle, CUSPARSE_POINTER_MODE_DEVICE),
+            'cusparseSetPointerMode',
+        )
+
+    # --- Descriptor creation ------------------------------------------------
+
+    def create_csr(self, nrows, ncols, nnz, indptr_ptr, indices_ptr, data_ptr, cdt):
+        """Create a CSR sparse matrix descriptor. Returns c_void_p."""
+        desc = c_void_p()
+        _check_status(self._lib.cusparseCreateCsr(
+            byref(desc),
+            c_int64(nrows), c_int64(ncols), c_int64(nnz),
+            c_void_p(indptr_ptr), c_void_p(indices_ptr), c_void_p(data_ptr),
+            c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_32I),
+            c_int(CUSPARSE_INDEX_BASE_ZERO), c_int(cdt),
+        ), 'cusparseCreateCsr')
+        return desc
+
+    def create_csc(self, nrows, ncols, nnz, indptr_ptr, indices_ptr, data_ptr, cdt):
+        """Create a CSC sparse matrix descriptor. Returns c_void_p."""
+        desc = c_void_p()
+        _check_status(self._lib.cusparseCreateCsc(
+            byref(desc),
+            c_int64(nrows), c_int64(ncols), c_int64(nnz),
+            c_void_p(indptr_ptr), c_void_p(indices_ptr), c_void_p(data_ptr),
+            c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_32I),
+            c_int(CUSPARSE_INDEX_BASE_ZERO), c_int(cdt),
+        ), 'cusparseCreateCsc')
+        return desc
+
+    def create_coo(self, nrows, ncols, nnz, row_ptr, col_ptr, data_ptr, cdt):
+        """Create a COO sparse matrix descriptor. Returns c_void_p."""
+        desc = c_void_p()
+        _check_status(self._lib.cusparseCreateCoo(
+            byref(desc),
+            c_int64(nrows), c_int64(ncols), c_int64(nnz),
+            c_void_p(row_ptr), c_void_p(col_ptr), c_void_p(data_ptr),
+            c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_BASE_ZERO),
+            c_int(cdt),
+        ), 'cusparseCreateCoo')
+        return desc
+
+    def create_dnmat(self, nrows, ncols, ld, buf_ptr, cdt):
+        """Create a dense matrix descriptor (row-major). Returns c_void_p."""
+        desc = c_void_p()
+        _check_status(self._lib.cusparseCreateDnMat(
+            byref(desc),
+            c_int64(nrows), c_int64(ncols), c_int64(ld),
+            c_void_p(buf_ptr),
+            c_int(cdt), c_int(CUSPARSE_ORDER_ROW),
+        ), 'cusparseCreateDnMat')
+        return desc
+
+    def destroy_sp_mat(self, desc):
+        """Destroy a sparse matrix descriptor."""
+        _check_status(self._lib.cusparseDestroySpMat(desc), 'cusparseDestroySpMat')
+
+    def destroy_dn_mat(self, desc):
+        """Destroy a dense matrix descriptor."""
+        _check_status(self._lib.cusparseDestroyDnMat(desc), 'cusparseDestroyDnMat')
+
+    # --- Stream management --------------------------------------------------
+
+    def set_stream(self, stream_ptr):
+        """Set the CUDA stream for subsequent cuSPARSE calls."""
+        _check_status(
+            self._lib.cusparseSetStream(self._handle, c_size_t(stream_ptr)),
+            'cusparseSetStream',
+        )
+
+    # --- SpMM operations ----------------------------------------------------
+
+    def spmm_buffer_size(self, cp, algorithm, op_a, op_b,
+                         alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc, cdt):
+        """Query SpMM buffer size and allocate workspace. Returns cupy array."""
+        buf_size = c_size_t(0)
+        _check_status(self._lib.cusparseSpMM_bufferSize(
+            self._handle, c_int(op_a), c_int(op_b),
+            c_void_p(alpha_ptr), sp_desc, B_desc,
+            c_void_p(beta_ptr), C_desc,
+            c_int(cdt), c_int(algorithm), byref(buf_size),
+        ), 'cusparseSpMM_bufferSize')
+        return cp.zeros(max(buf_size.value, 4), dtype=cp.uint8)
+
+    def spmm_preprocess(self, algorithm, op_a, op_b,
+                        alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc,
+                        cdt, ext_buf_ptr):
+        """Run cusparseSpMM_preprocess on an already-allocated workspace."""
+        _check_status(self._lib.cusparseSpMM_preprocess(
+            self._handle, c_int(op_a), c_int(op_b),
+            c_void_p(alpha_ptr), sp_desc, B_desc,
+            c_void_p(beta_ptr), C_desc,
+            c_int(cdt), c_int(algorithm), c_void_p(ext_buf_ptr),
+        ), 'cusparseSpMM_preprocess')
+
+    def spmm(self, algorithm, op_a, op_b,
+             alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc,
+             cdt, ext_buf_ptr):
+        """Launch a single cusparseSpMM kernel."""
+        _check_status(self._lib.cusparseSpMM(
+            self._handle, c_int(op_a), c_int(op_b),
+            c_void_p(alpha_ptr), sp_desc, B_desc,
+            c_void_p(beta_ptr), C_desc,
+            c_int(cdt), c_int(algorithm), c_void_p(ext_buf_ptr),
+        ), 'cusparseSpMM')
+
+    # --- Cleanup ------------------------------------------------------------
+
+    def destroy(self):
+        """Destroy the cuSPARSE handle."""
+        if self._handle:
+            self._lib.cusparseDestroy(self._handle)
+            self._handle = None
+
+    @property
+    def version(self):
+        """Return cuSPARSE version string (e.g. '12.6.1')."""
+        ver = c_int(0)
+        _check_status(
+            self._lib.cusparseGetVersion(self._handle, byref(ver)),
+            'cusparseGetVersion',
+        )
+        v = ver.value
+        return f"{v // 10000}.{(v % 10000) // 100}.{v % 100}"
 
 
 # ---------------------------------------------------------------------------

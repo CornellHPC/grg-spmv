@@ -20,19 +20,16 @@ class Backend(ABC):
 
     Block structure:
     - A_blocks[h][j] has shape (off[h+1]-off[h]) x (off[j+1]-off[j]) for j < h
-    - AT_blocks[h][j] has shape (off[h+1]-off[h]) x (off[h+2+j]-off[h+1+j])
     """
 
     @abstractmethod
     def setup(
         self,
         A_blocks: List[List[sp.csr_matrix]],
-        AT_blocks: List[List[sp.csr_matrix]],
         level_offsets: np.ndarray,
         n: int,
         K: int,
         sel: sp.csr_matrix,
-        sel_T: sp.csr_matrix,
         sample_perm: np.ndarray,
         inv_sample_perm: np.ndarray,
         dtype: np.dtype,
@@ -44,8 +41,6 @@ class Backend(ABC):
         ----------
         A_blocks : list of list of csr_matrix
             Forward blocks: A_blocks[h][j] for j in range(h).
-        AT_blocks : list of list of csr_matrix
-            Backward blocks: AT_blocks[h][j] for j in range(num_levels-1-h).
         level_offsets : np.ndarray
             Level boundary indices.
         n : int
@@ -54,8 +49,6 @@ class Backend(ABC):
             Total number of nodes.
         sel : csr_matrix
             Selector matrix (m x K).
-        sel_T : csr_matrix
-            Transposed selector (K x m).
         sample_perm : np.ndarray
             Maps new sample indices to original.
         inv_sample_perm : np.ndarray

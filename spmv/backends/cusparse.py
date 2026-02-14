@@ -7,12 +7,9 @@ with multi-stream parallelism; sel gather/scatter runs outside the graph
 since CuPy fancy indexing is not reliably graph-capture-safe.
 
 Requires CuPy for GPU memory management and CUDA stream/graph APIs.
-Uses ctypes to call cuSPARSE directly for the fine-grained control
-needed by CUDA graph capture (CuPy's high-level sparse @ dense
-bundles buffer-size queries + compute, breaking graph capture).
+Uses CuSparseLib (cuda_utils.py) for all cuSPARSE FFI calls.
 """
 
-from ctypes import c_int, c_int64, c_size_t, c_void_p, byref
 from typing import List, Optional
 
 import numpy as np
@@ -20,16 +17,13 @@ import scipy.sparse as sp
 
 from spmv.backends import Backend
 from spmv.backends.cuda_utils import (
-    load_cusparse, check_status, cuda_dtype, parse_algorithm,
-    get_cusparse_version, GpuTimer,
+    CuSparseLib, cuda_dtype, parse_algorithm, GpuTimer,
     CUSPARSE_OPERATION_NON_TRANSPOSE,
-    CUSPARSE_ORDER_ROW,
-    CUSPARSE_INDEX_32I,
-    CUSPARSE_INDEX_BASE_ZERO,
-    CUSPARSE_POINTER_MODE_DEVICE,
+    CUSPARSE_OPERATION_TRANSPOSE,
 )
 
 _OP_N = CUSPARSE_OPERATION_NON_TRANSPOSE
+_OP_T = CUSPARSE_OPERATION_TRANSPOSE
 
 # Whitelist of (fmt, algorithm) combinations that cuSPARSE actually supports.
 # Determined empirically and from NVIDIA docs:
@@ -41,7 +35,6 @@ VALID_FMT_ALG_COMBOS = frozenset({
     ('csr', 'default'),
     ('csr', 'csr_alg1'),
     ('csr', 'csr_alg2'),
-    ('csr', 'csr_alg3'),
     ('csc', 'default'),
     ('csc', 'csr_alg1'),
     ('csc', 'csr_alg2'),
@@ -94,19 +87,12 @@ class CusparseBackend(Backend):
         except ImportError:
             raise ImportError("CuPy required: pip install cupy-cuda12x")
 
-        self._lib = load_cusparse()
-
-        self._handle = c_void_p()
-        check_status(self._lib.cusparseCreate(byref(self._handle)), 'cusparseCreate')
-        check_status(
-            self._lib.cusparseSetPointerMode(self._handle, CUSPARSE_POINTER_MODE_DEVICE),
-            'cusparseSetPointerMode',
-        )
+        self._cslib = CuSparseLib()
 
         self._stream = cp.cuda.Stream(non_blocking=True)
 
         if verbose:
-            print(f"cuSPARSE version: {get_cusparse_version(self._lib, self._handle)}")
+            print(f"cuSPARSE version: {self._cslib.version}")
 
         # Will be populated in setup()
         self._H = self._n = self._K = self._m = 0
@@ -125,12 +111,10 @@ class CusparseBackend(Backend):
     def setup(
         self,
         A_blocks: List[List[sp.csr_matrix]],
-        AT_blocks: List[List[sp.csr_matrix]],
         level_offsets: np.ndarray,
         n: int,
         K: int,
         sel: sp.csr_matrix,
-        sel_T: sp.csr_matrix,  # unused; kept for Backend interface compat
         sample_perm: np.ndarray,
         inv_sample_perm: np.ndarray,
         dtype: np.dtype,
@@ -149,9 +133,8 @@ class CusparseBackend(Backend):
         self._beta_zero = cp.zeros(1, dtype=dtype)
         self._beta_one = cp.ones(1, dtype=dtype)
 
-        # --- Upload forward and backward blocks ---
+        # --- Upload forward blocks only (backward uses _fwd_sp with TRANSPOSE) ---
         self._fwd_sp, self._fwd_gpu = self._upload_blocks(A_blocks)
-        self._bwd_sp, self._bwd_gpu = self._upload_blocks(AT_blocks)
 
         # --- Sel index arrays (gather/scatter instead of SpMM) ---
         self._sel_mut_idx = []
@@ -190,13 +173,11 @@ class CusparseBackend(Backend):
 
         if self._verbose:
             nblk_fwd = sum(1 for h in range(self._H) for d in self._fwd_sp[h] if d is not None)
-            nblk_bwd = sum(1 for h in range(self._H) for d in self._bwd_sp[h] if d is not None)
             nnz_fwd = sum(b.nnz for blocks in A_blocks for b in blocks)
-            nnz_bwd = sum(b.nnz for blocks in AT_blocks for b in blocks)
             print(f"CusparseBackend setup: H={self._H}, K={K}, n={n}, m={self._m}, "
                   f"fmt={self._fmt}, graph_k={self._graph_k}")
             print(f"  Forward: {nblk_fwd} active blocks, {nnz_fwd:,} total nnz")
-            print(f"  Backward: {nblk_bwd} active blocks, {nnz_bwd:,} total nnz")
+            print(f"  Backward: {nblk_fwd} active blocks (transpose of fwd), {nnz_fwd:,} total nnz")
 
         if self._graph_k is not None:
             self._prepare_graphs(self._graph_k, self._dtype)
@@ -213,9 +194,11 @@ class CusparseBackend(Backend):
             for blk in blocks_list[h]:
                 if blk.nnz > 0:
                     d, a = self._upload_sparse(blk)
-                    descs.append(d); arrs.append(a)
+                    descs.append(d)
+                    arrs.append(a)
                 else:
-                    descs.append(None); arrs.append(None)
+                    descs.append(None)
+                    arrs.append(None)
             all_descs.append(descs)
             all_arrs.append(arrs)
         return all_descs, all_arrs
@@ -223,110 +206,83 @@ class CusparseBackend(Backend):
     def _upload_sparse(self, A_scipy):
         """Upload a scipy sparse matrix to GPU and create cuSPARSE descriptor."""
         cp = self._cp
-        lib = self._lib
+        cslib = self._cslib
         cdt = cuda_dtype(self._dtype)
 
-        if self._fmt == 'csc':
-            A = A_scipy.tocsc()
-            indptr = cp.array(A.indptr.astype(np.int32))
-            indices = cp.array(A.indices.astype(np.int32))
-            data = cp.array(A.data.astype(self._dtype))
-            desc = c_void_p()
-            check_status(lib.cusparseCreateCsc(
-                byref(desc),
-                c_int64(A.shape[0]), c_int64(A.shape[1]), c_int64(A.nnz),
-                c_void_p(indptr.data.ptr), c_void_p(indices.data.ptr),
-                c_void_p(data.data.ptr),
-                c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_32I),
-                c_int(CUSPARSE_INDEX_BASE_ZERO), c_int(cdt),
-            ), 'cusparseCreateCsc')
-        elif self._fmt == 'coo':
-            A = A_scipy.tocoo()
-            row_idx = cp.array(A.row.astype(np.int32))
-            col_idx = cp.array(A.col.astype(np.int32))
-            data = cp.array(A.data.astype(self._dtype))
-            desc = c_void_p()
-            check_status(lib.cusparseCreateCoo(
-                byref(desc),
-                c_int64(A.shape[0]), c_int64(A.shape[1]), c_int64(A.nnz),
-                c_void_p(row_idx.data.ptr), c_void_p(col_idx.data.ptr),
-                c_void_p(data.data.ptr),
-                c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_BASE_ZERO),
-                c_int(cdt),
-            ), 'cusparseCreateCoo')
-            return desc, (row_idx, col_idx, data)
-        else:  # csr
+        if self._fmt == 'csr':
             A = sp.csr_matrix(A_scipy).astype(self._dtype)
             indptr = cp.array(A.indptr.astype(np.int32))
             indices = cp.array(A.indices.astype(np.int32))
             data = cp.array(A.data)
-            desc = c_void_p()
-            check_status(lib.cusparseCreateCsr(
-                byref(desc),
-                c_int64(A.shape[0]), c_int64(A.shape[1]), c_int64(A.nnz),
-                c_void_p(indptr.data.ptr), c_void_p(indices.data.ptr),
-                c_void_p(data.data.ptr),
-                c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_32I),
-                c_int(CUSPARSE_INDEX_BASE_ZERO), c_int(cdt),
-            ), 'cusparseCreateCsr')
+            desc = cslib.create_csr(
+                A.shape[0], A.shape[1], A.nnz,
+                indptr.data.ptr, indices.data.ptr, data.data.ptr, cdt,
+            )
+        elif self._fmt == 'csc':
+            A = A_scipy.tocsc()
+            indptr = cp.array(A.indptr.astype(np.int32))
+            indices = cp.array(A.indices.astype(np.int32))
+            data = cp.array(A.data.astype(self._dtype))
+            desc = cslib.create_csc(
+                A.shape[0], A.shape[1], A.nnz,
+                indptr.data.ptr, indices.data.ptr, data.data.ptr, cdt,
+            )
+        else:  # coo
+            A = A_scipy.tocoo()
+            row_idx = cp.array(A.row.astype(np.int32))
+            col_idx = cp.array(A.col.astype(np.int32))
+            data = cp.array(A.data.astype(self._dtype))
+            desc = cslib.create_coo(
+                A.shape[0], A.shape[1], A.nnz,
+                row_idx.data.ptr, col_idx.data.ptr, data.data.ptr, cdt,
+            )
+            return desc, (row_idx, col_idx, data)
         return desc, (indptr, indices, data)
-
-    # ------------------------------------------------------------------
-    # dense descriptor helpers
-    # ------------------------------------------------------------------
-
-    def _create_level_dnmat(self, gpu_buf, k, dtype, ld=None):
-        """Create DnMat descriptor for an entire per-level buffer."""
-        if ld is None:
-            ld = gpu_buf.shape[1]
-        nrows = gpu_buf.shape[0]
-        desc = c_void_p()
-        check_status(self._lib.cusparseCreateDnMat(
-            byref(desc),
-            c_int64(nrows), c_int64(k), c_int64(ld),
-            c_void_p(gpu_buf.data.ptr),
-            c_int(cuda_dtype(dtype)), c_int(CUSPARSE_ORDER_ROW),
-        ), 'cusparseCreateDnMat')
-        return desc
 
     # ------------------------------------------------------------------
     # SpMM helpers
     # ------------------------------------------------------------------
 
-    def _spmm_bufsize(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt):
-        """Query buffer size and allocate workspace."""
-        buf_size = c_size_t(0)
-        check_status(self._lib.cusparseSpMM_bufferSize(
-            self._handle, c_int(_OP_N), c_int(_OP_N),
-            c_void_p(alpha_ptr), sp_desc, B_desc,
-            c_void_p(beta_ptr), C_desc,
-            c_int(cdt), c_int(self._algorithm), byref(buf_size),
-        ), 'cusparseSpMM_bufferSize')
-        return self._cp.zeros(max(buf_size.value, 4), dtype=self._cp.uint8)
-
-    def _spmm_preprocess(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt, ext_buf):
+    def _spmm_preprocess(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr,
+                         cdt, ext_buf, op_a=_OP_N):
         """Run cusparseSpMM_preprocess on an already-allocated workspace."""
-        check_status(self._lib.cusparseSpMM_preprocess(
-            self._handle, c_int(_OP_N), c_int(_OP_N),
-            c_void_p(alpha_ptr), sp_desc, B_desc,
-            c_void_p(beta_ptr), C_desc,
-            c_int(cdt), c_int(self._algorithm), c_void_p(ext_buf.data.ptr),
-        ), 'cusparseSpMM_preprocess')
+        self._cslib.spmm_preprocess(
+            self._algorithm, op_a, _OP_N,
+            alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc,
+            cdt, ext_buf.data.ptr,
+        )
 
-    def _preprocess_one(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt):
+    def _preprocess_one(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr,
+                        cdt, op_a=_OP_N):
         """Allocate workspace, preprocess, and return the buffer."""
-        buf = self._spmm_bufsize(sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt)
-        self._spmm_preprocess(sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt, buf)
+        buf = self._cslib.spmm_buffer_size(
+            self._cp, self._algorithm, op_a, _OP_N,
+            alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc, cdt,
+        )
+        self._spmm_preprocess(sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr,
+                              cdt, buf, op_a=op_a)
         return buf
 
-    def _spmm(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt, ext_buf_ptr):
+    def _spmm(self, sp_desc, B_desc, C_desc, alpha_ptr, beta_ptr, cdt, ext_buf_ptr,
+              op_a=_OP_N):
         """Launch a single cusparseSpMM kernel."""
-        check_status(self._lib.cusparseSpMM(
-            self._handle, c_int(_OP_N), c_int(_OP_N),
-            c_void_p(alpha_ptr), sp_desc, B_desc,
-            c_void_p(beta_ptr), C_desc,
-            c_int(cdt), c_int(self._algorithm), c_void_p(ext_buf_ptr),
-        ), 'cusparseSpMM')
+        self._cslib.spmm(
+            self._algorithm, op_a, _OP_N,
+            alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc,
+            cdt, ext_buf_ptr,
+        )
+
+    # ------------------------------------------------------------------
+    # Dense descriptor helpers
+    # ------------------------------------------------------------------
+
+    def _create_level_dnmat(self, gpu_buf, k, dtype, ld=None):
+        """Create DnMat descriptor for a per-level buffer."""
+        if ld is None:
+            ld = gpu_buf.shape[1]
+        return self._cslib.create_dnmat(
+            gpu_buf.shape[0], k, ld, gpu_buf.data.ptr, cuda_dtype(dtype),
+        )
 
     # ------------------------------------------------------------------
     # sel gather / scatter_add  (run OUTSIDE CUDA graph)
@@ -335,7 +291,7 @@ class CusparseBackend(Backend):
     def _sel_gather(self, result_gpu, level_bufs):
         """Forward sel: result[mut] = level_bufs[h][node].  (Outside graph.)"""
         with self._stream:
-            result_gpu[:] = 0
+            result_gpu.fill(0)
             for h in range(self._H):
                 idx = self._sel_mut_idx[h]
                 if len(idx) > 0:
@@ -346,7 +302,7 @@ class CusparseBackend(Backend):
         cp = self._cp
         with self._stream:
             for h in range(self._H):
-                level_bufs[h][:] = 0
+                level_bufs[h].fill(0)
                 idx = self._sel_mut_idx[h]
                 if len(idx) > 0:
                     cp.add.at(level_bufs[h], self._sel_node_local[h], X_gpu[idx])
@@ -356,7 +312,7 @@ class CusparseBackend(Backend):
         cp = self._cp
         with self._stream:
             for h in range(self._H):
-                self._level_bufs[h][:] = 0
+                self._level_bufs[h].fill(0)
                 ns = self._fwd_scatter_ns[h]
                 if ns > 0:
                     cp.take(self._fwd_X_gpu, self._fwd_scatter_src[h], axis=0,
@@ -366,7 +322,7 @@ class CusparseBackend(Backend):
         """Gather from level_bufs into bwd_result_gpu.  (Outside graph.)"""
         cp = self._cp
         with self._stream:
-            self._bwd_result_gpu[:] = 0
+            self._bwd_result_gpu.fill(0)
             for h in range(self._H):
                 if self._bwd_gather_temp[h] is not None:
                     cp.take(self._level_bufs[h], self._bwd_gather_src[h], axis=0,
@@ -385,9 +341,6 @@ class CusparseBackend(Backend):
         cdt = cuda_dtype(dtype)
         self._k = k
 
-        ld = k
-        self._ld = ld
-
         a1 = self._alpha.data.ptr
         b1 = self._beta_one.data.ptr
 
@@ -395,20 +348,20 @@ class CusparseBackend(Backend):
         self._level_bufs = []
         for h in range(self._H):
             sz = int(off[h + 1]) - int(off[h])
-            self._level_bufs.append(cp.zeros((sz, ld), dtype=dtype, order='C'))
+            self._level_bufs.append(cp.zeros((sz, k), dtype=dtype, order='C'))
 
         # --- I/O buffers ---
-        self._fwd_X_gpu = cp.zeros((self._n, ld), dtype=dtype, order='C')
-        self._fwd_result_gpu = cp.zeros((self._m, ld), dtype=dtype, order='C')
-        self._bwd_X_gpu = cp.zeros((self._m, ld), dtype=dtype, order='C')
-        self._bwd_result_gpu = cp.zeros((self._n, ld), dtype=dtype, order='C')
+        self._fwd_X_gpu = cp.zeros((self._n, k), dtype=dtype, order='C')
+        self._fwd_result_gpu = cp.zeros((self._m, k), dtype=dtype, order='C')
+        self._bwd_X_gpu = cp.zeros((self._m, k), dtype=dtype, order='C')
+        self._bwd_result_gpu = cp.zeros((self._n, k), dtype=dtype, order='C')
 
         # Pre-allocate backward gather temps (persistent, reusable across replays)
         self._bwd_gather_temp = []
         for h in range(self._H):
             ng = len(self._bwd_gather_dst[h])
             self._bwd_gather_temp.append(
-                cp.zeros((ng, ld), dtype=dtype, order='C') if ng > 0 else None)
+                cp.zeros((ng, k), dtype=dtype, order='C') if ng > 0 else None)
 
         # --- Dense descriptors for level buffers ---
         self._level_dn = [self._create_level_dnmat(self._level_bufs[h], k, dtype)
@@ -425,23 +378,26 @@ class CusparseBackend(Backend):
             row = []
             for j in range(h):
                 if self._fwd_sp[h][j] is None:
-                    row.append(None); continue
+                    row.append(None)
+                    continue
                 row.append(self._preprocess_one(
                     self._fwd_sp[h][j], self._level_dn[j], self._level_dn[h],
                     a1, b1, cdt))
             self._fwd_ext.append(row)
 
-        # Backward blocks (beta=1, accumulate)
+        # Backward blocks (beta=1, accumulate) — use _fwd_sp[src][h]^T
+        # AT_blocks[h][j] == A_blocks[src][h]^T  where src = h+1+j
         self._bwd_ext = []
         for h in range(self._H):
             row = []
-            for j in range(len(self._bwd_sp[h])):
-                if self._bwd_sp[h][j] is None:
-                    row.append(None); continue
-                src_level = h + 1 + j
+            for src in range(h + 1, self._H):
+                fwd_desc = self._fwd_sp[src][h]
+                if fwd_desc is None:
+                    row.append(None)
+                    continue
                 row.append(self._preprocess_one(
-                    self._bwd_sp[h][j], self._level_dn[src_level], self._level_dn[h],
-                    a1, b1, cdt))
+                    fwd_desc, self._level_dn[src], self._level_dn[h],
+                    a1, b1, cdt, op_a=_OP_T))
             self._bwd_ext.append(row)
 
         if self._verbose:
@@ -467,7 +423,7 @@ class CusparseBackend(Backend):
         in forward_matmat() via _fwd_scatter() and _sel_gather().
         """
         cp = self._cp
-        lib = self._lib
+        cslib = self._cslib
         cdt = cuda_dtype(dtype)
         a1, b1 = self._alpha.data.ptr, self._beta_one.data.ptr
         streams = self._level_streams
@@ -479,10 +435,9 @@ class CusparseBackend(Backend):
 
         for h in range(self._H):
             s = streams[h]
-            check_status(lib.cusparseSetStream(self._handle, c_size_t(s.ptr)),
-                         'cusparseSetStream')
+            cslib.set_stream(s.ptr)
             with s:
-                self._level_bufs[h][:] = 0
+                self._level_bufs[h].fill(0)
                 ns = self._fwd_scatter_ns[h]
                 if ns > 0:
                     cp.take(self._fwd_X_gpu, self._fwd_scatter_src[h], axis=0,
@@ -491,20 +446,21 @@ class CusparseBackend(Backend):
 
             n_blocks = sum(1 for j in range(h) if self._fwd_sp[h][j] is not None)
             if self._verbose and n_blocks > 0:
-                ev_start = cp.cuda.Event(); ev_end = cp.cuda.Event()
+                ev_start = cp.cuda.Event()
+                ev_end = cp.cuda.Event()
                 ev_start.record(s)
 
             for j in range(h):
                 if self._fwd_sp[h][j] is None:
                     continue
-                check_status(lib.cusparseSetStream(self._handle, c_size_t(s.ptr)),
-                             'cusparseSetStream')
+                cslib.set_stream(s.ptr)
                 self._spmm(self._fwd_sp[h][j],
                            self._level_dn[j], self._level_dn[h],
                            a1, b1, cdt, self._fwd_ext[h][j].data.ptr)
 
             if self._verbose and n_blocks > 0:
-                ev_end.record(s); ev_end.synchronize()
+                ev_end.record(s)
+                ev_end.synchronize()
                 fwd_level_times.append(
                     (h, n_blocks, cp.cuda.get_elapsed_time(ev_start, ev_end)))
             else:
@@ -528,12 +484,11 @@ class CusparseBackend(Backend):
 
         # --- Reset and capture ---
         for h in range(self._H):
-            self._level_bufs[h][:] = 0
+            self._level_bufs[h].fill(0)
         cp.cuda.Device().synchronize()
 
         # Begin capture on main stream
-        check_status(lib.cusparseSetStream(self._handle, c_size_t(self._stream.ptr)),
-                     'cusparseSetStream')
+        cslib.set_stream(self._stream.ptr)
         self._stream.begin_capture()
 
         # Fork: main -> all level streams
@@ -554,8 +509,7 @@ class CusparseBackend(Backend):
 
         # --- Wavefront: for each level h, queue blocks with event waits ---
         for h in range(1, self._H):
-            check_status(lib.cusparseSetStream(self._handle, c_size_t(streams[h].ptr)),
-                         'cusparseSetStream')
+            cslib.set_stream(streams[h].ptr)
             for j in range(h):
                 if self._fwd_sp[h][j] is None:
                     continue
@@ -586,7 +540,7 @@ class CusparseBackend(Backend):
         Level bufs must be pre-filled with sel_T data before graph launch.
         """
         cp = self._cp
-        lib = self._lib
+        cslib = self._cslib
         cdt = cuda_dtype(dtype)
         a1, b1 = self._alpha.data.ptr, self._beta_one.data.ptr
         streams = self._level_streams
@@ -603,24 +557,25 @@ class CusparseBackend(Backend):
         # Backward blocks (reverse level order)
         for h in range(self._H - 2, -1, -1):
             s = streams[h]
-            n_blocks = sum(1 for j in range(len(self._bwd_sp[h]))
-                           if self._bwd_sp[h][j] is not None)
+            n_blocks = sum(1 for src in range(h + 1, self._H)
+                           if self._fwd_sp[src][h] is not None)
             if self._verbose and n_blocks > 0:
-                ev_start = cp.cuda.Event(); ev_end = cp.cuda.Event()
+                ev_start = cp.cuda.Event()
+                ev_end = cp.cuda.Event()
                 ev_start.record(s)
 
-            for j in reversed(range(len(self._bwd_sp[h]))):
-                if self._bwd_sp[h][j] is None:
+            for src in reversed(range(h + 1, self._H)):
+                if self._fwd_sp[src][h] is None:
                     continue
-                check_status(lib.cusparseSetStream(self._handle, c_size_t(s.ptr)),
-                             'cusparseSetStream')
-                src = h + 1 + j
-                self._spmm(self._bwd_sp[h][j],
+                cslib.set_stream(s.ptr)
+                j = src - h - 1
+                self._spmm(self._fwd_sp[src][h],
                            self._level_dn[src], self._level_dn[h],
-                           a1, b1, cdt, self._bwd_ext[h][j].data.ptr)
+                           a1, b1, cdt, self._bwd_ext[h][j].data.ptr, op_a=_OP_T)
 
             if self._verbose and n_blocks > 0:
-                ev_end.record(s); ev_end.synchronize()
+                ev_end.record(s)
+                ev_end.synchronize()
                 bwd_level_times.append(
                     (h, n_blocks, cp.cuda.get_elapsed_time(ev_start, ev_end)))
             else:
@@ -628,7 +583,7 @@ class CusparseBackend(Backend):
 
         # Perm gather warmup (exercises CuPy JIT kernels)
         with self._stream:
-            self._bwd_result_gpu[:] = 0
+            self._bwd_result_gpu.fill(0)
             for h in range(self._H):
                 if self._bwd_gather_temp[h] is not None:
                     cp.take(self._level_bufs[h], self._bwd_gather_src[h], axis=0,
@@ -654,13 +609,12 @@ class CusparseBackend(Backend):
         # During capture they're zero — this is fine, the graph records kernel
         # code + addresses, not data values.
         for h in range(self._H):
-            self._level_bufs[h][:] = 0
-        self._bwd_result_gpu[:] = 0
+            self._level_bufs[h].fill(0)
+        self._bwd_result_gpu.fill(0)
         cp.cuda.Device().synchronize()
 
         # Begin capture on main stream
-        check_status(lib.cusparseSetStream(self._handle, c_size_t(self._stream.ptr)),
-                     'cusparseSetStream')
+        cslib.set_stream(self._stream.ptr)
         self._stream.begin_capture()
 
         # Fork: main -> all level streams
@@ -677,16 +631,15 @@ class CusparseBackend(Backend):
         # --- Wavefront (reverse): process from H-2 down to 0 ---
         # SpMMs accumulate (beta=1) into level_bufs which already hold sel_T data
         for h in range(self._H - 2, -1, -1):
-            check_status(lib.cusparseSetStream(self._handle, c_size_t(streams[h].ptr)),
-                         'cusparseSetStream')
-            for j in reversed(range(len(self._bwd_sp[h]))):
-                if self._bwd_sp[h][j] is None:
+            cslib.set_stream(streams[h].ptr)
+            for src in reversed(range(h + 1, self._H)):
+                if self._fwd_sp[src][h] is None:
                     continue
-                src = h + 1 + j
+                j = src - h - 1
                 streams[h].wait_event(ready[src])
-                self._spmm(self._bwd_sp[h][j],
+                self._spmm(self._fwd_sp[src][h],
                            self._level_dn[src], self._level_dn[h],
-                           a1, b1, cdt, self._bwd_ext[h][j].data.ptr)
+                           a1, b1, cdt, self._bwd_ext[h][j].data.ptr, op_a=_OP_T)
             ready[h].record(streams[h])
 
         # --- Join all level streams -> main stream ---
@@ -710,23 +663,27 @@ class CusparseBackend(Backend):
 
         if use_graph:
             timer = GpuTimer(cp, self._stream) if self._verbose else None
-            if timer: timer.mark()
-            with self._stream:
-                self._fwd_X_gpu[:] = cp.asarray(X, dtype=dtype, order='C')
+            if timer:
+                timer.mark()
+            self._fwd_X_gpu.set(X, stream=self._stream)
             self._stream.synchronize()
-            if timer: timer.mark('H2D')
+            if timer:
+                timer.mark('H2D')
             # Scatter into level_bufs (outside graph — CuPy ops not capture-safe)
             self._fwd_scatter()
             self._stream.synchronize()
-            if timer: timer.mark('scatter')
+            if timer:
+                timer.mark('scatter')
             # Graph: SpMM wavefront only (no CuPy ops inside)
             self._fwd_exec.launch(stream=self._stream)
             self._stream.synchronize()
-            if timer: timer.mark('wavefront')
+            if timer:
+                timer.mark('wavefront')
             # Sel gather (outside graph)
             self._sel_gather(self._fwd_result_gpu, self._level_bufs)
             self._stream.synchronize()
-            if timer: timer.mark('sel')
+            if timer:
+                timer.mark('sel')
             result = self._fwd_result_gpu.get()
             if timer:
                 timer.mark('D2H')
@@ -744,21 +701,25 @@ class CusparseBackend(Backend):
 
         if use_graph:
             timer = GpuTimer(cp, self._stream) if self._verbose else None
-            if timer: timer.mark()
-            with self._stream:
-                self._bwd_X_gpu[:] = cp.asarray(X, dtype=dtype, order='C')
+            if timer:
+                timer.mark()
+            self._bwd_X_gpu.set(X, stream=self._stream)
             self._stream.synchronize()
-            if timer: timer.mark('H2D')
+            if timer:
+                timer.mark('H2D')
             # sel_T scatter_add (outside graph — not capture-safe)
             self._sel_scatter_add(self._bwd_X_gpu, self._level_bufs)
             self._stream.synchronize()
-            if timer: timer.mark('sel_T')
+            if timer:
+                timer.mark('sel_T')
             self._bwd_exec.launch(stream=self._stream)
             self._stream.synchronize()
-            if timer: timer.mark('wavefront')
+            if timer:
+                timer.mark('wavefront')
             self._bwd_gather()
             self._stream.synchronize()
-            if timer: timer.mark('perm')
+            if timer:
+                timer.mark('perm')
             result = self._bwd_result_gpu.get()
             if timer:
                 timer.mark('D2H')
@@ -774,14 +735,14 @@ class CusparseBackend(Backend):
     def _run_fwd_dynamic(self, X, k, dtype):
         """Forward pass without CUDA graphs (any k)."""
         cp = self._cp
-        lib = self._lib
+        cslib = self._cslib
         off = self._level_offsets
         cdt = cuda_dtype(dtype)
         a1, b1 = self._alpha.data.ptr, self._beta_one.data.ptr
-        ld = k
 
         timer = GpuTimer(cp, self._stream) if self._verbose else None
-        if timer: timer.mark()
+        if timer:
+            timer.mark()
 
         # All CuPy ops on self._stream to avoid race with non-blocking stream
         with self._stream:
@@ -799,27 +760,30 @@ class CusparseBackend(Backend):
                     cp.take(X_gpu, self._fwd_scatter_src[h], axis=0,
                             out=level_bufs[h][:ns])
 
-        if timer: timer.mark('H2D+scatter')
+        if timer:
+            timer.mark('H2D+scatter')
 
         # Block SpMMs (single stream)
-        check_status(lib.cusparseSetStream(self._handle, c_size_t(self._stream.ptr)),
-                     'cusparseSetStream')
+        cslib.set_stream(self._stream.ptr)
         with self._stream:
             for h in range(1, self._H):
                 for j in range(h):
                     if self._fwd_sp[h][j] is None:
                         continue
-                    B_desc = self._create_level_dnmat(level_bufs[j], k, dtype, ld=ld)
-                    C_desc = self._create_level_dnmat(level_bufs[h], k, dtype, ld=ld)
-                    ext = self._spmm_bufsize(
-                        self._fwd_sp[h][j], B_desc, C_desc, a1, b1, cdt)
+                    B_desc = self._create_level_dnmat(level_bufs[j], k, dtype, ld=k)
+                    C_desc = self._create_level_dnmat(level_bufs[h], k, dtype, ld=k)
+                    ext = cslib.spmm_buffer_size(
+                        self._cp, self._algorithm, _OP_N, _OP_N,
+                        a1, self._fwd_sp[h][j], B_desc, b1, C_desc, cdt,
+                    )
                     self._spmm(self._fwd_sp[h][j], B_desc, C_desc,
                                a1, b1, cdt, ext.data.ptr)
-                    lib.cusparseDestroyDnMat(B_desc)
-                    lib.cusparseDestroyDnMat(C_desc)
+                    cslib.destroy_dn_mat(B_desc)
+                    cslib.destroy_dn_mat(C_desc)
         self._stream.synchronize()
 
-        if timer: timer.mark('wavefront')
+        if timer:
+            timer.mark('wavefront')
 
         # Sel gather
         with self._stream:
@@ -830,7 +794,8 @@ class CusparseBackend(Backend):
                     result_gpu[idx] = level_bufs[h][self._sel_node_local[h]]
         self._stream.synchronize()
 
-        if timer: timer.mark('sel')
+        if timer:
+            timer.mark('sel')
 
         result = result_gpu.get()
         if timer:
@@ -841,14 +806,14 @@ class CusparseBackend(Backend):
     def _run_bwd_dynamic(self, X, k, dtype):
         """Backward pass without CUDA graphs (any k)."""
         cp = self._cp
-        lib = self._lib
+        cslib = self._cslib
         off = self._level_offsets
         cdt = cuda_dtype(dtype)
         a1, b1 = self._alpha.data.ptr, self._beta_one.data.ptr
-        ld = k
 
         timer = GpuTimer(cp, self._stream) if self._verbose else None
-        if timer: timer.mark()
+        if timer:
+            timer.mark()
 
         # All CuPy ops on self._stream to avoid race with non-blocking stream
         with self._stream:
@@ -864,28 +829,31 @@ class CusparseBackend(Backend):
                     cp.add.at(level_bufs[h], self._sel_node_local[h], X_gpu[idx])
         self._stream.synchronize()
 
-        if timer: timer.mark('H2D+sel_T')
+        if timer:
+            timer.mark('H2D+sel_T')
 
         # Backward block SpMMs (single stream, reverse level order)
-        check_status(lib.cusparseSetStream(self._handle, c_size_t(self._stream.ptr)),
-                     'cusparseSetStream')
+        # AT_blocks[h][j] == A_blocks[src][h]^T  where src = h+1+j
+        cslib.set_stream(self._stream.ptr)
         with self._stream:
             for h in range(self._H - 2, -1, -1):
-                for j in reversed(range(len(self._bwd_sp[h]))):
-                    if self._bwd_sp[h][j] is None:
+                for src in reversed(range(h + 1, self._H)):
+                    sp_desc = self._fwd_sp[src][h]
+                    if sp_desc is None:
                         continue
-                    src = h + 1 + j
-                    B_desc = self._create_level_dnmat(level_bufs[src], k, dtype, ld=ld)
-                    C_desc = self._create_level_dnmat(level_bufs[h], k, dtype, ld=ld)
-                    ext = self._spmm_bufsize(
-                        self._bwd_sp[h][j], B_desc, C_desc, a1, b1, cdt)
-                    self._spmm(self._bwd_sp[h][j], B_desc, C_desc,
-                               a1, b1, cdt, ext.data.ptr)
-                    lib.cusparseDestroyDnMat(B_desc)
-                    lib.cusparseDestroyDnMat(C_desc)
+                    B_desc = self._create_level_dnmat(level_bufs[src], k, dtype, ld=k)
+                    C_desc = self._create_level_dnmat(level_bufs[h], k, dtype, ld=k)
+                    ext = cslib.spmm_buffer_size(
+                        self._cp, self._algorithm, _OP_T, _OP_N,
+                        a1, sp_desc, B_desc, b1, C_desc, cdt,
+                    )
+                    self._spmm(sp_desc, B_desc, C_desc, a1, b1, cdt, ext.data.ptr, op_a=_OP_T)
+                    cslib.destroy_dn_mat(B_desc)
+                    cslib.destroy_dn_mat(C_desc)
         self._stream.synchronize()
 
-        if timer: timer.mark('wavefront')
+        if timer:
+            timer.mark('wavefront')
 
         # Inverse permutation (gather)
         with self._stream:
@@ -907,22 +875,19 @@ class CusparseBackend(Backend):
     # ------------------------------------------------------------------
 
     def __del__(self):
-        lib = getattr(self, '_lib', None)
-        if lib is None:
+        cslib = getattr(self, '_cslib', None)
+        if cslib is None:
             return
 
         # Dense descriptors (graph mode)
         for d in getattr(self, '_level_dn', []):
             if d is not None:
-                lib.cusparseDestroyDnMat(d)
+                cslib._lib.cusparseDestroyDnMat(d)
 
         # Sparse descriptors
-        for sp_list in (getattr(self, '_fwd_sp', []) +
-                        getattr(self, '_bwd_sp', [])):
+        for sp_list in getattr(self, '_fwd_sp', []):
             for d in sp_list:
                 if d is not None:
-                    lib.cusparseDestroySpMat(d)
+                    cslib._lib.cusparseDestroySpMat(d)
 
-        handle = getattr(self, '_handle', None)
-        if handle is not None:
-            lib.cusparseDestroy(handle)
+        cslib.destroy()

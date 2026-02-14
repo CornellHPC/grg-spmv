@@ -44,37 +44,45 @@ class MultithreadBackend(Backend):
     def setup(
         self,
         A_blocks: List[List[sp.csr_matrix]],
-        AT_blocks: List[List[sp.csr_matrix]],
         level_offsets: np.ndarray,
         n: int,
         K: int,
         sel: sp.csr_matrix,
-        sel_T: sp.csr_matrix,
         sample_perm: np.ndarray,
         inv_sample_perm: np.ndarray,
         dtype: np.dtype,
     ) -> None:
         """Store references to block-wise sparse matrices and permutations."""
         self._A_blocks = A_blocks
-        self._AT_blocks = AT_blocks
         self._level_offsets = level_offsets
         self._n = n
         self._K = K
         self._sel = sel
-        self._sel_T = sel_T
+        self._sel_T = sel.T.tocsr()
         self._sample_perm = sample_perm
         self._inv_sample_perm = inv_sample_perm
         self._dtype = dtype
+
+        # Compute AT_blocks internally from A_blocks
+        num_levels = len(level_offsets) - 1
+        self._AT_blocks = []
+        for h in range(num_levels):
+            row = []
+            for j in range(num_levels - 1 - h):
+                src = h + 1 + j
+                row.append(A_blocks[src][h].T.tocsr())
+            self._AT_blocks.append(row)
+
         if self._verbose:
             total_nnz_fwd = sum(blk.nnz for blocks in A_blocks for blk in blocks)
-            total_nnz_bwd = sum(blk.nnz for blocks in AT_blocks for blk in blocks)
+            total_nnz_bwd = sum(blk.nnz for blocks in self._AT_blocks for blk in blocks)
             print(f"MultithreadBackend setup: {len(A_blocks)} levels")
             print(f"  A_blocks total nnz: {total_nnz_fwd:,}")
             print(f"  AT_blocks total nnz: {total_nnz_bwd:,}")
             for h in range(len(A_blocks)):
                 lo, hi = level_offsets[h], level_offsets[h + 1]
                 fwd_shapes = [blk.shape for blk in A_blocks[h]]
-                bwd_shapes = [blk.shape for blk in AT_blocks[h]]
+                bwd_shapes = [blk.shape for blk in self._AT_blocks[h]]
                 print(f"  Level {h}: A_blocks={fwd_shapes}, AT_blocks={bwd_shapes}")
 
     def forward_matmat(self, X: np.ndarray) -> np.ndarray:

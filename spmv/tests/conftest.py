@@ -73,6 +73,16 @@ def make_fmt_alg_params():
     return params
 
 
+def valid_fmt_alg_params():
+    """Build pytest.param list for only valid (fmt, alg) combos (no xfail)."""
+    params = []
+    for fmt in _ALL_FMTS:
+        for alg in _ALL_ALGS:
+            if is_valid_combo(fmt, alg):
+                params.append(pytest.param(fmt, alg, id=f"{fmt}-{alg}"))
+    return params
+
+
 def binary_pm1(rng, shape, dtype):
     """Return a random {-1, +1} matrix."""
     return rng.choice(np.array([-1.0, 1.0], dtype=dtype), size=shape)

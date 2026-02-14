@@ -32,9 +32,19 @@ def _make_backend_configs(backend_filter):
         except ImportError:
             pass
         else:
-            configs += [
-                pytest.param({'type': 'cusparse', 'fmt': 'csr', 'k': None}, id='gpu-dyn'),
-            ]
+            from spmv.backends.cusparse import VALID_FMT_ALG_COMBOS
+            # Dynamic mode for all valid combos
+            for fmt, alg in sorted(VALID_FMT_ALG_COMBOS):
+                configs.append(pytest.param(
+                    {'type': 'cusparse', 'fmt': fmt, 'algorithm': alg, 'k': None},
+                    id=f'gpu-dyn-{fmt}-{alg}',
+                ))
+            # Graph mode for all valid combos (k=4)
+            for fmt, alg in sorted(VALID_FMT_ALG_COMBOS):
+                configs.append(pytest.param(
+                    {'type': 'cusparse', 'fmt': fmt, 'algorithm': alg, 'k': 4},
+                    id=f'gpu-graph-{fmt}-{alg}',
+                ))
     return configs
 
 

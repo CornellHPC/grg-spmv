@@ -11,7 +11,7 @@ import pytest
 from spmv import SpMVOperator
 from spmv.tests.conftest import (
     DATA_DTYPE, INDEX_DTYPE, K_FULL,
-    make_fmt_alg_params, binary_pm1, tol,
+    make_fmt_alg_params, valid_fmt_alg_params, binary_pm1, tol,
 )
 
 # Skip entire module if no GPU
@@ -49,18 +49,32 @@ class TestFormatAlgorithmValidity:
 # ---------------------------------------------------------------------------
 
 class TestFmtAlgCorrectness:
-    """Correctness at k=4 (dynamic) for every valid (fmt, alg) combo."""
+    """Correctness for every valid (fmt, alg) combo in dynamic and graph modes."""
 
     @pytest.mark.parametrize("fmt,alg", make_fmt_alg_params())
-    def test_forward(self, small_grg_path, gt_small, fmt, alg):
+    def test_forward_dynamic(self, small_grg_path, gt_small, fmt, alg):
         op = _make_op(small_grg_path, fmt=fmt, k=None, algorithm=alg)
         X, Y_expected = gt_small.get('forward', 4, seed=42, dtype=DATA_DTYPE)
         atol, rtol = tol(DATA_DTYPE)
         np.testing.assert_allclose(op.H @ X, Y_expected, atol=atol, rtol=rtol)
 
     @pytest.mark.parametrize("fmt,alg", make_fmt_alg_params())
-    def test_backward(self, small_grg_path, gt_small, fmt, alg):
+    def test_backward_dynamic(self, small_grg_path, gt_small, fmt, alg):
         op = _make_op(small_grg_path, fmt=fmt, k=None, algorithm=alg)
+        X, Y_expected = gt_small.get('backward', 4, seed=42, dtype=DATA_DTYPE)
+        atol, rtol = tol(DATA_DTYPE)
+        np.testing.assert_allclose(op @ X, Y_expected, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("fmt,alg", make_fmt_alg_params())
+    def test_forward_graph(self, small_grg_path, gt_small, fmt, alg):
+        op = _make_op(small_grg_path, fmt=fmt, k=4, algorithm=alg)
+        X, Y_expected = gt_small.get('forward', 4, seed=42, dtype=DATA_DTYPE)
+        atol, rtol = tol(DATA_DTYPE)
+        np.testing.assert_allclose(op.H @ X, Y_expected, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("fmt,alg", make_fmt_alg_params())
+    def test_backward_graph(self, small_grg_path, gt_small, fmt, alg):
+        op = _make_op(small_grg_path, fmt=fmt, k=4, algorithm=alg)
         X, Y_expected = gt_small.get('backward', 4, seed=42, dtype=DATA_DTYPE)
         atol, rtol = tol(DATA_DTYPE)
         np.testing.assert_allclose(op @ X, Y_expected, atol=atol, rtol=rtol)
@@ -71,18 +85,20 @@ class TestFmtAlgCorrectness:
 # ---------------------------------------------------------------------------
 
 class TestKSweepGraph:
-    """Test CUDA graph capture and replay at every k value (CSR)."""
+    """Test CUDA graph capture and replay at every k value across fmt/alg combos."""
 
+    @pytest.mark.parametrize("fmt,alg", valid_fmt_alg_params())
     @pytest.mark.parametrize("k", K_FULL)
-    def test_forward(self, small_grg_path, gt_small, k):
-        op = _make_op(small_grg_path, fmt='csr', k=k)
+    def test_forward(self, small_grg_path, gt_small, fmt, alg, k):
+        op = _make_op(small_grg_path, fmt=fmt, k=k, algorithm=alg)
         X, Y_expected = gt_small.get('forward', k, seed=42, dtype=DATA_DTYPE)
         atol, rtol = tol(DATA_DTYPE)
         np.testing.assert_allclose(op.H @ X, Y_expected, atol=atol, rtol=rtol)
 
+    @pytest.mark.parametrize("fmt,alg", valid_fmt_alg_params())
     @pytest.mark.parametrize("k", K_FULL)
-    def test_backward(self, small_grg_path, gt_small, k):
-        op = _make_op(small_grg_path, fmt='csr', k=k)
+    def test_backward(self, small_grg_path, gt_small, fmt, alg, k):
+        op = _make_op(small_grg_path, fmt=fmt, k=k, algorithm=alg)
         X, Y_expected = gt_small.get('backward', k, seed=42, dtype=DATA_DTYPE)
         atol, rtol = tol(DATA_DTYPE)
         np.testing.assert_allclose(op @ X, Y_expected, atol=atol, rtol=rtol)
@@ -95,10 +111,11 @@ class TestKSweepGraph:
 class TestGraphBehavior:
     """Graph-specific behavior tests."""
 
-    def test_graph_vs_dynamic(self, small_grg_path):
+    @pytest.mark.parametrize("fmt,alg", valid_fmt_alg_params())
+    def test_graph_vs_dynamic(self, small_grg_path, fmt, alg):
         """Graph and dynamic modes produce identical results."""
-        op_graph = _make_op(small_grg_path, fmt='csr', k=4)
-        op_dynamic = _make_op(small_grg_path, fmt='csr', k=None)
+        op_graph = _make_op(small_grg_path, fmt=fmt, k=4, algorithm=alg)
+        op_dynamic = _make_op(small_grg_path, fmt=fmt, k=None, algorithm=alg)
         rng = np.random.default_rng(7001)
         V = rng.standard_normal((op_graph.n, 4), dtype=DATA_DTYPE)
         W = rng.standard_normal((op_graph.m, 4), dtype=DATA_DTYPE)

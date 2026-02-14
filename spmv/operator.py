@@ -78,7 +78,6 @@ class SpMVOperator(LinearOperator):
     level_offsets : ndarray - Boundary indices for height levels.
     sample_perm : ndarray - Maps new sample indices to original.
     sel : csr_matrix - Selector matrix (m x K).
-    sel_T : csr_matrix - Transposed selector (K x m).
     """
 
     def __init__(self, path, backend_config: dict[str, Any], dtype, index_dtype, use_rcm: bool = True):
@@ -99,15 +98,15 @@ class SpMVOperator(LinearOperator):
             print(f"Building SpMVOperator with {path}")
             grg = pygrgl.load_immutable_grg(str(path))
             self._build_from_grg(grg)
-            save_operator_npz(self, self.A_blocks, self.AT_blocks, npz_path, algo)
+            save_operator_npz(self, self.A_blocks, npz_path, algo)
 
         # Initialize backend with block-wise matrices and permutations
         self._backend.setup(
-            self.A_blocks, self.AT_blocks, self.level_offsets,
-            self.n, self.K, self.sel, self.sel_T,
+            self.A_blocks, self.level_offsets,
+            self.n, self.K, self.sel,
             self.sample_perm, self._inv_sample_perm, self._dtype,
         )
-        del self.A_blocks, self.AT_blocks
+        del self.A_blocks
 
     def _build_from_grg(self, grg):
         """Build SpMVOperator from a GRG object."""
@@ -186,10 +185,9 @@ class SpMVOperator(LinearOperator):
         new_cols = inv_final_perm[cols]
         del rows, cols, A_h
 
-        # 6. Build A/AT and extract block-wise matrices
+        # 6. Build A and extract block-wise matrices
         off = self.level_offsets
         A = sp.csr_matrix((ones_E, (new_rows, new_cols)), shape=(K, K))
-        AT = A.T.tocsr()
 
         self.A_blocks = []
         for h in range(num_levels):
@@ -199,22 +197,11 @@ class SpMVOperator(LinearOperator):
                 for j in range(h)
             ])
 
-        self.AT_blocks = []
-        for h in range(num_levels):
-            lo, hi = off[h], off[h + 1]
-            self.AT_blocks.append([
-                _extract_block(AT, lo, hi, off[j], off[j + 1], dtype, index_dtype)
-                for j in range(h + 1, num_levels)
-            ])
-
         # Assert block shapes
         for h in range(num_levels):
             assert len(self.A_blocks[h]) == h
             for j, blk in enumerate(self.A_blocks[h]):
                 assert blk.shape == (off[h+1]-off[h], off[j+1]-off[j])
-            assert len(self.AT_blocks[h]) == num_levels - 1 - h
-            for j, blk in enumerate(self.AT_blocks[h]):
-                assert blk.shape == (off[h+1]-off[h], off[h+2+j]-off[h+1+j])
 
         # 7. Selector matrix
         pairs = grg.get_mutation_node_pairs()
@@ -231,7 +218,6 @@ class SpMVOperator(LinearOperator):
 
         sel_ones = np.ones(len(pair_mut_ids), dtype=dtype)
         self.sel = sp.csr_matrix((sel_ones, (pair_mut_ids, pair_node_ids)), shape=(m, K))
-        self.sel_T = sp.csr_matrix((sel_ones, (pair_node_ids, pair_mut_ids)), shape=(K, m))
 
         self.n = n
         self.m = m
@@ -298,9 +284,7 @@ class SpMVOperator(LinearOperator):
         self.sample_perm = data['sample_perm']
         self._inv_sample_perm = data['_inv_sample_perm']
         self.sel = data['sel']
-        self.sel_T = data['sel_T']
         self.A_blocks = data['A_blocks']
-        self.AT_blocks = data['AT_blocks']
         super().__init__(dtype=self._dtype, shape=(self.n, self.m))
 
     def _matmat(self, X):
