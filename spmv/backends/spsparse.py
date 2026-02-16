@@ -1,5 +1,5 @@
 """
-Multithread Backend - Multi-threaded SpMV using dynamic chunk scheduling.
+Spsparse Backend — SciPy sparse with multi-threaded row chunking.
 
 Each thread processes chunks of rows on-demand using CSR views (no copying).
 """
@@ -15,9 +15,9 @@ import scipy.sparse as sp
 from spmv.backends import Backend
 
 
-class MultithreadBackend(Backend):
+class SpsparseBackend(Backend):
     """
-    Multithread-based SpMV backend with multi-threading.
+    SciPy sparse SpMV backend with multi-threading.
 
     Uses dynamic scheduling where each thread processes row chunks on-demand.
     CSR views are created on-the-fly to avoid memory copying.
@@ -73,10 +73,16 @@ class MultithreadBackend(Backend):
                 row.append(A_blocks[src][h].T.tocsr())
             self._AT_blocks.append(row)
 
+        # Create persistent executor for parallel mode
+        if self._n_workers > 1:
+            self._executor = ThreadPoolExecutor(max_workers=self._n_workers)
+        else:
+            self._executor = None
+
         if self._verbose:
             total_nnz_fwd = sum(blk.nnz for blocks in A_blocks for blk in blocks)
             total_nnz_bwd = sum(blk.nnz for blocks in self._AT_blocks for blk in blocks)
-            print(f"MultithreadBackend setup: {len(A_blocks)} levels")
+            print(f"SpsparseBackend setup: {len(A_blocks)} levels")
             print(f"  A_blocks total nnz: {total_nnz_fwd:,}")
             print(f"  AT_blocks total nnz: {total_nnz_bwd:,}")
             for h in range(len(A_blocks)):
@@ -163,7 +169,7 @@ class MultithreadBackend(Backend):
         """Compute A @ x using dynamic chunk scheduling."""
         nrows = A.shape[0]
 
-        if self._n_workers <= 1 or nrows < self._n_workers:
+        if self._executor is None or nrows < self._n_workers:
             return A @ x
 
         is_1d = x.ndim == 1
@@ -185,8 +191,10 @@ class MultithreadBackend(Backend):
                 result[start:end, :] = chunk_result
 
         chunks = list(range(0, nrows, chunk_size))
-
-        with ThreadPoolExecutor(max_workers=self._n_workers) as executor:
-            list(executor.map(process_chunk, chunks))
+        list(self._executor.map(process_chunk, chunks))
 
         return result
+
+    def __del__(self):
+        if getattr(self, '_executor', None) is not None:
+            self._executor.shutdown(wait=False)

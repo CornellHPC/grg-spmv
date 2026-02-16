@@ -49,8 +49,8 @@ def _time_op(op, W, V, n_warmup, n_trials):
     return times_fwd, times_bwd, result_fwd, result_bwd
 
 
-def benchmark_cpu(grg_path, k, n_trials, n_warmup, worker_counts, chunk_size):
-    """Benchmark CPU multithread backend across worker counts."""
+def benchmark_spsparse(grg_path, k, n_trials, n_warmup, worker_counts, chunk_size):
+    """Benchmark spsparse backend across worker counts."""
     print(f"GRG file: {grg_path}")
 
     results = []
@@ -59,7 +59,7 @@ def benchmark_cpu(grg_path, k, n_trials, n_warmup, worker_counts, chunk_size):
         print(f"Loading operator: n_workers={n_workers}")
         t0 = perf_counter()
         backend_config = {
-            'type': 'multithread', 'n_workers': n_workers,
+            'type': 'spsparse', 'n_workers': n_workers,
             'chunk_size': chunk_size, 'verbose': True
         }
         op = SpMVOperator(grg_path, backend_config, DTYPE, INDEX_DTYPE, use_rcm=True)
@@ -69,7 +69,43 @@ def benchmark_cpu(grg_path, k, n_trials, n_warmup, worker_counts, chunk_size):
         times_fwd, times_bwd, result_fwd, result_bwd = _time_op(op, W, V, n_warmup, n_trials)
 
         results.append({
-            'label': f'cpu-{n_workers}w',
+            'label': f'spsparse-{n_workers}w',
+            'build': build_time,
+            'fwd_mean': np.mean(times_fwd) * 1000,
+            'fwd_std': np.std(times_fwd) * 1000,
+            'bwd_mean': np.mean(times_bwd) * 1000,
+            'bwd_std': np.std(times_bwd) * 1000,
+            'fwd_cksum': np.linalg.norm(result_fwd),
+            'bwd_cksum': np.linalg.norm(result_bwd),
+        })
+
+        print(f"  Build: {build_time:.2f}s")
+        print(f"  G @ W:   {np.mean(times_fwd)*1000:.2f} +/- {np.std(times_fwd)*1000:.2f} ms")
+        print(f"  G^T @ V: {np.mean(times_bwd)*1000:.2f} +/- {np.std(times_bwd)*1000:.2f} ms")
+
+    return results
+
+
+def benchmark_mkl(grg_path, k, n_trials, n_warmup, thread_counts):
+    """Benchmark MKL backend across thread counts."""
+    print(f"GRG file: {grg_path}")
+
+    results = []
+    for n_threads in thread_counts:
+        print(f"\n{'='*60}")
+        print(f"Loading operator: n_threads={n_threads}")
+        t0 = perf_counter()
+        backend_config = {
+            'type': 'mkl', 'n_threads': n_threads, 'verbose': True
+        }
+        op = SpMVOperator(grg_path, backend_config, DTYPE, INDEX_DTYPE, use_rcm=True)
+        build_time = perf_counter() - t0
+
+        W, V = _make_vectors(op, k)
+        times_fwd, times_bwd, result_fwd, result_bwd = _time_op(op, W, V, n_warmup, n_trials)
+
+        results.append({
+            'label': f'mkl-{n_threads}t',
             'build': build_time,
             'fwd_mean': np.mean(times_fwd) * 1000,
             'fwd_std': np.std(times_fwd) * 1000,
@@ -318,13 +354,17 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=3,
         help="Number of warmup runs (not timed)")
     parser.add_argument("--backend", type=str, default="cusparse",
-        choices=["multithread", "cusparse", "all"],
+        choices=["spsparse", "mkl", "cusparse", "cpu", "all"],
         help="Which backend(s) to benchmark")
 
-    # CPU-specific
+    # Spsparse-specific
     parser.add_argument("--workers", type=str, default="1,4,16",
-        help="Comma-separated worker counts for multithread backend")
+        help="Comma-separated worker counts for spsparse backend")
     parser.add_argument("--chunk-size", type=int, default=4096)
+
+    # MKL-specific
+    parser.add_argument("--mkl-threads", type=str, default="0,1,4,16",
+        help="Comma-separated thread counts for MKL backend")
 
     # GPU-specific
     parser.add_argument("--fmt", type=str, default="csr,csc",
@@ -338,14 +378,23 @@ if __name__ == "__main__":
 
     all_results = []
 
-    if args.backend in ("multithread", "all"):
+    if args.backend in ("spsparse", "cpu", "all"):
         worker_counts = [int(w) for w in args.workers.split(",")]
-        cpu_results = benchmark_cpu(
+        spsparse_results = benchmark_spsparse(
             grg_path=args.grg, k=args.k,
             n_trials=args.trials, n_warmup=args.warmup,
             worker_counts=worker_counts, chunk_size=args.chunk_size,
         )
-        all_results.extend(cpu_results)
+        all_results.extend(spsparse_results)
+
+    if args.backend in ("mkl", "cpu", "all"):
+        thread_counts = [int(t) for t in args.mkl_threads.split(",")]
+        mkl_results = benchmark_mkl(
+            grg_path=args.grg, k=args.k,
+            n_trials=args.trials, n_warmup=args.warmup,
+            thread_counts=thread_counts,
+        )
+        all_results.extend(mkl_results)
 
     if args.backend in ("cusparse", "all"):
         fmts = [f.strip() for f in args.fmt.split(",")]

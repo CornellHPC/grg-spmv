@@ -33,7 +33,8 @@ _ALL_ALGS = ['default', 'csr_alg1', 'csr_alg2', 'csr_alg3',
 # ---------------------------------------------------------------------------
 
 def pytest_addoption(parser):
-    parser.addoption("--backend", default="all", choices=["cpu", "cusparse", "all"],
+    parser.addoption("--backend", default="all",
+                     choices=["spsparse", "mkl", "cusparse", "cpu", "all"],
                      help="Which backend(s) to test")
     parser.addoption("--smoke", action="store_true", default=False,
                      help="Run smoke tests only (subset of k values)")
@@ -42,15 +43,38 @@ def pytest_addoption(parser):
 def pytest_collection_modifyitems(config, items):
     """Skip tests based on --backend flag and markers."""
     backend = config.getoption("--backend")
-    if backend == "all":
-        return
-    skip_gpu = pytest.mark.skip(reason="--backend=cpu excludes GPU tests")
-    skip_cpu = pytest.mark.skip(reason="--backend=cusparse excludes CPU tests")
-    for item in items:
-        if backend == "cpu" and "gpu" in item.keywords:
-            item.add_marker(skip_gpu)
-        elif backend == "cusparse" and "cpu" in item.keywords:
-            item.add_marker(skip_cpu)
+    match backend:
+        case "all":
+            return
+        case "cpu":
+            skip = pytest.mark.skip(reason="--backend=cpu excludes GPU tests")
+            for item in items:
+                if "gpu" in item.keywords:
+                    item.add_marker(skip)
+        case "spsparse":
+            skip_mkl = pytest.mark.skip(reason="--backend=spsparse")
+            skip_gpu = pytest.mark.skip(reason="--backend=spsparse")
+            for item in items:
+                if "mkl" in item.keywords:
+                    item.add_marker(skip_mkl)
+                elif "gpu" in item.keywords:
+                    item.add_marker(skip_gpu)
+        case "mkl":
+            skip_sp = pytest.mark.skip(reason="--backend=mkl")
+            skip_gpu = pytest.mark.skip(reason="--backend=mkl")
+            for item in items:
+                if "spsparse" in item.keywords:
+                    item.add_marker(skip_sp)
+                elif "gpu" in item.keywords:
+                    item.add_marker(skip_gpu)
+        case "cusparse":
+            skip_sp = pytest.mark.skip(reason="--backend=cusparse")
+            skip_mkl = pytest.mark.skip(reason="--backend=cusparse")
+            for item in items:
+                if "spsparse" in item.keywords:
+                    item.add_marker(skip_sp)
+                elif "mkl" in item.keywords:
+                    item.add_marker(skip_mkl)
 
 
 # ---------------------------------------------------------------------------

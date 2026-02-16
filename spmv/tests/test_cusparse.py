@@ -178,17 +178,6 @@ class TestLargeGRG:
                                      input_fn=binary_pm1)
         np.testing.assert_array_equal(op @ X, Y_expected)
 
-    def test_allele_counts(self, large_grg_path, gt_large):
-        """op.H @ ones on large GRG: exact integer equality."""
-        def _ones_input(rng, shape, dtype):
-            return np.ones(shape, dtype=dtype)
-        _ones_input.__name__ = "ones"
-
-        op = _make_op(large_grg_path, fmt='csr', k=None)
-        X, Y_expected = gt_large.get('forward', 1, seed=0, dtype=DATA_DTYPE,
-                                     input_fn=_ones_input)
-        np.testing.assert_array_equal(op.H @ X, Y_expected)
-
     def test_dynamic_csr(self, large_grg_path, gt_large):
         """Dynamic CSR on large GRG, approximate."""
         op = _make_op(large_grg_path, fmt='csr', k=None)

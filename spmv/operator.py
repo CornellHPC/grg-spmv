@@ -12,7 +12,7 @@ from scipy.sparse.csgraph import reverse_cuthill_mckee
 from scipy.sparse.linalg import LinearOperator
 
 from spmv.io import save_operator_npz, load_operator_npz, _extract_block
-from spmv.backends.multithread import MultithreadBackend
+from spmv.backends import get_backend_class
 
 
 def _create_backend(config: dict[str, Any]):
@@ -23,29 +23,25 @@ def _create_backend(config: dict[str, Any]):
     ----------
     config : dict
         Backend configuration with keys:
-        - 'type': str - Backend type ('multithread', 'cusparse')
+        - 'type': str — Backend type ('spsparse', 'mkl', 'cusparse')
         - Additional backend-specific parameters
-
-    Returns
-    -------
-    Backend
-        Instantiated backend.
     """
-    backend_type = config.get('type', 'multithread')
+    backend_type = config.get('type', 'spsparse')
     verbose = config.get('verbose', False)
+    cls = get_backend_class(backend_type)
 
-    if backend_type == 'multithread':
-        n_workers = config.get('n_workers', 1)
-        chunk_size = config.get('chunk_size', 4096)
-        return MultithreadBackend(n_workers, chunk_size, verbose)
-    elif backend_type == 'cusparse':
-        from spmv.backends.cusparse import CusparseBackend
-        fmt = config.get('fmt', 'csr')
-        k = config.get('k', None)
-        algorithm = config.get('algorithm', 'default')
-        return CusparseBackend(fmt=fmt, k=k, algorithm=algorithm, verbose=verbose)
-    else:
-        raise ValueError(f"Unknown backend type: {backend_type}")
+    match backend_type:
+        case 'spsparse':
+            return cls(config.get('n_workers', 1),
+                       config.get('chunk_size', 4096), verbose)
+        case 'mkl':
+            return cls(config.get('n_threads', 0), verbose)
+        case 'cusparse':
+            return cls(fmt=config.get('fmt', 'csr'), k=config.get('k'),
+                       algorithm=config.get('algorithm', 'default'),
+                       verbose=verbose)
+        case _:
+            raise ValueError(f"No config handler for backend: {backend_type!r}")
 
 
 class SpMVOperator(LinearOperator):
@@ -61,8 +57,8 @@ class SpMVOperator(LinearOperator):
         Path to a .grg file.
     backend_config : dict
         Backend configuration with keys:
-        - 'type': str - Backend type ('multithread', 'cusparse')
-        - Additional backend-specific parameters (e.g., 'n_workers', 'chunk_size')
+        - 'type': str — Backend type ('spsparse', 'mkl', 'cusparse')
+        - Additional backend-specific parameters (e.g., 'n_workers', 'n_threads')
     dtype : numpy dtype
         Data type for computation.
     index_dtype : numpy dtype

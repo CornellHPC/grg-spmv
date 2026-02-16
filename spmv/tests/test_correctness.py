@@ -21,10 +21,14 @@ from spmv.tests.conftest import (
 
 def _make_backend_configs(backend_filter):
     configs = []
-    if backend_filter in ("cpu", "all"):
+    if backend_filter in ("spsparse", "cpu", "all"):
         configs += [
-            pytest.param({'type': 'multithread', 'n_workers': 1}, id='cpu-1w'),
-            pytest.param({'type': 'multithread', 'n_workers': 4}, id='cpu-4w'),
+            pytest.param({'type': 'spsparse', 'n_workers': 1}, id='spsparse-1w'),
+            pytest.param({'type': 'spsparse', 'n_workers': 4}, id='spsparse-4w'),
+        ]
+    if backend_filter in ("mkl", "cpu", "all"):
+        configs += [
+            pytest.param({'type': 'mkl', 'n_threads': 0}, id='mkl'),
         ]
     if backend_filter in ("cusparse", "all"):
         try:
@@ -37,13 +41,13 @@ def _make_backend_configs(backend_filter):
             for fmt, alg in sorted(VALID_FMT_ALG_COMBOS):
                 configs.append(pytest.param(
                     {'type': 'cusparse', 'fmt': fmt, 'algorithm': alg, 'k': None},
-                    id=f'gpu-dyn-{fmt}-{alg}',
+                    id=f'cusparse-dyn-{fmt}-{alg}',
                 ))
             # Graph mode for all valid combos (k=4)
             for fmt, alg in sorted(VALID_FMT_ALG_COMBOS):
                 configs.append(pytest.param(
                     {'type': 'cusparse', 'fmt': fmt, 'algorithm': alg, 'k': 4},
-                    id=f'gpu-graph-{fmt}-{alg}',
+                    id=f'cusparse-graph-{fmt}-{alg}',
                 ))
     return configs
 
@@ -86,6 +90,56 @@ def pytest_generate_tests(metafunc):
 @pytest.fixture
 def op(backend_config, small_grg_path):
     return _get_op(backend_config, small_grg_path)
+
+
+@pytest.fixture
+def op_large(backend_config, large_grg_path):
+    return _get_op(backend_config, large_grg_path)
+
+
+# ---------------------------------------------------------------------------
+# TestStructure — operator structure (backend-agnostic)
+# ---------------------------------------------------------------------------
+
+class TestStructure:
+    """Tests for operator structure properties."""
+
+    def test_shape(self, backend_config, small_grg_path):
+        import pygrgl
+        grg = pygrgl.load_immutable_grg(small_grg_path)
+        op = _get_op(backend_config, small_grg_path)
+        assert op.shape == (grg.num_samples, grg.num_mutations)
+
+    def test_level_offsets(self, op):
+        off = op.level_offsets
+        assert off[0] == 0 and off[-1] == op.K
+        assert np.all(np.diff(off) > 0)
+
+    def test_selector_shape(self, op):
+        n, m = op.shape
+        assert op.sel.shape == (m, op.K)
+
+
+# ---------------------------------------------------------------------------
+# TestRCMReordering — RCM correctness (backend-agnostic)
+# ---------------------------------------------------------------------------
+
+class TestRCMReordering:
+    """Test RCM reordering produces correct results vs ground truth."""
+
+    def test_rcm_forward(self, backend_config, small_grg_path, gt_small):
+        op = SpMVOperator(small_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE,
+                          use_rcm=True)
+        X, Y_expected = gt_small.get('forward', 4, seed=42, dtype=DATA_DTYPE)
+        atol, rtol = tol(DATA_DTYPE)
+        np.testing.assert_allclose(op.H @ X, Y_expected, atol=atol, rtol=rtol)
+
+    def test_rcm_backward(self, backend_config, small_grg_path, gt_small):
+        op = SpMVOperator(small_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE,
+                          use_rcm=True)
+        X, Y_expected = gt_small.get('backward', 4, seed=42, dtype=DATA_DTYPE)
+        atol, rtol = tol(DATA_DTYPE)
+        np.testing.assert_allclose(op @ X, Y_expected, atol=atol, rtol=rtol)
 
 
 # ---------------------------------------------------------------------------
@@ -214,3 +268,36 @@ class TestZeroInput:
         X = np.zeros((m, 4), dtype=DATA_DTYPE)
         Y = op @ X
         np.testing.assert_array_equal(Y, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# TestLargeGRG — backend-agnostic large GRG correctness
+# ---------------------------------------------------------------------------
+
+class TestLargeGRG:
+    """Large GRG correctness, parametrized across all backends."""
+
+    def test_forward(self, op_large, gt_large):
+        X, Y_expected = gt_large.get('forward', 4, seed=8001, dtype=DATA_DTYPE)
+        atol, rtol = tol(DATA_DTYPE)
+        np.testing.assert_allclose(op_large.H @ X, Y_expected, atol=atol, rtol=rtol)
+
+    def test_backward(self, op_large, gt_large):
+        X, Y_expected = gt_large.get('backward', 4, seed=8001, dtype=DATA_DTYPE)
+        atol, rtol = tol(DATA_DTYPE)
+        np.testing.assert_allclose(op_large @ X, Y_expected, atol=atol, rtol=rtol)
+
+    def test_exact_forward(self, op_large, gt_large):
+        X, Y_expected = gt_large.get('forward', 4, seed=8002, dtype=DATA_DTYPE,
+                                     input_fn=binary_pm1)
+        np.testing.assert_array_equal(op_large.H @ X, Y_expected)
+
+    def test_exact_backward(self, op_large, gt_large):
+        X, Y_expected = gt_large.get('backward', 4, seed=8002, dtype=DATA_DTYPE,
+                                     input_fn=binary_pm1)
+        np.testing.assert_array_equal(op_large @ X, Y_expected)
+
+    def test_allele_counts(self, op_large, gt_large):
+        X, Y_expected = gt_large.get('forward', 1, seed=0, dtype=DATA_DTYPE,
+                                     input_fn=_ones_input)
+        np.testing.assert_array_equal(op_large.H @ X, Y_expected)

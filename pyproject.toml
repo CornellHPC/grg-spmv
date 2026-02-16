@@ -14,12 +14,14 @@ dependencies = [
     "pytest>=9.0.2",
     "scipy>=1.17.0",
     "seaborn>=0.13.2",
+    "sparse-dot-mkl>=0.9.10",
 ]
 
 [tool.pytest.ini_options]
 markers = [
     "gpu: tests requiring a GPU (CuPy + cuSPARSE)",
-    "cpu: tests specific to CPU multithread backend",
+    "spsparse: tests specific to SciPy sparse + multithread backend",
+    "mkl: tests specific to MKL backend",
 ]
 
 [tool.pyright]

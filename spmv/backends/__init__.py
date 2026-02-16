@@ -77,4 +77,22 @@ class Backend(ABC):
         pass
 
 
-__all__ = ['Backend']
+BACKEND_REGISTRY: dict[str, tuple[str, str]] = {
+    'spsparse':  ('spmv.backends.spsparse',  'SpsparseBackend'),
+    'mkl':       ('spmv.backends.mkl',       'MklBackend'),
+    'cusparse':  ('spmv.backends.cusparse',  'CusparseBackend'),
+}
+
+
+def get_backend_class(backend_type: str) -> type[Backend]:
+    """Lazy-import and return the backend class for the given type name."""
+    if backend_type not in BACKEND_REGISTRY:
+        raise ValueError(f"Unknown backend type: {backend_type!r}. "
+                         f"Available: {sorted(BACKEND_REGISTRY)}")
+    module_path, class_name = BACKEND_REGISTRY[backend_type]
+    import importlib
+    mod = importlib.import_module(module_path)
+    return getattr(mod, class_name)
+
+
+__all__ = ['Backend', 'BACKEND_REGISTRY', 'get_backend_class']

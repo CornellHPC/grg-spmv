@@ -209,35 +209,39 @@ class CusparseBackend(Backend):
         cslib = self._cslib
         cdt = cuda_dtype(self._dtype)
 
-        if self._fmt == 'csr':
-            A = sp.csr_matrix(A_scipy).astype(self._dtype)
-            indptr = cp.array(A.indptr.astype(np.int32))
-            indices = cp.array(A.indices.astype(np.int32))
-            data = cp.array(A.data)
-            desc = cslib.create_csr(
-                A.shape[0], A.shape[1], A.nnz,
-                indptr.data.ptr, indices.data.ptr, data.data.ptr, cdt,
-            )
-        elif self._fmt == 'csc':
-            A = A_scipy.tocsc()
-            indptr = cp.array(A.indptr.astype(np.int32))
-            indices = cp.array(A.indices.astype(np.int32))
-            data = cp.array(A.data.astype(self._dtype))
-            desc = cslib.create_csc(
-                A.shape[0], A.shape[1], A.nnz,
-                indptr.data.ptr, indices.data.ptr, data.data.ptr, cdt,
-            )
-        else:  # coo
-            A = A_scipy.tocoo()
-            row_idx = cp.array(A.row.astype(np.int32))
-            col_idx = cp.array(A.col.astype(np.int32))
-            data = cp.array(A.data.astype(self._dtype))
-            desc = cslib.create_coo(
-                A.shape[0], A.shape[1], A.nnz,
-                row_idx.data.ptr, col_idx.data.ptr, data.data.ptr, cdt,
-            )
-            return desc, (row_idx, col_idx, data)
-        return desc, (indptr, indices, data)
+        match self._fmt:
+            case 'csr':
+                A = sp.csr_matrix(A_scipy).astype(self._dtype)
+                indptr = cp.array(A.indptr.astype(np.int32))
+                indices = cp.array(A.indices.astype(np.int32))
+                data = cp.array(A.data)
+                desc = cslib.create_csr(
+                    A.shape[0], A.shape[1], A.nnz,
+                    indptr.data.ptr, indices.data.ptr, data.data.ptr, cdt,
+                )
+                return desc, (indptr, indices, data)
+            case 'csc':
+                A = A_scipy.tocsc()
+                indptr = cp.array(A.indptr.astype(np.int32))
+                indices = cp.array(A.indices.astype(np.int32))
+                data = cp.array(A.data.astype(self._dtype))
+                desc = cslib.create_csc(
+                    A.shape[0], A.shape[1], A.nnz,
+                    indptr.data.ptr, indices.data.ptr, data.data.ptr, cdt,
+                )
+                return desc, (indptr, indices, data)
+            case 'coo':
+                A = A_scipy.tocoo()
+                row_idx = cp.array(A.row.astype(np.int32))
+                col_idx = cp.array(A.col.astype(np.int32))
+                data = cp.array(A.data.astype(self._dtype))
+                desc = cslib.create_coo(
+                    A.shape[0], A.shape[1], A.nnz,
+                    row_idx.data.ptr, col_idx.data.ptr, data.data.ptr, cdt,
+                )
+                return desc, (row_idx, col_idx, data)
+            case _:
+                raise ValueError(f"Unknown sparse format: {self._fmt!r}")
 
     # ------------------------------------------------------------------
     # SpMM helpers
