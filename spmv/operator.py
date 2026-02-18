@@ -35,7 +35,11 @@ def _create_backend(config: dict[str, Any]):
             return cls(config.get('n_workers', 1),
                        config.get('chunk_size', 4096), verbose)
         case 'mkl':
-            return cls(config.get('n_threads', 0), verbose)
+            return cls(n_threads=config.get('n_threads', 0),
+                       fmt=config.get('fmt', 'csr'),
+                       k_hint=config.get('k_hint', 1),
+                       blocksize=config.get('blocksize'),
+                       verbose=verbose)
         case 'cusparse':
             return cls(fmt=config.get('fmt', 'csr'), k=config.get('k'),
                        algorithm=config.get('algorithm', 'default'),

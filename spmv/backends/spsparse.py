@@ -85,11 +85,6 @@ class SpsparseBackend(Backend):
             print(f"SpsparseBackend setup: {len(A_blocks)} levels")
             print(f"  A_blocks total nnz: {total_nnz_fwd:,}")
             print(f"  AT_blocks total nnz: {total_nnz_bwd:,}")
-            for h in range(len(A_blocks)):
-                lo, hi = level_offsets[h], level_offsets[h + 1]
-                fwd_shapes = [blk.shape for blk in A_blocks[h]]
-                bwd_shapes = [blk.shape for blk in self._AT_blocks[h]]
-                print(f"  Level {h}: A_blocks={fwd_shapes}, AT_blocks={bwd_shapes}")
 
     def forward_matmat(self, X: np.ndarray) -> np.ndarray:
         """

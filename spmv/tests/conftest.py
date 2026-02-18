@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 from spmv import SpMVOperator
-from spmv.backends.cusparse import is_valid_combo
 
 # ---------------------------------------------------------------------------
 # Configuration constants (single source of truth)
@@ -83,6 +82,7 @@ def pytest_collection_modifyitems(config, items):
 
 def make_fmt_alg_params():
     """Build pytest.param list for all (fmt, alg) combos: valid pass, invalid xfail."""
+    from spmv.backends.cusparse import is_valid_combo
     params = []
     for fmt in _ALL_FMTS:
         for alg in _ALL_ALGS:
@@ -99,6 +99,7 @@ def make_fmt_alg_params():
 
 def valid_fmt_alg_params():
     """Build pytest.param list for only valid (fmt, alg) combos (no xfail)."""
+    from spmv.backends.cusparse import is_valid_combo
     params = []
     for fmt in _ALL_FMTS:
         for alg in _ALL_ALGS:

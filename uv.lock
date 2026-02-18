@@ -191,7 +191,6 @@ dependencies = [
     { name = "pytest" },
     { name = "scipy" },
     { name = "seaborn" },
-    { name = "sparse-dot-mkl" },
 ]
 
 [package.metadata]
@@ -205,7 +204,6 @@ requires-dist = [
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "scipy", specifier = ">=1.17.0" },
     { name = "seaborn", specifier = ">=0.13.2" },
-    { name = "sparse-dot-mkl", specifier = ">=0.9.10" },
 ]
 
 [[package]]
@@ -688,19 +686,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
-]
-
-[[package]]
-name = "sparse-dot-mkl"
-version = "0.9.10"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-    { name = "scipy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ca/91/9f82df25dee9c8e4019f9aa05a3b854d2390f3bc6963279bda79f3ad5284/sparse_dot_mkl-0.9.10.tar.gz", hash = "sha256:8af89242e53654c168b4843e5c7ed8e9f55d7778f60ac70b75a5309eff1a1164", size = 48342, upload-time = "2025-10-23T14:53:17.134Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ea/ee/bfb201a532bc55dd7024e9b47348755b6037662ffbad2880dc5c42e283c1/sparse_dot_mkl-0.9.10-py3-none-any.whl", hash = "sha256:d554784392d8049eebae516920b052b09c15655aeb9acfc880f8237c43145672", size = 61276, upload-time = "2025-10-23T14:53:15.989Z" },
 ]
 
 [[package]]

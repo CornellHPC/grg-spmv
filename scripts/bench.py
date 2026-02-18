@@ -3,12 +3,12 @@ Benchmarking utilities for SpMVOperator.
 """
 
 import argparse
+import gc
 from time import perf_counter
 
 import numpy as np
 
 from spmv import SpMVOperator
-from spmv.backends.cusparse import is_valid_combo
 
 DTYPE = np.float64
 INDEX_DTYPE = np.uintp
@@ -83,47 +83,60 @@ def benchmark_spsparse(grg_path, k, n_trials, n_warmup, worker_counts, chunk_siz
         print(f"  G @ W:   {np.mean(times_fwd)*1000:.2f} +/- {np.std(times_fwd)*1000:.2f} ms")
         print(f"  G^T @ V: {np.mean(times_bwd)*1000:.2f} +/- {np.std(times_bwd)*1000:.2f} ms")
 
+        del op, W, V, result_fwd, result_bwd
+        gc.collect()
+
     return results
 
 
-def benchmark_mkl(grg_path, k, n_trials, n_warmup, thread_counts):
-    """Benchmark MKL backend across thread counts."""
+def benchmark_mkl(grg_path, k, n_trials, n_warmup, thread_counts, fmts,
+                   k_hint):
+    """Benchmark MKL backend across (thread_count, fmt) combinations."""
     print(f"GRG file: {grg_path}")
 
     results = []
-    for n_threads in thread_counts:
-        print(f"\n{'='*60}")
-        print(f"Loading operator: n_threads={n_threads}")
-        t0 = perf_counter()
-        backend_config = {
-            'type': 'mkl', 'n_threads': n_threads, 'verbose': True
-        }
-        op = SpMVOperator(grg_path, backend_config, DTYPE, INDEX_DTYPE, use_rcm=True)
-        build_time = perf_counter() - t0
+    for fmt in fmts:
+        for n_threads in thread_counts:
+            label = f'mkl-{fmt}-{n_threads}t'
+            print(f"\n{'='*60}")
+            print(f"Loading operator: fmt={fmt}, n_threads={n_threads}, k_hint={k_hint}")
+            t0 = perf_counter()
+            backend_config = {
+                'type': 'mkl', 'n_threads': n_threads, 'fmt': fmt,
+                'k_hint': k_hint, 'verbose': True,
+            }
+            op = SpMVOperator(grg_path, backend_config, DTYPE, INDEX_DTYPE, use_rcm=True)
+            build_time = perf_counter() - t0
 
-        W, V = _make_vectors(op, k)
-        times_fwd, times_bwd, result_fwd, result_bwd = _time_op(op, W, V, n_warmup, n_trials)
+            W, V = _make_vectors(op, k)
+            times_fwd, times_bwd, result_fwd, result_bwd = _time_op(op, W, V, n_warmup, n_trials)
 
-        results.append({
-            'label': f'mkl-{n_threads}t',
-            'build': build_time,
-            'fwd_mean': np.mean(times_fwd) * 1000,
-            'fwd_std': np.std(times_fwd) * 1000,
-            'bwd_mean': np.mean(times_bwd) * 1000,
-            'bwd_std': np.std(times_bwd) * 1000,
-            'fwd_cksum': np.linalg.norm(result_fwd),
-            'bwd_cksum': np.linalg.norm(result_bwd),
-        })
+            results.append({
+                'label': label,
+                'build': build_time,
+                'fwd_mean': np.mean(times_fwd) * 1000,
+                'fwd_std': np.std(times_fwd) * 1000,
+                'bwd_mean': np.mean(times_bwd) * 1000,
+                'bwd_std': np.std(times_bwd) * 1000,
+                'fwd_cksum': np.linalg.norm(result_fwd),
+                'bwd_cksum': np.linalg.norm(result_bwd),
+            })
 
-        print(f"  Build: {build_time:.2f}s")
-        print(f"  G @ W:   {np.mean(times_fwd)*1000:.2f} +/- {np.std(times_fwd)*1000:.2f} ms")
-        print(f"  G^T @ V: {np.mean(times_bwd)*1000:.2f} +/- {np.std(times_bwd)*1000:.2f} ms")
+            print(f"  Build: {build_time:.2f}s")
+            print(f"  G @ W:   {np.mean(times_fwd)*1000:.2f} +/- {np.std(times_fwd)*1000:.2f} ms")
+            print(f"  G^T @ V: {np.mean(times_bwd)*1000:.2f} +/- {np.std(times_bwd)*1000:.2f} ms")
+
+            # Destroy MKL handles before the next iteration to avoid
+            # two full sets of handles coexisting during construction.
+            del op, W, V, result_fwd, result_bwd
+            gc.collect()
 
     return results
 
 
 def filter_valid_combinations(fmts, algorithms):
     """Filter out invalid (format, algorithm) combinations."""
+    from spmv.backends.cusparse import is_valid_combo
     return [(fmt, alg) for fmt in fmts for alg in algorithms
             if is_valid_combo(fmt, alg)]
 
@@ -246,7 +259,8 @@ def benchmark_gpu(grg_path, k, n_trials, n_warmup, fmts, graph_ks, algorithms):
             print(f"\n  Timed ({n_trials} trials, {n_warmup} warmup):")
             print(f"  G @ W:   {np.mean(times_fwd)*1000:.2f} +/- {np.std(times_fwd)*1000:.2f} ms")
             print(f"  G^T @ V: {np.mean(times_bwd)*1000:.2f} +/- {np.std(times_bwd)*1000:.2f} ms")
-            del op
+            del op, W, V, result_fwd, result_bwd
+            gc.collect()
 
     return results
 
@@ -365,6 +379,10 @@ if __name__ == "__main__":
     # MKL-specific
     parser.add_argument("--mkl-threads", type=str, default="0,1,4,16",
         help="Comma-separated thread counts for MKL backend")
+    parser.add_argument("--mkl-fmt", type=str, default="csr",
+        help="Comma-separated sparse formats for MKL backend (csr,csc,coo)")
+    parser.add_argument("--mkl-k-hint", type=int, default=None,
+        help="MKL SpMM k_hint (default: match --k)")
 
     # GPU-specific
     parser.add_argument("--fmt", type=str, default="csr,csc",
@@ -389,10 +407,13 @@ if __name__ == "__main__":
 
     if args.backend in ("mkl", "cpu", "all"):
         thread_counts = [int(t) for t in args.mkl_threads.split(",")]
+        mkl_fmts = [f.strip() for f in args.mkl_fmt.split(",")]
+        mkl_k_hint = args.mkl_k_hint if args.mkl_k_hint is not None else args.k
         mkl_results = benchmark_mkl(
             grg_path=args.grg, k=args.k,
             n_trials=args.trials, n_warmup=args.warmup,
-            thread_counts=thread_counts,
+            thread_counts=thread_counts, fmts=mkl_fmts,
+            k_hint=mkl_k_hint,
         )
         all_results.extend(mkl_results)
 
