@@ -258,3 +258,5 @@ inputs/
 archived/
 text/
 figs/
+external/
+*.pygrgl_spmv.npz

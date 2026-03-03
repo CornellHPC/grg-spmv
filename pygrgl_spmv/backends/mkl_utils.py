@@ -262,12 +262,10 @@ class MklSparseHandle:
     mat : scipy sparse matrix
         Input matrix (will be converted to the requested format).
     fmt : str
-        Target format: 'csr', 'csc', 'coo', 'bsr'.
-    blocksize : int or None
-        Block size for BSR format.
+        Target format: 'csr', 'csc', 'coo'.
     """
 
-    def __init__(self, mat, fmt='csr', blocksize=None):
+    def __init__(self, mat, fmt='csr'):
         lib, int_dtype, ct_int = _ensure_loaded()
         self._lib = lib
         self._ct_int = ct_int
@@ -275,12 +273,12 @@ class MklSparseHandle:
         self._fmt = fmt
 
         # Convert to target format and keep reference
-        self._mat = _scipy_to_fmt(mat, fmt, blocksize)
+        self._mat = _scipy_to_fmt(mat, fmt)
         self._nnz = self._mat.nnz
         self._shape = self._mat.shape
 
         # Ensure index arrays use the correct MKL integer type
-        if fmt in ('csr', 'csc', 'bsr'):
+        if fmt in ('csr', 'csc'):
             self._mat.indptr = self._mat.indptr.astype(int_dtype, copy=False)
             self._mat.indices = self._mat.indices.astype(int_dtype, copy=False)
         elif fmt == 'coo':
@@ -329,26 +327,6 @@ class MklSparseHandle:
                 self._mat.col.ctypes.data_as(INT_P),
                 self._mat.data.ctypes.data_as(DBL_P),
             ), 'mkl_sparse_d_create_coo')
-
-        elif fmt == 'bsr':
-            bs = self._mat.blocksize[0]
-            indptr = self._mat.indptr
-            mb = m // bs  # number of block-rows
-            nb = n // bs  # number of block-cols
-            # BSR data is (nblocks, bs, bs) — flatten to C-contiguous
-            data = np.ascontiguousarray(self._mat.data, dtype=np.float64)
-            _check(lib.mkl_sparse_d_create_bsr(
-                byref(self._handle),
-                ct_int(SPARSE_INDEX_BASE_ZERO),
-                ct_int(SPARSE_LAYOUT_ROW_MAJOR),
-                ct_int(mb), ct_int(nb), ct_int(bs),
-                indptr[:-1].ctypes.data_as(INT_P),
-                indptr[1:].ctypes.data_as(INT_P),
-                self._mat.indices.ctypes.data_as(INT_P),
-                data.ctypes.data_as(DBL_P),
-            ), 'mkl_sparse_d_create_bsr')
-            # Keep data reference alive
-            self._bsr_data = data
 
         else:
             raise ValueError(f"Unsupported format: {fmt!r}")
@@ -434,7 +412,7 @@ class MklSparseHandle:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _scipy_to_fmt(mat, fmt, blocksize=None):
+def _scipy_to_fmt(mat, fmt):
     """Convert a scipy sparse matrix to the target format."""
     if fmt == 'csr':
         return mat.tocsr()
@@ -442,10 +420,6 @@ def _scipy_to_fmt(mat, fmt, blocksize=None):
         return mat.tocsc()
     elif fmt == 'coo':
         return mat.tocoo()
-    elif fmt == 'bsr':
-        if blocksize is None:
-            raise ValueError("blocksize required for BSR format")
-        return mat.tobsr(blocksize=(blocksize, blocksize))
     else:
         raise ValueError(f"Unsupported format: {fmt!r}")
 

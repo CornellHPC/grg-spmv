@@ -6,9 +6,12 @@ high-level cuSPARSE calls.
 """
 
 import ctypes
+import logging
 from ctypes import c_int, c_int64, c_size_t, c_void_p, byref, POINTER
 
 import numpy as np
+
+_LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # cuSPARSE enum constants  (values from cusparse.h / library_types.h)
@@ -57,9 +60,9 @@ def cuda_dtype(np_dtype):
         raise ValueError(f"Unsupported dtype for cuSPARSE: {dt}")
 
 
-def parse_algorithm(alg_str):
-    """Parse algorithm string to cuSPARSE algorithm constant."""
-    alg_map = {
+def parse_algo(algo: str):
+    """Parse algo string to cuSPARSE algorithm constant."""
+    algo_map = {
         'default': CUSPARSE_SPMM_ALG_DEFAULT,
         'coo_alg1': CUSPARSE_SPMM_COO_ALG1,
         'coo_alg2': CUSPARSE_SPMM_COO_ALG2,
@@ -69,12 +72,12 @@ def parse_algorithm(alg_str):
         'csr_alg2': CUSPARSE_SPMM_CSR_ALG2,
         'csr_alg3': CUSPARSE_SPMM_CSR_ALG3,
     }
-    if isinstance(alg_str, int):
-        return alg_str
-    alg_lower = alg_str.lower()
-    if alg_lower not in alg_map:
-        raise ValueError(f"Unknown algorithm: {alg_str}. Valid options: {list(alg_map.keys())}")
-    return alg_map[alg_lower]
+    if not isinstance(algo, str):
+        raise TypeError(f"algo must be a string, got {type(algo).__name__}")
+    algo_key = algo.lower()
+    if algo_key not in algo_map:
+        raise ValueError(f"Unknown algo: {algo}. Valid options: {list(algo_map.keys())}")
+    return algo_map[algo_key]
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +267,7 @@ class CuSparseLib:
 
     # --- SpMM operations ----------------------------------------------------
 
-    def spmm_buffer_size(self, cp, algorithm, op_a, op_b,
+    def spmm_buffer_size(self, cp, algo, op_a, op_b,
                          alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc, cdt):
         """Query SpMM buffer size and allocate workspace. Returns cupy array."""
         buf_size = c_size_t(0)
@@ -272,11 +275,11 @@ class CuSparseLib:
             self._handle, c_int(op_a), c_int(op_b),
             c_void_p(alpha_ptr), sp_desc, B_desc,
             c_void_p(beta_ptr), C_desc,
-            c_int(cdt), c_int(algorithm), byref(buf_size),
+            c_int(cdt), c_int(algo), byref(buf_size),
         ), 'cusparseSpMM_bufferSize')
         return cp.zeros(max(buf_size.value, 4), dtype=cp.uint8)
 
-    def spmm_preprocess(self, algorithm, op_a, op_b,
+    def spmm_preprocess(self, algo, op_a, op_b,
                         alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc,
                         cdt, ext_buf_ptr):
         """Run cusparseSpMM_preprocess on an already-allocated workspace."""
@@ -284,10 +287,10 @@ class CuSparseLib:
             self._handle, c_int(op_a), c_int(op_b),
             c_void_p(alpha_ptr), sp_desc, B_desc,
             c_void_p(beta_ptr), C_desc,
-            c_int(cdt), c_int(algorithm), c_void_p(ext_buf_ptr),
+            c_int(cdt), c_int(algo), c_void_p(ext_buf_ptr),
         ), 'cusparseSpMM_preprocess')
 
-    def spmm(self, algorithm, op_a, op_b,
+    def spmm(self, algo, op_a, op_b,
              alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc,
              cdt, ext_buf_ptr):
         """Launch a single cusparseSpMM kernel."""
@@ -295,7 +298,7 @@ class CuSparseLib:
             self._handle, c_int(op_a), c_int(op_b),
             c_void_p(alpha_ptr), sp_desc, B_desc,
             c_void_p(beta_ptr), C_desc,
-            c_int(cdt), c_int(algorithm), c_void_p(ext_buf_ptr),
+            c_int(cdt), c_int(algo), c_void_p(ext_buf_ptr),
         ), 'cusparseSpMM')
 
     # --- Cleanup ------------------------------------------------------------
@@ -364,4 +367,4 @@ class GpuTimer:
             dt = self._cp.cuda.get_elapsed_time(self._ev[i][0], self._ev[i + 1][0])
             parts.append(f"{self._ev[i + 1][1]}={dt:.2f}ms")
             total += dt
-        print(f"{prefix}: {' '.join(parts)} total={total:.2f}ms")
+        _LOGGER.info("%s: %s total=%.2fms", prefix, " ".join(parts), total)
