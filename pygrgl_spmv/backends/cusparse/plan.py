@@ -21,7 +21,7 @@ import re
 
 import pygrgl
 
-from pygrgl_spmv.backends.cuda_utils import (
+from pygrgl_spmv.backends.cusparse.ffi import (
     CUSPARSE_OPERATION_NON_TRANSPOSE,
     CUSPARSE_OPERATION_TRANSPOSE,
     CUSPARSE_ORDER_COL,

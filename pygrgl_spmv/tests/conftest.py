@@ -255,9 +255,9 @@ def make_mkl_config(
 
 def _has_mkl_runtime() -> bool:
     try:
-        from pygrgl_spmv.backends import mkl_utils
+        from pygrgl_spmv.backends.mkl import ffi as mkl_ffi
 
-        mkl_utils._ensure_loaded()
+        mkl_ffi._ensure_loaded()
         return True
     except Exception:
         return False

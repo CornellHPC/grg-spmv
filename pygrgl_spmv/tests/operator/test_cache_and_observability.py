@@ -1,4 +1,4 @@
-"""Cache lifecycle and observability tests for operator/backends."""
+"""Cache lifecycle and observability tests for GRG/backend plumbing."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def test_wavefront_debug_logging_preserves_values(backend_config, primary_grg_pa
 @MKL_ONLY
 def test_wavefront_debug_logs_all_levels(primary_grg_path, spmv_cache_dir, caplog):
     cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1, log_level="DEBUG")
-    with caplog.at_level(logging.DEBUG, logger="pygrgl_spmv.backends.mkl.MklBackend"):
+    with caplog.at_level(logging.DEBUG, logger="pygrgl_spmv.backends.mkl.backend.MklBackend"):
         op = SpmvGRG(primary_grg_path, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
         x = np.ones((2, op.n), dtype=DATA_DTYPE)
         _ = op.matmul(x, pygrgl.TraversalDirection.UP)

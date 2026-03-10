@@ -10,17 +10,10 @@ import scipy.sparse as sp
 
 from pygrgl_spmv.backends.memory import MemoryRecord, MemoryUsage, RuntimeBytes, StaticBytes
 from pygrgl_spmv.backends.mkl import MklPlan
-from scripts.bench import (
-    _validate_and_extract_runtime_memory,
-    benchmark_config,
-    evaluate_output_equivalence,
-    format_dry_run_line,
-    parse_dtype,
-    parse_index_dtype,
-    print_summary_table,
-    summarize_intra_diagnostics,
-    tolerances_for_dtype,
-)
+from scripts.bench.cli import parse_dtype, parse_index_dtype, tolerances_for_dtype
+from scripts.bench.configs import BenchConfig, format_dry_run_line
+from scripts.bench.report import evaluate_output_equivalence, print_summary_table, summarize_intra_diagnostics
+from scripts.bench.run import _validate_and_extract_runtime_memory, benchmark_config
 
 
 def _save_arr(path, arr):
@@ -43,15 +36,15 @@ def test_dtype_parsers_and_tolerances():
 
 def test_format_dry_run_line_includes_dtype_and_index_dtype():
     line = format_dry_run_line(
-        {
-            "label": "x",
-            "config": {
+        BenchConfig(
+            label="x",
+            config={
                 "type": "mkl",
                 "plan_up": MklPlan.from_any({"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1}),
                 "plan_down": None,
                 "log_level": "WARNING",
             },
-        },
+        ),
         [1, 4],
         ["baseline"],
         dtype=np.float32,

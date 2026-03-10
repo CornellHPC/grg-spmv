@@ -221,7 +221,7 @@ def test_mkl_bsr_not_supported(primary_grg_path, spmv_cache_dir):
 
 
 def test_run_uses_per_direction_thread_counts(primary_grg_path, gt_small, spmv_cache_dir, monkeypatch):
-    import pygrgl_spmv.backends.mkl as mkl_backend
+    import pygrgl_spmv.backends.mkl.backend as mkl_backend
 
     calls: list[int] = []
     monkeypatch.setattr(mkl_backend, "mkl_set_num_threads", lambda n: calls.append(int(n)))
@@ -247,7 +247,7 @@ def test_run_uses_per_direction_thread_counts(primary_grg_path, gt_small, spmv_c
 
 
 def test_nonshared_handles_keep_distinct_k_hints(primary_grg_path, spmv_cache_dir, monkeypatch):
-    from pygrgl_spmv.backends.mkl_utils import MklSparseHandle
+    from pygrgl_spmv.backends.mkl.ffi import MklSparseHandle
 
     calls: list[tuple[int, int, bool]] = []
     original = MklSparseHandle.set_mm_hint

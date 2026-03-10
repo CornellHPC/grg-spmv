@@ -17,6 +17,12 @@
 - `data/`
   - immutable fixture datasets used by end-to-end and missingness tests
 
+Implementation paths exercised by these tests:
+
+- GRG code lives under `pygrgl_spmv/grg/`
+- backend code lives under `pygrgl_spmv/backends/base.py`, `reference.py`, `mkl/`, and `cusparse/`
+- benchmark helper tests target the split modules in `scripts/bench/`
+
 ## Markers
 
 - `smoke`: core fast checks selected by `--smoke`

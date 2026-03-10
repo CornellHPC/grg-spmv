@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import argparse
 
-from . import (
+from .cli import (
     add_common_bench_args,
     configure_logging,
-    expand_cusparse_configs,
-    format_dry_run_line,
     parse_common_bench_args,
-    run_benchmark_suite,
 )
+from .configs import expand_cusparse_configs, format_dry_run_line
+from .run import run_benchmark_suite
 
 
 def parse_args() -> argparse.Namespace:

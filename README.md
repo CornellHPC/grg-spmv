@@ -52,6 +52,8 @@ Benchmark scripts:
 
 See `scripts/README.md` for the explicit `--plan-up-down` syntax, wildcard expansion, and search commands.
 
+Internally, the GRG implementation now lives under `pygrgl_spmv/grg/`, and backend implementations live under `pygrgl_spmv/backends/mkl/` and `pygrgl_spmv/backends/cusparse/`.
+
 ## Tests
 
 See `pygrgl_spmv/tests/README.md` for test layout, marker policy, CLI options, and recommended commands.

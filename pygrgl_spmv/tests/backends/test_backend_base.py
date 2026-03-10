@@ -6,11 +6,11 @@ import numpy as np
 import scipy.sparse as sp
 import pytest
 
-from pygrgl_spmv.backends import Backend
+from pygrgl_spmv.backends import BackendSetup, ReferenceBackend
 from pygrgl_spmv.backends.types import InitMode
 
 
-def _make_toy_backend(coalescence_counts: np.ndarray | None = None) -> Backend:
+def _make_toy_backend(coalescence_counts: np.ndarray | None = None) -> ReferenceBackend:
     # Levels: [samples(0,1)] -> [node2] -> [node3]
     level_offsets = np.array([0, 2, 3, 4], dtype=np.int64)
     A_blocks = [
@@ -38,22 +38,25 @@ def _make_toy_backend(coalescence_counts: np.ndarray | None = None) -> Backend:
     sample_perm = np.array([0, 1], dtype=np.int64)
     inv_sample_perm = np.array([0, 1], dtype=np.int64)
 
-    backend = Backend(plan_up=Backend.plan(fmt="CSR", store="N", k_hint=None), plan_down=Backend.plan(fmt="CSC", store="T", k_hint=None))
+    backend = ReferenceBackend(
+        plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
+        plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+    )
     backend.setup(
-        A_blocks=A_blocks,
-        level_offsets=level_offsets,
-        n=2,
-        K=4,
-        sel_mut=sel_mut,
-        sel_miss=sel_miss,
-        sample_perm=sample_perm,
-        inv_sample_perm=inv_sample_perm,
-        coalescence_counts=coalescence_counts,
-        dtype=np.float64,
+        BackendSetup(
+            A_blocks=A_blocks,
+            level_offsets=level_offsets,
+            n=2,
+            K=4,
+            sel_mut=sel_mut,
+            sel_miss=sel_miss,
+            sample_perm=sample_perm,
+            inv_sample_perm=inv_sample_perm,
+            coalescence_counts=coalescence_counts,
+            dtype=np.float64,
+        )
     )
     return backend
-
-
 @pytest.mark.smoke
 def test_backend_base_run_up_and_run_down_cpu_reference():
     backend = _make_toy_backend()

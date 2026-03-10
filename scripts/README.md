@@ -11,6 +11,14 @@ then prints one unified summary table.
 Both entrypoints call the same shared benchmark runner and therefore execute
 the same stress/correctness workflow (intra-case + cross-config diagnostics).
 
+Internal layout:
+
+- `scripts/bench/cli.py`: CLI parsing, dtype/index parsing, logging
+- `scripts/bench/configs.py`: plan-pair parsing, config expansion, dry-run formatting
+- `scripts/bench/cases.py`: generated inputs and scenario construction
+- `scripts/bench/run.py`: benchmark execution and runtime diagnostics
+- `scripts/bench/report.py`: summary rendering and output-equivalence checks
+
 ## Summary table
 
 Columns:

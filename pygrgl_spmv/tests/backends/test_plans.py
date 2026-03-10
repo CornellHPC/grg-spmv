@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from pygrgl_spmv.backends import Backend
+from pygrgl_spmv.backends import ReferenceBackend
 from pygrgl_spmv.backends.mkl import MklPlan
 from pygrgl_spmv.backends.types import SparseFormat, StoredMatrix
-from scripts.bench import parse_plan_pair_literal
+from scripts.bench.configs import parse_plan_pair_literal
 
 
 def test_mkl_plan_string_literal():
@@ -16,7 +16,7 @@ def test_mkl_plan_string_literal():
 
 
 def test_reference_plan_factory():
-    plan = Backend.plan(fmt="CSR", store="N", k_hint=4)
+    plan = ReferenceBackend.plan(fmt="CSR", store="N", k_hint=4)
     assert plan.fmt == SparseFormat.CSR
     assert plan.store == StoredMatrix.N
     assert plan.k_hint == 4
@@ -33,7 +33,7 @@ def test_reference_plan_factory():
     ],
 )
 def test_shared_k_hint_parsing(raw, expected):
-    reference = Backend.plan(fmt="CSR", store="N", k_hint=raw)
+    reference = ReferenceBackend.plan(fmt="CSR", store="N", k_hint=raw)
     mkl = MklPlan.from_any({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": raw})
     assert reference.k_hint == expected
     assert mkl.k_hint == expected
@@ -42,7 +42,7 @@ def test_shared_k_hint_parsing(raw, expected):
 @pytest.mark.parametrize("raw", [0, -1, "0", "-3"])
 def test_shared_k_hint_rejects_non_positive_values(raw):
     with pytest.raises(ValueError, match="k_hint must be positive or none"):
-        Backend.plan(fmt="CSR", store="N", k_hint=raw)
+        ReferenceBackend.plan(fmt="CSR", store="N", k_hint=raw)
     with pytest.raises(ValueError, match="k_hint must be positive or none"):
         MklPlan.from_any({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": raw})
 

@@ -36,6 +36,14 @@ This document describes how memory usage is tracked for all backends through
 - estimated static memory comes from `backend.estimate_static_bytes()`
 - tests assert alignment between measured and estimated static fields
 
+## Layout
+
+- `pygrgl_spmv/backends/base.py`: shared backend scaffolding, setup payloads, validation, and profiling helpers
+- `pygrgl_spmv/backends/reference.py`: `ReferenceBackend` and `ReferencePlan`
+- `pygrgl_spmv/backends/registry.py`: backend factory from the public config dict
+- `pygrgl_spmv/backends/mkl/`: MKL plan, backend, and FFI modules
+- `pygrgl_spmv/backends/cusparse/`: cuSPARSE plan, backend, storage/runtime helpers, and FFI modules
+
 ## Plan-driven backends
 
 Backends are now constructed from explicit `plan_up` / `plan_down` objects
@@ -77,8 +85,11 @@ Either side may be omitted: `plan_up=None` builds a DOWN-only backend and
 
 ### cuSPARSE package layout
 
-- `pygrgl_spmv/backends/cusparse/__init__.py`: `CusparseBackend`
+- `pygrgl_spmv/backends/cusparse/backend.py`: `CusparseBackend`
 - `pygrgl_spmv/backends/cusparse/plan.py`: `CusparsePlan` and its enums/parsers
+- `pygrgl_spmv/backends/cusparse/storage.py`: sparse-block descriptors and storage accounting helpers
+- `pygrgl_spmv/backends/cusparse/runtime.py`: selector routing, dense-view, and workspace helpers
+- `pygrgl_spmv/backends/cusparse/ffi.py`: ctypes bindings and CUDA/cuSPARSE constants
 
 ### `CusparsePlan`
 
