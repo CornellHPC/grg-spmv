@@ -6,50 +6,10 @@ import pygrgl
 import pytest
 
 from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE
+from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, default_backend_params
 
 
-def _backend_configs():
-    params = [
-        pytest.param({"type": "mkl", "n_threads": 0, "log_level": "INFO"}, id="mkl", marks=pytest.mark.mkl),
-    ]
-    try:
-        import cupy  # noqa: F401
-    except ImportError:
-        return params
-
-    params.extend(
-        [
-            pytest.param(
-                {
-                    "type": "cusparse",
-                    "fmt_up": "csr",
-                    "algo_up": "default",
-                    "algo_down": "default",
-                    "k_hint": None,
-                    "log_level": "INFO",
-                },
-                id="cusparse-dyn",
-                marks=pytest.mark.gpu,
-            ),
-            pytest.param(
-                {
-                    "type": "cusparse",
-                    "fmt_up": "csr",
-                    "algo_up": "default",
-                    "algo_down": "default",
-                    "k_hint": 4,
-                    "log_level": "INFO",
-                },
-                id="cusparse-graph-k4",
-                marks=pytest.mark.gpu,
-            ),
-        ]
-    )
-    return params
-
-
-@pytest.fixture(params=_backend_configs())
+@pytest.fixture(params=default_backend_params(log_level="INFO"))
 def backend_config(request, backend_filter):
     cfg = request.param
     btype = str(cfg["type"])

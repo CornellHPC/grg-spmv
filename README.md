@@ -11,8 +11,8 @@ pip install pygrgl-spmv
 Optional extras:
 
 ```bash
-pip install "pygrgl-spmv[gpu]"   # cuSPARSE / CuPy support
-pip install "pygrgl-spmv[dev]"   # tests + plotting + tooling
+pip install "pygrgl-spmv[gpu]"
+pip install "pygrgl-spmv[dev]"
 ```
 
 ## Quick usage
@@ -20,22 +20,28 @@ pip install "pygrgl-spmv[dev]"   # tests + plotting + tooling
 ```python
 import numpy as np
 from pygrgl_spmv import SpmvGRG
+from pygrgl_spmv.backends.mkl import MklPlan
 
 op = SpmvGRG(
     "/path/to/file.grg",
-    {"type": "mkl", "n_threads": 1},
+    {
+        "type": "mkl",
+        "plan_up": MklPlan.from_any({"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1}),
+        "plan_down": MklPlan.from_any({"k_hint": None, "store": "T", "fmt": "CSC", "n_threads": 1}),
+    },
     np.float64,
     np.uintp,
-    cache_dir="pygrgl_spmv_cache",  # optional, defaults to ./pygrgl_spmv_cache
+    cache_dir="pygrgl_spmv_cache",
 )
 ```
 
+Set `plan_up` or `plan_down` to `None` to build a one-sided operator.
+
 ## Cache behavior
 
-- `SpmvGRG` stores/load NPZ caches under `cache_dir`.
+- `SpmvGRG` stores/loads NPZ caches under `cache_dir`
 - default cache root: `./pygrgl_spmv_cache`
-- cache file paths encode the full GRG path to avoid collisions between GRGs
-  with the same filename in different directories.
+- cache file paths encode the full GRG path to avoid collisions between GRGs with the same filename in different directories
 
 ## Benchmarks
 
@@ -44,14 +50,12 @@ Benchmark scripts:
 - `python -m scripts.bench.mkl`
 - `python -m scripts.bench.cusparse`
 
-See `scripts/README.md` for flags, output schema, and examples.
+See `scripts/README.md` for the explicit `--plan-up-down` syntax, wildcard expansion, and search commands.
 
 ## Tests
 
-See `pygrgl_spmv/tests/README.md` for test layout, marker policy, CLI options,
-and recommended commands.
+See `pygrgl_spmv/tests/README.md` for test layout, marker policy, CLI options, and recommended commands.
 
 ## Backend memory tracking
 
-See `pygrgl_spmv/backends/README.md` for static/runtime memory tracking,
-backend-specific accounting details, and estimate-vs-measured semantics.
+See `pygrgl_spmv/backends/README.md` for static/runtime memory tracking, plan objects, and backend-specific accounting details.

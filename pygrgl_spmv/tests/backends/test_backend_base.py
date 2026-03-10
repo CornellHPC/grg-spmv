@@ -38,7 +38,7 @@ def _make_toy_backend(coalescence_counts: np.ndarray | None = None) -> Backend:
     sample_perm = np.array([0, 1], dtype=np.int64)
     inv_sample_perm = np.array([0, 1], dtype=np.int64)
 
-    backend = Backend(fmt_up="csr", fmt_down="csc", k_hint=None)
+    backend = Backend(plan_up=Backend.plan(fmt="CSR", store="N", k_hint=None), plan_down=Backend.plan(fmt="CSC", store="T", k_hint=None))
     backend.setup(
         A_blocks=A_blocks,
         level_offsets=level_offsets,

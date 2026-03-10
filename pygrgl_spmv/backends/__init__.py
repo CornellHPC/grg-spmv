@@ -2,17 +2,76 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
-from typing import List
+import warnings
+from typing import Any, List
 
 import numpy as np
 import scipy.sparse as sp
 
 from pygrgl_spmv.backends.memory import MemoryUsage, RuntimeBytes, StaticBytes
-from pygrgl_spmv.backends.types import InitMode, parse_init_mode
 
-SUPPORTED_FMTS = frozenset({"csr", "csc", "coo"})
-TRANSPOSE_FMT_MAP = {"csr": "csc", "csc": "csr", "coo": "coo"}
+from pygrgl_spmv.backends.types import (
+    Direction,
+    InitMode,
+    SparseFormat,
+    StoredMatrix,
+    parse_init_mode,
+    parse_sparse_format,
+    parse_store,
+    transpose_compatible_format,
+)
+
+
+def _parse_optional_k_hint(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key == "none":
+            return None
+        value = key
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"k_hint must be positive or none, got {value!r}")
+    return parsed
+
+
+@dataclass(frozen=True)
+class ReferencePlan:
+    """Minimal sparse-storage plan for the CPU reference backend."""
+
+    store: StoredMatrix
+    fmt: SparseFormat
+    k_hint: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "k_hint", _parse_optional_k_hint(self.k_hint))
+
+    @classmethod
+    def from_any(cls, value):
+        if isinstance(value, cls):
+            return value
+        if hasattr(value, "store") and hasattr(value, "fmt"):
+            k_hint = getattr(value, "k_hint", None)
+            return cls(
+                store=parse_store(getattr(value, "store")),
+                fmt=parse_sparse_format(getattr(value, "fmt")),
+                k_hint=_parse_optional_k_hint(k_hint),
+            )
+        if isinstance(value, dict):
+            return cls(
+                store=parse_store(value["store"]),
+                fmt=parse_sparse_format(value["fmt"]),
+                k_hint=_parse_optional_k_hint(value.get("k_hint")),
+            )
+        raise TypeError(f"Cannot construct ReferencePlan from {type(value).__name__}")
+
+    def can_share_storage_with(self, other: "ReferencePlan") -> bool:
+        if self.store == other.store:
+            return self.fmt == other.fmt
+        return transpose_compatible_format(self.fmt) == other.fmt
 
 
 def _sparse_host_bytes(mat: sp.spmatrix) -> int:
@@ -74,6 +133,73 @@ def estimate_common_host_static_bytes(
     return host
 
 
+def selector_rows_unique_from_csr_indptr(indptr: np.ndarray) -> bool:
+    """Return True when each selector row has at most one non-zero."""
+    return bool(np.all(np.diff(np.asarray(indptr)) <= 1))
+
+
+def build_wavefront_level_stats(ops_by_level: list[list[object]]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build per-level wavefront stats from logical op lists.
+
+    Returns
+    -------
+    calls : np.ndarray[int32]
+        Number of sparse block calls per level.
+    nnz : np.ndarray[int64]
+        Sum of per-op nnz per level.
+    """
+    calls = np.fromiter((len(ops) for ops in ops_by_level), dtype=np.int32, count=len(ops_by_level))
+    nnz = np.fromiter(
+        (sum(int(getattr(op, "nnz", 0)) for op in ops) for ops in ops_by_level),
+        dtype=np.int64,
+        count=len(ops_by_level),
+    )
+    return calls, nnz
+
+
+def log_wavefront_profile(
+    logger: logging.Logger,
+    *,
+    direction: Direction,
+    calls: np.ndarray,
+    nnz: np.ndarray,
+    level_ms: np.ndarray,
+) -> None:
+    """Log per-level wavefront timing breakdown at DEBUG level."""
+    records = [
+        (h, float(level_ms[h]), int(calls[h]), int(nnz[h]))
+        for h in range(len(level_ms))
+        if int(calls[h]) > 0
+    ]
+    if not records:
+        return
+
+    total_ms = sum(ms for _, ms, _, _ in records)
+    logger.debug("wavefront[%s] levels=%d total=%.3fms", direction.value, len(records), total_ms)
+    for h, ms, call_count, nnz_count in records:
+        pct = (100.0 * ms / total_ms) if total_ms > 0.0 else 0.0
+        logger.debug(
+            "  level=%2d ms=%.3f (%5.1f%%) calls=%3d nnz=%d",
+            h,
+            ms,
+            pct,
+            call_count,
+            nnz_count,
+        )
+
+
+def warn_k_hint_mismatch(*, backend: str, direction: Direction, runtime_k: int, k_hint: int) -> None:
+    warnings.warn(
+        (
+            f"{backend} backend runtime k={runtime_k} does not match k_hint={k_hint}; "
+            f"{direction.value} traversal continues on non-hinted path."
+        ),
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 class Backend:
     """
     Base backend and CPU reference implementation.
@@ -81,62 +207,43 @@ class Backend:
     Subclasses may override setup/run_up/run_down for accelerated kernels.
     """
 
+    @staticmethod
+    def plan(*, fmt: str | SparseFormat = SparseFormat.CSR, store: str | StoredMatrix = StoredMatrix.N, k_hint: int | None = None) -> ReferencePlan:
+        return ReferencePlan(
+            store=parse_store(store),
+            fmt=parse_sparse_format(fmt),
+            k_hint=_parse_optional_k_hint(k_hint),
+        )
+
     def __init__(
         self,
         *,
-        fmt_up: str | None = "csr",
-        fmt_down: str | None = None,
-        k_hint: int | None = None,
+        plan_up,
+        plan_down,
         log_level: str = "WARNING",
     ) -> None:
-        if k_hint is not None:
-            k_hint = int(k_hint)
-            if k_hint <= 0:
-                raise ValueError(f"k_hint must be positive or None, got {k_hint}")
-        self._k_hint = k_hint
+        self._plan_up = None if plan_up is None else (plan_up if hasattr(plan_up, "can_share_storage_with") and hasattr(plan_up, "fmt") else ReferencePlan.from_any(plan_up))
+        self._plan_down = None if plan_down is None else (plan_down if hasattr(plan_down, "can_share_storage_with") and hasattr(plan_down, "fmt") else ReferencePlan.from_any(plan_down))
+        if self._plan_up is None and self._plan_down is None:
+            raise ValueError("At least one of plan_up/plan_down must be provided")
 
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         self._logger.setLevel(getattr(logging, str(log_level).upper(), logging.WARNING))
 
-        up = None if fmt_up is None else str(fmt_up).lower()
-        down = None if fmt_down is None else str(fmt_down).lower()
-        if up is None and down is None:
-            raise ValueError("At least one of fmt_up/fmt_down must be provided")
-        if up is not None and up not in SUPPORTED_FMTS:
-            raise ValueError(f"Unsupported fmt_up {fmt_up!r}; expected one of {sorted(SUPPORTED_FMTS)}")
-        if down is not None and down not in SUPPORTED_FMTS:
-            raise ValueError(f"Unsupported fmt_down {fmt_down!r}; expected one of {sorted(SUPPORTED_FMTS)}")
-
-        if up is None:
-            assert down is not None
-            up = TRANSPOSE_FMT_MAP[down]
-        if down is None:
-            down = TRANSPOSE_FMT_MAP[up]
-        transpose_compatible = TRANSPOSE_FMT_MAP[up] == down
-
-        if fmt_up is None:
+        if self._plan_up is None:
+            share_storage = False
             self._store_blocks_up = False
             self._store_blocks_down = True
-            self._up_ops_owner = "down"
-            self._down_ops_owner = "down"
-        elif fmt_down is None:
+        elif self._plan_down is None:
+            share_storage = False
             self._store_blocks_up = True
             self._store_blocks_down = False
-            self._up_ops_owner = "up"
-            self._down_ops_owner = "up"
-        elif transpose_compatible:
-            self._store_blocks_up = True
-            self._store_blocks_down = False
-            self._up_ops_owner = "up"
-            self._down_ops_owner = "up"
         else:
+            share_storage = self._plan_up.can_share_storage_with(self._plan_down)
             self._store_blocks_up = True
-            self._store_blocks_down = True
-            self._up_ops_owner = "up"
-            self._down_ops_owner = "down"
-
-        self._fmt_up = up
-        self._fmt_down = down
+            self._store_blocks_down = not share_storage
+        self._up_ops_owner = "up"
+        self._down_ops_owner = "up" if share_storage else "down"
 
         self._A_blocks: List[List[sp.csr_matrix]] = []
         self._level_offsets = np.empty(0, dtype=np.int64)
@@ -151,6 +258,36 @@ class Backend:
         self._K = 0
         self._m = 0
         self.mem_usage = MemoryUsage()
+
+    @property
+    def _fmt_up(self) -> str:
+        if self._plan_up is None:
+            raise ValueError("UP plan is not configured")
+        return self._plan_up.fmt.value.lower()
+
+    @property
+    def _fmt_down(self) -> str:
+        if self._plan_down is None:
+            raise ValueError("DOWN plan is not configured")
+        return self._plan_down.fmt.value.lower()
+
+    def _require_plan(self, direction: Direction):
+        plan = self._plan_for(direction)
+        if plan is None:
+            raise ValueError(f"{direction.value.upper()} plan is not configured")
+        return plan
+
+    def _plan_for(self, direction: Direction):
+        return self._plan_up if direction == Direction.UP else self._plan_down
+
+    def _configured_directions(self) -> tuple[Direction, ...]:
+        directions: list[Direction] = []
+        if self._plan_up is not None:
+            directions.append(Direction.UP)
+        if self._plan_down is not None:
+            directions.append(Direction.DOWN)
+        return tuple(directions)
+
 
     def setup(
         self,
@@ -282,6 +419,7 @@ class Backend:
         init: np.ndarray | None = None,
         need_miss_output: bool = False,
     ) -> tuple[np.ndarray, np.ndarray | None]:
+        self._require_plan(Direction.UP)
         X = np.asarray(primary, dtype=self._dtype, order="C")
         if X.ndim != 2:
             raise ValueError(f"primary input must be 2D, got shape {X.shape}")
@@ -328,6 +466,7 @@ class Backend:
         init_mode: InitMode,
         init: np.ndarray | None = None,
     ) -> np.ndarray:
+        self._require_plan(Direction.DOWN)
         X = np.asarray(primary, dtype=self._dtype, order="C")
         if X.ndim != 2:
             raise ValueError(f"primary input must be 2D, got shape {X.shape}")
@@ -368,7 +507,12 @@ class Backend:
 
 __all__ = [
     "Backend",
+    "ReferencePlan",
     "MemoryUsage",
+    "build_wavefront_level_stats",
     "estimate_common_host_static_bytes",
     "estimate_sparse_payload_bytes",
+    "log_wavefront_profile",
+    "selector_rows_unique_from_csr_indptr",
+    "warn_k_hint_mismatch",
 ]

@@ -19,7 +19,239 @@ K_MATRIX = [1, 2, 3, 7, 8, 9, 16, 20]
 
 _ALL_FMTS = ["csr", "csc", "coo"]
 _ALL_ALGOS = ["default", "csr_alg1", "csr_alg2", "csr_alg3", "coo_alg1", "coo_alg2", "coo_alg3", "coo_alg4"]
+_TRANSPOSE_COMPATIBLE_FMT = {"csr": "CSC", "csc": "CSR", "coo": "COO"}
 
+
+def make_cusparse_plan(
+    *,
+    k_hint=None,
+    store="N",
+    fmt="CSR",
+    op_a="N",
+    op_b="N",
+    order_b="ROW",
+    order_c="ROW",
+    algo="DEFAULT",
+):
+    return {
+        "k_hint": k_hint,
+        "store": store,
+        "fmt": fmt,
+        "opA": op_a,
+        "opB": op_b,
+        "orderB": order_b,
+        "orderC": order_c,
+        "algo": algo,
+    }
+
+
+def make_mkl_plan(*, k_hint=None, store="N", fmt="CSR", n_threads=0):
+    return {
+        "k_hint": k_hint,
+        "store": store,
+        "fmt": fmt,
+        "n_threads": n_threads,
+    }
+
+
+def transpose_compatible_fmt(fmt: str) -> str:
+    token = str(fmt).lower()
+    if token not in _TRANSPOSE_COMPATIBLE_FMT:
+        raise ValueError(f"Unsupported sparse format {fmt!r}; expected CSR/CSC/COO")
+    return _TRANSPOSE_COMPATIBLE_FMT[token]
+
+
+def make_backend_config(backend_type: str, *, plan_up, plan_down, log_level="WARNING"):
+    if plan_up is None and plan_down is None:
+        raise ValueError("plan_up/plan_down")
+    return {
+        "type": str(backend_type),
+        "plan_up": plan_up,
+        "plan_down": plan_down,
+        "log_level": log_level,
+    }
+
+
+def default_backend_params(*, log_level="INFO"):
+    params = [
+        pytest.param(
+            make_backend_config(
+                "mkl",
+                plan_up=make_mkl_plan(store="N", fmt="CSR", n_threads=0, k_hint=None),
+                plan_down=make_mkl_plan(store="T", fmt="CSC", n_threads=0, k_hint=None),
+                log_level=log_level,
+            ),
+            id="mkl",
+            marks=pytest.mark.mkl,
+        ),
+    ]
+    try:
+        import cupy  # noqa: F401
+    except ImportError:
+        return params
+
+    params.extend(
+        [
+            pytest.param(
+                make_backend_config(
+                    "cusparse",
+                    plan_up=make_cusparse_plan(
+                        k_hint=None,
+                        store="N",
+                        fmt="CSR",
+                        op_a="N",
+                        op_b="N",
+                        order_b="ROW",
+                        order_c="ROW",
+                        algo="DEFAULT",
+                    ),
+                    plan_down=make_cusparse_plan(
+                        k_hint=None,
+                        store="T",
+                        fmt="CSC",
+                        op_a="N",
+                        op_b="N",
+                        order_b="ROW",
+                        order_c="ROW",
+                        algo="DEFAULT",
+                    ),
+                    log_level=log_level,
+                ),
+                id="cusparse-dyn",
+                marks=pytest.mark.gpu,
+            ),
+            pytest.param(
+                make_backend_config(
+                    "cusparse",
+                    plan_up=make_cusparse_plan(
+                        k_hint=4,
+                        store="N",
+                        fmt="CSR",
+                        op_a="N",
+                        op_b="N",
+                        order_b="ROW",
+                        order_c="ROW",
+                        algo="DEFAULT",
+                    ),
+                    plan_down=make_cusparse_plan(
+                        k_hint=4,
+                        store="T",
+                        fmt="CSC",
+                        op_a="N",
+                        op_b="N",
+                        order_b="ROW",
+                        order_c="ROW",
+                        algo="DEFAULT",
+                    ),
+                    log_level=log_level,
+                ),
+                id="cusparse-graph-k4",
+                marks=pytest.mark.gpu,
+            ),
+        ]
+    )
+    return params
+
+
+def make_cusparse_config(
+    *,
+    fmt_up="csr",
+    fmt_down=None,
+    k_hint=None,
+    algo_up="default",
+    algo_down="default",
+    log_level="WARNING",
+    infer_missing=True,
+):
+    if fmt_up is None and fmt_down is None:
+        raise ValueError("fmt_up/fmt_down")
+    if not isinstance(algo_up, str):
+        raise TypeError("algo_up")
+    if not isinstance(algo_down, str):
+        raise TypeError("algo_down")
+
+    plan_up = None
+    if fmt_up is not None:
+        plan_up = make_cusparse_plan(
+            k_hint=k_hint,
+            store="N",
+            fmt=str(fmt_up).upper(),
+            op_a="N",
+            op_b="N",
+            order_b="ROW",
+            order_c="ROW",
+            algo=algo_up.upper(),
+        )
+    elif infer_missing:
+        assert fmt_down is not None
+        plan_up = make_cusparse_plan(
+            k_hint=k_hint,
+            store="T",
+            fmt=str(fmt_down).upper(),
+            op_a="T",
+            op_b="N",
+            order_b="ROW",
+            order_c="ROW",
+            algo=algo_up.upper(),
+        )
+
+    plan_down = None
+    if fmt_down is not None:
+        plan_down = make_cusparse_plan(
+            k_hint=k_hint,
+            store="T",
+            fmt=str(fmt_down).upper(),
+            op_a="N",
+            op_b="N",
+            order_b="ROW",
+            order_c="ROW",
+            algo=algo_down.upper(),
+        )
+    elif infer_missing:
+        assert fmt_up is not None
+        plan_down = make_cusparse_plan(
+            k_hint=k_hint,
+            store="T",
+            fmt=transpose_compatible_fmt(fmt_up),
+            op_a="N",
+            op_b="N",
+            order_b="ROW",
+            order_c="ROW",
+            algo=algo_down.upper(),
+        )
+
+    return make_backend_config("cusparse", plan_up=plan_up, plan_down=plan_down, log_level=log_level)
+
+
+def make_mkl_config(
+    *,
+    fmt_up="csr",
+    fmt_down=None,
+    k_hint=None,
+    n_threads=0,
+    log_level="WARNING",
+    infer_missing=True,
+):
+    plan_up = None
+    if fmt_up is not None:
+        plan_up = make_mkl_plan(k_hint=k_hint, store="N", fmt=str(fmt_up).upper(), n_threads=n_threads)
+    elif infer_missing:
+        assert fmt_down is not None
+        plan_up = make_mkl_plan(k_hint=k_hint, store="T", fmt=str(fmt_down).upper(), n_threads=n_threads)
+
+    plan_down = None
+    if fmt_down is not None:
+        plan_down = make_mkl_plan(k_hint=k_hint, store="T", fmt=str(fmt_down).upper(), n_threads=n_threads)
+    elif infer_missing:
+        assert fmt_up is not None
+        plan_down = make_mkl_plan(
+            k_hint=k_hint,
+            store="T",
+            fmt=transpose_compatible_fmt(fmt_up),
+            n_threads=n_threads,
+        )
+
+    return make_backend_config("mkl", plan_up=plan_up, plan_down=plan_down, log_level=log_level)
 
 def _has_mkl_runtime() -> bool:
     try:
@@ -96,30 +328,30 @@ def pytest_collection_modifyitems(config, items):
             items[:] = keep
 
 
-def make_fmt_algo_params():
-    """Build pytest.param list for all (fmt, algo) combos: valid pass, invalid xfail."""
+def make_fmt_algo_params(*, transpose_bool: bool = False):
+    """Build pytest.param list for all (fmt, algo) combos for one transpose mode."""
     from pygrgl_spmv.backends.cusparse import is_valid_combo
 
     params = []
     for fmt in _ALL_FMTS:
         for algo in _ALL_ALGOS:
-            pid = f"{fmt}-{algo}"
-            if is_valid_combo(fmt, algo):
+            pid = f"{fmt}-t{int(bool(transpose_bool))}-{algo}"
+            if is_valid_combo(fmt, transpose_bool, algo):
                 params.append(pytest.param(fmt, algo, id=pid))
             else:
                 params.append(pytest.param(fmt, algo, id=pid, marks=pytest.mark.xfail(raises=ValueError, strict=True)))
     return params
 
 
-def valid_fmt_algo_params():
-    """Build pytest.param list for valid (fmt, algo) combos only."""
+def valid_fmt_algo_params(*, transpose_bool: bool = False):
+    """Build pytest.param list for valid (fmt, algo) combos only for one transpose mode."""
     from pygrgl_spmv.backends.cusparse import is_valid_combo
 
     params = []
     for fmt in _ALL_FMTS:
         for algo in _ALL_ALGOS:
-            if is_valid_combo(fmt, algo):
-                params.append(pytest.param(fmt, algo, id=f"{fmt}-{algo}"))
+            if is_valid_combo(fmt, transpose_bool, algo):
+                params.append(pytest.param(fmt, algo, id=f"{fmt}-t{int(bool(transpose_bool))}-{algo}"))
     return params
 
 

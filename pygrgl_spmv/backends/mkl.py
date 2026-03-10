@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import warnings
 from dataclasses import dataclass
 from time import perf_counter
 from typing import List
@@ -12,14 +11,78 @@ from typing import List
 import numpy as np
 import scipy.sparse as sp
 
-from pygrgl_spmv.backends import Backend, estimate_common_host_static_bytes, estimate_sparse_payload_bytes
+from pygrgl_spmv.backends import (
+    _parse_optional_k_hint,
+    Backend,
+    build_wavefront_level_stats,
+    estimate_common_host_static_bytes,
+    estimate_sparse_payload_bytes,
+    log_wavefront_profile,
+    selector_rows_unique_from_csr_indptr,
+    warn_k_hint_mismatch,
+)
 from pygrgl_spmv.backends.memory import RuntimeBytes, StaticBytes
 from pygrgl_spmv.backends.mkl_utils import (
     MklSparseHandle,
     mkl_get_max_threads,
     mkl_set_num_threads,
 )
-from pygrgl_spmv.backends.types import Direction, InitMode, parse_init_mode
+from pygrgl_spmv.backends.types import Direction, InitMode, SparseFormat, StoredMatrix, parse_init_mode, parse_sparse_format, parse_store, transpose_compatible_format
+
+
+@dataclass(frozen=True)
+class MklPlan:
+    """Explicit MKL traversal/storage plan."""
+
+    store: StoredMatrix
+    fmt: SparseFormat
+    n_threads: int = 0
+    k_hint: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "k_hint", _parse_optional_k_hint(self.k_hint))
+
+    @classmethod
+    def from_any(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            allowed_keys = {"store", "fmt", "n_threads", "k_hint"}
+            extra = sorted(set(value) - allowed_keys)
+            if extra:
+                raise ValueError(f"Unknown MklPlan field(s): {extra}")
+            n_threads = int(value.get("n_threads", 0))
+            return cls(
+                store=parse_store(value["store"]),
+                fmt=parse_sparse_format(value["fmt"]),
+                n_threads=n_threads,
+                k_hint=_parse_optional_k_hint(value.get("k_hint")),
+            )
+        if hasattr(value, "store") and hasattr(value, "fmt"):
+            n_threads = int(getattr(value, "n_threads", 0))
+            return cls(
+                store=parse_store(getattr(value, "store")),
+                fmt=parse_sparse_format(getattr(value, "fmt")),
+                n_threads=n_threads,
+                k_hint=_parse_optional_k_hint(getattr(value, "k_hint", None)),
+            )
+        raise TypeError(f"Cannot construct MklPlan from {type(value).__name__}")
+
+    def can_share_storage_with(self, other: "MklPlan") -> bool:
+        if self.store == other.store:
+            return self.fmt == other.fmt
+        return transpose_compatible_format(self.fmt) == other.fmt
+
+    def __str__(self) -> str:
+        return (
+            "["
+            f"k_hint={'none' if self.k_hint is None else self.k_hint},"
+            f"store={self.store.value},fmt={self.fmt.value},"
+            f"n_threads={self.n_threads}"
+            "]"
+        )
 
 
 @dataclass(frozen=True)
@@ -30,6 +93,14 @@ class _MklBlockOp:
     handle: MklSparseHandle
     transpose: bool
     nnz: int
+
+
+def _stored_block(base_block: sp.spmatrix, store: StoredMatrix) -> sp.spmatrix:
+    return base_block if store == StoredMatrix.N else base_block.T
+
+
+def _needs_transpose(direction: Direction, store: StoredMatrix) -> bool:
+    return (direction == Direction.DOWN) != (store == StoredMatrix.T)
 
 
 def _handle_bytes(handle: MklSparseHandle | None) -> int:
@@ -96,24 +167,43 @@ class MklBackend(Backend):
 
     def __init__(
         self,
-        n_threads: int = 0,
-        fmt_up: str | None = "csr",
-        fmt_down: str | None = None,
-        k_hint: int | None = None,
+        *,
+        plan_up: MklPlan,
+        plan_down: MklPlan,
         log_level: str = "WARNING",
     ):
+        up = None if plan_up is None else MklPlan.from_any(plan_up)
+        down = None if plan_down is None else MklPlan.from_any(plan_down)
         super().__init__(
-            fmt_up=fmt_up,
-            fmt_down=fmt_down,
-            k_hint=k_hint,
+            plan_up=up,
+            plan_down=down,
             log_level=log_level,
         )
-        self._n_threads = os.cpu_count() if n_threads == 0 else n_threads
-        if self._fmt_up not in {"csr", "csc", "coo"}:
+        self._n_threads_up = self._resolve_thread_count(self._plan_up)
+        self._n_threads_down = self._resolve_thread_count(self._plan_down)
+        configured_threads = [
+            count for count in (self._n_threads_up, self._n_threads_down) if count is not None
+        ]
+        self._n_threads_setup = max(configured_threads)
+        if self._plan_up is not None and self._fmt_up not in {"csr", "csc", "coo"}:
             raise ValueError(f"Unsupported MKL fmt_up={self._fmt_up!r}; expected csr/csc/coo")
-        if self._fmt_down not in {"csr", "csc", "coo"}:
+        if self._plan_down is not None and self._fmt_down not in {"csr", "csc", "coo"}:
             raise ValueError(f"Unsupported MKL fmt_down={self._fmt_down!r}; expected csr/csc/coo")
         self._coalescence_counts = None
+
+    def _resolve_thread_count(self, plan: MklPlan | None) -> int | None:
+        if plan is None:
+            return None
+        cpu_count = os.cpu_count()
+        if cpu_count is None:
+            cpu_count = 1
+        return cpu_count if plan.n_threads == 0 else int(plan.n_threads)
+
+    def _thread_count_for(self, direction: Direction) -> int:
+        count = self._n_threads_up if direction == Direction.UP else self._n_threads_down
+        if count is None:
+            raise ValueError(f"{direction.value.upper()} plan is not configured")
+        return count
 
     def _build_owned_block_handles(self, A_blocks: List[List[sp.csr_matrix]]) -> None:
         num_levels = len(self._level_offsets) - 1
@@ -121,19 +211,23 @@ class MklBackend(Backend):
         self._blocks_down = [[] for _ in range(num_levels)]
 
         if self._store_blocks_up:
+            if self._plan_up is None:
+                raise RuntimeError("UP storage requested without an UP plan")
             for h in range(num_levels):
                 row: list[MklSparseHandle | None] = []
                 for j in range(h):
-                    blk = A_blocks[h][j]
+                    blk = _stored_block(A_blocks[h][j], self._plan_up.store)
                     row.append(None if blk.nnz == 0 else MklSparseHandle(blk, self._fmt_up))
                 self._blocks_up[h] = row
 
         if self._store_blocks_down:
+            if self._plan_down is None:
+                raise RuntimeError("DOWN storage requested without a DOWN plan")
             for h in range(num_levels):
                 row = []
                 for src in range(h + 1, num_levels):
-                    blk_t = A_blocks[src][h].T.tocsr()
-                    row.append(None if blk_t.nnz == 0 else MklSparseHandle(blk_t, self._fmt_down))
+                    blk = _stored_block(A_blocks[src][h], self._plan_down.store)
+                    row.append(None if blk.nnz == 0 else MklSparseHandle(blk, self._fmt_down))
                 self._blocks_down[h] = row
 
     def _build_logical_ops(self) -> None:
@@ -141,79 +235,94 @@ class MklBackend(Backend):
         self._ops_up: list[list[_MklBlockOp]] = [[] for _ in range(num_levels)]
         self._ops_down: list[list[_MklBlockOp]] = [[] for _ in range(num_levels)]
 
-        for h in range(1, num_levels):
-            for j in range(h):
-                if self._up_ops_owner == "up":
-                    handle = self._blocks_up[h][j]
-                    transpose = False
-                else:
-                    handle = self._blocks_down[j][h - j - 1]
-                    transpose = True
-                if handle is None:
-                    continue
-                self._ops_up[h].append(
-                    _MklBlockOp(
-                        src_level=j,
-                        handle=handle,
-                        transpose=transpose,
-                        nnz=int(handle.nnz),
+        if self._plan_up is not None:
+            for h in range(1, num_levels):
+                for j in range(h):
+                    if self._up_ops_owner == "up":
+                        handle = self._blocks_up[h][j]
+                        owner_store = self._plan_up.store
+                    else:
+                        handle = self._blocks_down[j][h - j - 1]
+                        if self._plan_down is None:
+                            raise RuntimeError("UP ops requested shared DOWN storage without a DOWN plan")
+                        owner_store = self._plan_down.store
+                    if handle is None:
+                        continue
+                    self._ops_up[h].append(
+                        _MklBlockOp(
+                            src_level=j,
+                            handle=handle,
+                            transpose=_needs_transpose(Direction.UP, owner_store),
+                            nnz=int(handle.nnz),
+                        )
                     )
-                )
 
-        for h in range(num_levels - 1):
-            for src in range(num_levels - 1, h, -1):
-                if self._down_ops_owner == "down":
-                    handle = self._blocks_down[h][src - h - 1]
-                    transpose = False
-                else:
-                    handle = self._blocks_up[src][h]
-                    transpose = True
-                if handle is None:
-                    continue
-                self._ops_down[h].append(
-                    _MklBlockOp(
-                        src_level=src,
-                        handle=handle,
-                        transpose=transpose,
-                        nnz=int(handle.nnz),
+        if self._plan_down is not None:
+            for h in range(num_levels - 1):
+                for src in range(num_levels - 1, h, -1):
+                    if self._down_ops_owner == "down":
+                        handle = self._blocks_down[h][src - h - 1]
+                        owner_store = self._plan_down.store
+                    else:
+                        handle = self._blocks_up[src][h]
+                        if self._plan_up is None:
+                            raise RuntimeError("DOWN ops requested shared UP storage without an UP plan")
+                        owner_store = self._plan_up.store
+                    if handle is None:
+                        continue
+                    self._ops_down[h].append(
+                        _MklBlockOp(
+                            src_level=src,
+                            handle=handle,
+                            transpose=_needs_transpose(Direction.DOWN, owner_store),
+                            nnz=int(handle.nnz),
+                        )
                     )
-                )
 
     def _build_selector_indices(self, selector: sp.csr_matrix) -> tuple[np.ndarray, np.ndarray, bool]:
         coo = selector.tocoo()
         rows = np.asarray(coo.row, dtype=np.int64)
         cols = np.asarray(coo.col, dtype=np.int64)
-        row_unique = bool(np.all(np.diff(selector.indptr) <= 1))
+        row_unique = selector_rows_unique_from_csr_indptr(selector.indptr)
         return rows, cols, row_unique
 
     def _configure_handle_hints(self) -> None:
-        usage: dict[int, dict[str, object]] = {}
-        for ops_by_level in (self._ops_up, self._ops_down):
+        usage: dict[tuple[int, bool], dict[str, object]] = {}
+        for direction, ops_by_level, plan in (
+            (Direction.UP, self._ops_up, self._plan_up),
+            (Direction.DOWN, self._ops_down, self._plan_down),
+        ):
+            if plan is None:
+                continue
             for ops in ops_by_level:
                 for op in ops:
-                    key = id(op.handle)
+                    key = (id(op.handle), bool(op.transpose))
                     entry = usage.get(key)
                     if entry is None:
-                        entry = {"handle": op.handle, "non_transpose": False, "transpose": False}
+                        entry = {
+                            "handle": op.handle,
+                            "transpose": bool(op.transpose),
+                            "k_hint": plan.k_hint,
+                        }
                         usage[key] = entry
-                    if op.transpose:
-                        entry["transpose"] = True
-                    else:
-                        entry["non_transpose"] = True
-
-        hint_k = self._k_hint
+                        continue
+                    existing_hint = entry["k_hint"]
+                    if existing_hint is None:
+                        entry["k_hint"] = plan.k_hint
+                    elif plan.k_hint is not None and int(existing_hint) != int(plan.k_hint):
+                        raise ValueError(
+                            "Incompatible MKL k_hint values share the same handle and transpose mode: "
+                            f"{direction.value} requested {plan.k_hint}, existing {existing_hint}"
+                        )
         expected = 1000
         for entry in usage.values():
             handle = entry["handle"]
             assert isinstance(handle, MklSparseHandle)
-            if bool(entry["non_transpose"]):
-                handle.set_mv_hint(transpose=False, expected_calls=expected)
-                if hint_k is not None and hint_k > 1:
-                    handle.set_mm_hint(hint_k, transpose=False, expected_calls=expected)
-            if bool(entry["transpose"]):
-                handle.set_mv_hint(transpose=True, expected_calls=expected)
-                if hint_k is not None and hint_k > 1:
-                    handle.set_mm_hint(hint_k, transpose=True, expected_calls=expected)
+            transpose = bool(entry["transpose"])
+            handle.set_mv_hint(transpose=transpose, expected_calls=expected)
+            hint_k = entry["k_hint"]
+            if hint_k is not None and int(hint_k) > 1:
+                handle.set_mm_hint(int(hint_k), transpose=transpose, expected_calls=expected)
             handle.optimize()
 
     def setup(
@@ -229,7 +338,7 @@ class MklBackend(Backend):
         coalescence_counts: np.ndarray | None,
         dtype: np.dtype,
     ) -> None:
-        mkl_set_num_threads(self._n_threads)
+        mkl_set_num_threads(self._n_threads_setup)
 
         self._level_offsets = np.asarray(level_offsets)
         self._n = int(n)
@@ -294,13 +403,13 @@ class MklBackend(Backend):
 
         self._logger.info(
             (
-                "MklBackend setup: fmt_up=%s fmt_down=%s k_hint=%s n_threads=%d (actual=%d) "
+                "MklBackend setup: fmt_up=%s fmt_down=%s k_hint=%s n_threads=%s (actual=%d) "
                 "store_up=%s store_down=%s up_owner=%s down_owner=%s"
             ),
-            self._fmt_up,
-            self._fmt_down,
-            self._k_hint,
-            self._n_threads,
+            "<unspecified>" if self._plan_up is None else self._fmt_up,
+            "<unspecified>" if self._plan_down is None else self._fmt_down,
+            (None if self._plan_up is None else self._plan_up.k_hint, None if self._plan_down is None else self._plan_down.k_hint),
+            (self._n_threads_up, self._n_threads_down),
             mkl_get_max_threads(),
             self._store_blocks_up,
             self._store_blocks_down,
@@ -320,19 +429,8 @@ class MklBackend(Backend):
         self._build_wavefront_level_stats()
 
     def _build_wavefront_level_stats(self) -> None:
-        num_levels = len(self._level_offsets) - 1
-        self._ops_up_calls = np.zeros(num_levels, dtype=np.int32)
-        self._ops_up_nnz = np.zeros(num_levels, dtype=np.int64)
-        self._ops_down_calls = np.zeros(num_levels, dtype=np.int32)
-        self._ops_down_nnz = np.zeros(num_levels, dtype=np.int64)
-
-        for h in range(1, num_levels):
-            self._ops_up_calls[h] = len(self._ops_up[h])
-            self._ops_up_nnz[h] = int(sum(op.nnz for op in self._ops_up[h]))
-
-        for h in range(num_levels - 1):
-            self._ops_down_calls[h] = len(self._ops_down[h])
-            self._ops_down_nnz[h] = int(sum(op.nnz for op in self._ops_down[h]))
+        self._ops_up_calls, self._ops_up_nnz = build_wavefront_level_stats(self._ops_up)
+        self._ops_down_calls, self._ops_down_nnz = build_wavefront_level_stats(self._ops_down)
 
     def _print_wavefront_profile(self, direction: Direction, level_ms: np.ndarray) -> None:
         match direction:
@@ -344,32 +442,7 @@ class MklBackend(Backend):
                 nnz = self._ops_down_nnz
             case _:
                 raise ValueError(f"Unknown direction for wavefront profile: {direction!r}")
-
-        records = [
-            (h, float(level_ms[h]), int(calls[h]), int(nnz[h]))
-            for h in range(len(level_ms))
-            if calls[h] > 0
-        ]
-        if not records:
-            return
-
-        total_ms = sum(ms for _, ms, _, _ in records)
-        self._logger.debug(
-            "wavefront[%s] levels=%d total=%.3fms",
-            direction.value,
-            len(records),
-            total_ms,
-        )
-        for h, ms, call_count, nnz_count in records:
-            pct = (100.0 * ms / total_ms) if total_ms > 0.0 else 0.0
-            self._logger.debug(
-                "  level=%2d ms=%.3f (%5.1f%%) calls=%3d nnz=%d",
-                h,
-                ms,
-                pct,
-                call_count,
-                nnz_count,
-            )
+        log_wavefront_profile(self._logger, direction=direction, calls=calls, nnz=nnz, level_ms=level_ms)
 
     def _propagate_up_inplace(self, U: np.ndarray, level_ms: np.ndarray | None = None) -> None:
         off = self._level_offsets
@@ -499,25 +572,19 @@ class MklBackend(Backend):
         init: np.ndarray | None = None,
         need_miss_output: bool = False,
     ) -> tuple[np.ndarray, np.ndarray | None]:
-        mkl_set_num_threads(self._n_threads)
+        mkl_set_num_threads(self._thread_count_for(Direction.UP))
         total_t0 = perf_counter()
 
         t0 = perf_counter()
+        self._require_plan(Direction.UP)
         X = np.asarray(primary, dtype=self._dtype, order="C")
         if X.ndim != 2:
             raise ValueError(f"primary input must be 2D, got shape {X.shape}")
         if X.shape[0] != self._n:
             raise ValueError(f"UP primary input must have {self._n} rows, got {X.shape[0]}")
         k = int(X.shape[1])
-        if self._k_hint is not None and k != self._k_hint:
-            warnings.warn(
-                (
-                    f"MKL backend runtime k={k} does not match k_hint={self._k_hint}; "
-                    "continuing with non-hinted execution."
-                ),
-                RuntimeWarning,
-                stacklevel=3,
-            )
+        if self._plan_up is not None and self._plan_up.k_hint is not None and k != self._plan_up.k_hint:
+            warn_k_hint_mismatch(backend="MKL", direction=Direction.UP, runtime_k=k, k_hint=self._plan_up.k_hint)
         parse_ms = (perf_counter() - t0) * 1000.0
 
         init_mode = parse_init_mode(init_mode)
@@ -598,25 +665,19 @@ class MklBackend(Backend):
         init_mode: InitMode,
         init: np.ndarray | None = None,
     ) -> np.ndarray:
-        mkl_set_num_threads(self._n_threads)
+        mkl_set_num_threads(self._thread_count_for(Direction.DOWN))
         total_t0 = perf_counter()
 
         t0 = perf_counter()
+        self._require_plan(Direction.DOWN)
         X = np.asarray(primary, dtype=self._dtype, order="C")
         if X.ndim != 2:
             raise ValueError(f"primary input must be 2D, got shape {X.shape}")
         if X.shape[0] != self._m:
             raise ValueError(f"DOWN primary input must have {self._m} rows, got {X.shape[0]}")
         k = int(X.shape[1])
-        if self._k_hint is not None and k != self._k_hint:
-            warnings.warn(
-                (
-                    f"MKL backend runtime k={k} does not match k_hint={self._k_hint}; "
-                    "continuing with non-hinted execution."
-                ),
-                RuntimeWarning,
-                stacklevel=3,
-            )
+        if self._plan_down is not None and self._plan_down.k_hint is not None and k != self._plan_down.k_hint:
+            warn_k_hint_mismatch(backend="MKL", direction=Direction.DOWN, runtime_k=k, k_hint=self._plan_down.k_hint)
         parse_ms = (perf_counter() - t0) * 1000.0
 
         miss_arr = None
@@ -719,3 +780,6 @@ class MklBackend(Backend):
             raise ValueError(f"Selector {selector!r} row/col shapes mismatch: {rows.shape} vs {cols.shape}")
         itemsize = int(np.dtype(rows.dtype).itemsize)
         return int(rows.size * 2 * itemsize)
+
+
+__all__ = ["MklBackend", "MklPlan"]

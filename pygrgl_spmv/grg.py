@@ -17,9 +17,9 @@ from pygrgl_spmv.backends.types import Direction, InitMode, parse_direction
 from pygrgl_spmv.io import load_operator_npz, save_operator_npz
 
 
-_COMMON_BACKEND_KEYS = {"type", "k_hint", "log_level", "fmt_up", "fmt_down"}
-_MKL_BACKEND_KEYS = _COMMON_BACKEND_KEYS | {"n_threads"}
-_CUSPARSE_BACKEND_KEYS = _COMMON_BACKEND_KEYS | {"algo_up", "algo_down"}
+_COMMON_BACKEND_KEYS = {"type", "log_level", "plan_up", "plan_down"}
+_MKL_BACKEND_KEYS = _COMMON_BACKEND_KEYS
+_CUSPARSE_BACKEND_KEYS = _COMMON_BACKEND_KEYS
 
 
 def _cache_path_for_grg(grg_path: Path, cache_root: Path) -> Path:
@@ -86,30 +86,24 @@ def _create_backend(config: dict[str, Any]):
         - Additional backend-specific parameters
     """
     backend_type = config.get("type", "mkl")
-    k_hint = config.get("k_hint")
     log_level = str(config.get("log_level", "WARNING"))
     match backend_type:
         case "mkl":
-            from pygrgl_spmv.backends.mkl import MklBackend
+            from pygrgl_spmv.backends.mkl import MklBackend, MklPlan
 
             _validate_backend_config_keys(config, _MKL_BACKEND_KEYS, backend_type)
             return MklBackend(
-                n_threads=config.get("n_threads", 0),
-                fmt_up=config.get("fmt_up", "csr"),
-                fmt_down=config.get("fmt_down"),
-                k_hint=k_hint,
+                plan_up=MklPlan.from_any(config["plan_up"]),
+                plan_down=MklPlan.from_any(config["plan_down"]),
                 log_level=log_level,
             )
         case "cusparse":
-            from pygrgl_spmv.backends.cusparse import CusparseBackend
+            from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlan
 
             _validate_backend_config_keys(config, _CUSPARSE_BACKEND_KEYS, backend_type)
             return CusparseBackend(
-                fmt_up=config.get("fmt_up", "csr"),
-                fmt_down=config.get("fmt_down"),
-                k_hint=k_hint,
-                algo_up=config.get("algo_up", "default"),
-                algo_down=config.get("algo_down", "default"),
+                plan_up=CusparsePlan.from_any(config["plan_up"]),
+                plan_down=CusparsePlan.from_any(config["plan_down"]),
                 log_level=log_level,
             )
         case _:
@@ -201,7 +195,11 @@ class SpmvGRG:
 
         This removes per-matmul O(K) init additions and uses setup-time work instead.
         """
-        helper = Backend(fmt_up="csr", fmt_down="csc", log_level="WARNING")
+        helper = Backend(
+            plan_up=Backend.plan(fmt="CSR", store="N", k_hint=None),
+            plan_down=Backend.plan(fmt="CSC", store="T", k_hint=None),
+            log_level="WARNING",
+        )
         helper.setup(
             self.A_blocks,
             self.level_offsets,
@@ -851,16 +849,16 @@ class SpmvGRG:
         total_ms: float,
     ) -> None:
         miss_mode = "on" if miss else "off"
+        timing_body = " ".join(f"{stage}={ms:.3f}ms" for stage, ms in timings)
         self._logger.info(
-            "SpmvGRG.matmul[%s] rows=%d cols=%d by_individual=%s init=%s miss=%s",
+            "SpmvGRG.matmul[%s] rows=%d cols=%d by_individual=%s init=%s miss=%s "
+            "path=fused_single_traversal=on %s total=%.3fms",
             direction.value,
             rows,
             cols,
             by_individual,
             init_mode,
             miss_mode,
+            timing_body,
+            total_ms,
         )
-        self._logger.info("  path: fused_single_traversal=on")
-        for stage, ms in timings:
-            self._logger.info("  %s: %.3f ms", stage, ms)
-        self._logger.info("  total: %.3f ms", total_ms)

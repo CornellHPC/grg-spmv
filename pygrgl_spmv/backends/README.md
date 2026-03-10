@@ -3,13 +3,13 @@
 This document describes how memory usage is tracked for all backends through
 `Backend.mem_usage` (`MemoryUsage` dataclass).
 
-## Shared Memory Tracking (all backends)
+## Shared Memory Tracking
 
 `mem_usage` has three parts:
 
 1. `host_static: StaticBytes`
 2. `device_static: StaticBytes`
-3. `calls: list[MemoryRecord]` (one runtime record per matmul call)
+3. `calls: list[MemoryRecord]`
 
 ### Static memory (`StaticBytes`) keys
 
@@ -23,24 +23,6 @@ This document describes how memory usage is tracked for all backends through
 - `selector_mut`
 - `selector_miss`
 
-`host_static` and `device_static` use the same key schema so estimates and
-measured values are directly comparable field-by-field.
-
-### Block-format resolution (`fmt_up`, `fmt_down`)
-
-All backends resolve block storage policy once in `Backend.__init__`:
-
-- at least one of `fmt_up` / `fmt_down` must be set
-- supported formats are `csr`, `csc`, `coo`
-- if one side is `None`, the transpose-compatible format is inferred
-- if both sides are transpose-compatible (for example `csr/csc`, `csc/csr`,
-  `coo/coo`), one physical block set is stored and the other traversal aliases
-  it via transpose semantics
-- if both sides are explicitly non-compatible, both block sets are materialized
-
-This policy is backend-agnostic and directly drives the `blocks_up` /
-`blocks_down` static-memory counters.
-
 ### Runtime memory (`RuntimeBytes`) keys
 
 - `level_buffers`
@@ -48,41 +30,88 @@ This policy is backend-agnostic and directly drives the `blocks_up` /
 - `outputs`
 - `aux`
 
-Each `MemoryRecord` stores host/device runtime bytes plus metadata
-(`direction`, mode flags, etc.).
-
 ### Actual vs Estimated static memory
 
-- **Actual** static memory comes from `backend.setup()` accounting.
-- **Estimated** static memory comes from `backend.estimate_static_bytes()`.
-- Tests assert alignment between estimated and actual static fields for both
-  host and device schemas.
+- actual static memory comes from `backend.setup()` accounting
+- estimated static memory comes from `backend.estimate_static_bytes()`
+- tests assert alignment between measured and estimated static fields
 
----
+## Plan-driven backends
+
+Backends are now constructed from explicit `plan_up` / `plan_down` objects
+instead of shorthand format pairs.
+
+- `MklPlan` carries MKL-specific storage/runtime hints (`store`, `fmt`,
+  `n_threads`, `k_hint`)
+- `CusparsePlan` carries explicit cuSPARSE SpMM choices (`store`, `fmt`,
+  `opA`, `opB`, `orderB`, `orderC`, `algo`, and `k_hint`); the current CUDA
+  runtime version remains available as an environment-derived property
+
+The plan object is the single source of truth for backend execution semantics.
+Runtime helper objects may still cache raw storage buffers or workspaces, but
+should not duplicate plan metadata such as algorithm, dense order, or transpose
+mode.
+
+Either side may be omitted: `plan_up=None` builds a DOWN-only backend and
+`plan_down=None` builds an UP-only backend.
 
 ## MKL backend details
 
-- Sparse blocks (`blocks_up`, `blocks_down`) are MKL handle payloads backed by
-  host-side sparse arrays.
-- Selector buffers are stored on host (`selector_mut`, `selector_miss`).
-- `device_static` remains zero for MKL by design.
-- Common host arrays (`level_offsets`, permutations, optional coalescence/xtx)
-  are included in both measured and estimated static host usage.
-
-Runtime calls track host-side level buffers and temporary arrays in
-`mem_usage.calls`.
-
----
+- sparse blocks are MKL handle payloads backed by host sparse arrays
+- selector buffers are stored on host
+- `device_static` remains zero for MKL by design
+- common host arrays are included in measured and estimated static host usage
+- `n_threads` and `k_hint` are applied per direction; one side does not override
+  the other unless both traversals truly share the same handle and transpose
+  mode
 
 ## cuSPARSE backend details
 
-- Sparse block payloads are device arrays (`blocks_up`, `blocks_down`).
-- Selector row/col index buffers are device arrays (`selector_mut`,
-  `selector_miss`).
-- Optional XTX init buffers (`xtx_init`) are tracked on device when
-  coalescence counts are available.
-- Host static usage still includes common metadata arrays
-  (`level_offsets`, permutations, optional coalescence counts).
+- sparse blocks are device payloads with separate sparse descriptors for static
+  and dynamic preprocess state
+- selector row/col index buffers are stored on device
+- optional `xtx_init` vectors are stored on device when coalescence counts are
+  available
+- runtime memory tracks dense level buffers, input/output staging buffers, and
+  external cuSPARSE work buffers
 
-Runtime calls track both host and device transient usage, including workspace
-buffers, staging buffers, and per-call auxiliaries.
+### cuSPARSE package layout
+
+- `pygrgl_spmv/backends/cusparse/__init__.py`: `CusparseBackend`
+- `pygrgl_spmv/backends/cusparse/plan.py`: `CusparsePlan` and its enums/parsers
+
+### `CusparsePlan`
+
+`CusparsePlan` is grounded on CUDA 12.9.0 SpMM semantics and exposes the
+current CUDA 12.x runtime version as an environment-derived property backed by
+`cupy.cuda.runtime.runtimeGetVersion()`.
+
+It exposes doc-driven properties such as:
+
+- `direction`
+- `supported`
+- `deterministic`
+- `need_buffer`
+- `need_preprocess`
+- `can_share_storage_with(...)`
+
+`need_buffer` and `need_preprocess` are currently metadata only: the executor
+still allocates work buffers and runs preprocess unconditionally. This keeps
+runtime control flow simple while preserving the information needed for later
+optimization work.
+
+### Dense layout execution
+
+The cuSPARSE backend now treats the dense side of each direction plan
+(`order_b`, `order_c`, `op_b`) explicitly.
+
+For one direction and one runtime `k`, each level owns a canonical dense state
+buffer stored in `order_c`. The backend then derives the source-side `matB`
+view in one of three ways:
+
+- direct alias: `order_b == order_c` and `op_b == N`
+- descriptor reinterpretation: `order_b != order_c` and `op_b == T`
+- one-per-level repack into a separate source buffer for all remaining cases
+
+This keeps the wavefront level-oriented: if repacking is needed, it happens once
+per completed destination level, not once per block SpMM call.

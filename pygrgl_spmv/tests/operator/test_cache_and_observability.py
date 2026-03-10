@@ -10,7 +10,7 @@ import pygrgl
 import pytest
 
 from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, HAS_MKL_RUNTIME, INDEX_DTYPE, tol
+from pygrgl_spmv.tests.conftest import DATA_DTYPE, HAS_MKL_RUNTIME, INDEX_DTYPE, make_mkl_config, tol
 
 MKL_ONLY = pytest.mark.skipif(not HAS_MKL_RUNTIME, reason="MKL runtime unavailable (libmkl_rt.so not found)")
 
@@ -47,7 +47,7 @@ def test_wavefront_debug_logging_preserves_values(backend_config, primary_grg_pa
 @pytest.mark.mkl
 @MKL_ONLY
 def test_wavefront_debug_logs_all_levels(primary_grg_path, spmv_cache_dir, caplog):
-    cfg = {"type": "mkl", "n_threads": 1, "log_level": "DEBUG"}
+    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1, log_level="DEBUG")
     with caplog.at_level(logging.DEBUG, logger="pygrgl_spmv.backends.mkl.MklBackend"):
         op = SpmvGRG(primary_grg_path, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
         x = np.ones((2, op.n), dtype=DATA_DTYPE)
@@ -92,7 +92,7 @@ def test_cache_miss_build_uses_up_edges_and_fails_on_missing_coals(primary_grg_p
 
     monkeypatch.setattr(grg_module.pygrgl, "load_immutable_grg", _wrapped_loader)
 
-    cfg = {"type": "mkl", "n_threads": 1}
+    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1)
     with pytest.raises(ValueError, match="missing coalescence counts"):
         SpmvGRG(dst, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=cache_dir)
     assert calls["loader"] == 1
@@ -106,7 +106,7 @@ def test_cache_hit_does_not_reload_grg(primary_grg_path, tmp_path, monkeypatch):
     dst = tmp_path / "cache-hit.grg"
     shutil.copy2(primary_grg_path, dst)
     cache_dir = tmp_path / "cache"
-    cfg = {"type": "mkl", "n_threads": 1}
+    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1)
 
     first = SpmvGRG(dst, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=cache_dir)
     import pygrgl_spmv.grg as grg_module
@@ -134,7 +134,7 @@ def test_cache_hit_skips_init_bias_rebuild(primary_grg_path, tmp_path, monkeypat
     dst = tmp_path / "cache-hit-no-rebuild.grg"
     shutil.copy2(primary_grg_path, dst)
     cache_dir = tmp_path / "cache"
-    cfg = {"type": "mkl", "n_threads": 1}
+    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1)
 
     _ = SpmvGRG(dst, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=cache_dir)
 
@@ -152,7 +152,7 @@ def test_cache_hit_skips_init_bias_rebuild(primary_grg_path, tmp_path, monkeypat
 @pytest.mark.mkl
 @MKL_ONLY
 def test_mem_usage_records_setup_and_calls(primary_grg_path, spmv_cache_dir):
-    cfg = {"type": "mkl", "n_threads": 1, "log_level": "WARNING"}
+    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1, log_level="WARNING")
     op = SpmvGRG(primary_grg_path, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
     assert op._backend.mem_usage.host_static.level_offsets > 0
     assert len(op._backend.mem_usage.calls) == 0

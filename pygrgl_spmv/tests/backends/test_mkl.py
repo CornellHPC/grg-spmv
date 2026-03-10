@@ -8,7 +8,16 @@ import numpy as np
 import pytest
 
 from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, K_CORE, K_MATRIX, tol
+from pygrgl_spmv.tests.conftest import (
+    DATA_DTYPE,
+    INDEX_DTYPE,
+    K_CORE,
+    K_MATRIX,
+    make_backend_config,
+    make_mkl_config,
+    make_mkl_plan,
+    tol,
+)
 
 pytestmark = pytest.mark.mkl
 
@@ -23,17 +32,18 @@ def _make_mkl_op(
     fmt_up="csr",
     fmt_down=None,
     k_hint=None,
+    infer_missing=True,
     dtype=DATA_DTYPE,
 ):
     return SpmvGRG(
         grg_path,
-        {
-            "type": "mkl",
-            "n_threads": n_threads,
-            "fmt_up": fmt_up,
-            "fmt_down": fmt_down,
-            "k_hint": k_hint,
-        },
+        make_mkl_config(
+            fmt_up=fmt_up,
+            fmt_down=fmt_down,
+            k_hint=k_hint,
+            n_threads=n_threads,
+            infer_missing=infer_missing,
+        ),
         dtype,
         INDEX_DTYPE,
         cache_dir=cache_dir,
@@ -46,6 +56,38 @@ def _run_up(op, X_col_major):
 
 def _run_down(op, X_col_major):
     return op.matmul(X_col_major.T, "down").T
+
+
+def _assert_sparse_equal(left, right):
+    np.testing.assert_array_equal(left.toarray(), right.toarray())
+
+
+def _first_present_handle(grid):
+    for row_idx, row in enumerate(grid):
+        for col_idx, handle in enumerate(row):
+            if handle is not None:
+                return row_idx, col_idx, handle
+    raise AssertionError("expected at least one sparse handle")
+
+
+def _find_op(ops_by_level, *, level: int, src_level: int, handle):
+    for op in ops_by_level[level]:
+        if op.src_level == src_level and op.handle is handle:
+            return op
+    raise AssertionError(
+        f"expected op for level={level} src_level={src_level} handle_id={id(handle)}"
+    )
+
+
+def _make_backend(primary_grg_path, spmv_cache_dir, *, plan_up, plan_down):
+    op = SpmvGRG(
+        primary_grg_path,
+        make_backend_config("mkl", plan_up=plan_up, plan_down=plan_down, log_level="WARNING"),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        cache_dir=spmv_cache_dir,
+    )
+    return op._backend
 
 
 class TestSmokeCoreConfigMatrix:
@@ -174,17 +216,133 @@ def test_primary_grg_backward(primary_grg_path, gt_primary, spmv_cache_dir, fmt,
 
 
 def test_mkl_bsr_not_supported(primary_grg_path, spmv_cache_dir):
-    with pytest.raises(ValueError, match="fmt_up"):
+    with pytest.raises(ValueError, match="sparse format|CSR|CSC|COO"):
         _make_mkl_op(primary_grg_path, cache_dir=spmv_cache_dir, fmt_up="bsr")
 
 
-def test_mem_usage_static_dedupe_components(primary_grg_path, spmv_cache_dir):
-    baseline = _make_mkl_op(primary_grg_path, cache_dir=spmv_cache_dir, fmt_up="csr", fmt_down="csr", k_hint=None)
-    optimized = _make_mkl_op(primary_grg_path, cache_dir=spmv_cache_dir, fmt_up="csr", fmt_down=None, k_hint=None)
+def test_run_uses_per_direction_thread_counts(primary_grg_path, gt_small, spmv_cache_dir, monkeypatch):
+    import pygrgl_spmv.backends.mkl as mkl_backend
 
-    base_static = baseline._backend.mem_usage.host_static
-    opt_static = optimized._backend.mem_usage.host_static
-    assert int(base_static.blocks_down) > 0
-    assert int(opt_static.blocks_down) == 0
-    assert int(opt_static.blocks_up) == int(base_static.blocks_up)
-    assert int(opt_static.total()) < int(base_static.total())
+    calls: list[int] = []
+    monkeypatch.setattr(mkl_backend, "mkl_set_num_threads", lambda n: calls.append(int(n)))
+    op = SpmvGRG(
+        primary_grg_path,
+        make_backend_config(
+            "mkl",
+            plan_up=make_mkl_plan(store="N", fmt="CSR", n_threads=1, k_hint=None),
+            plan_down=make_mkl_plan(store="T", fmt="CSC", n_threads=4, k_hint=None),
+            log_level="WARNING",
+        ),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        cache_dir=spmv_cache_dir,
+    )
+
+    calls.clear()
+    x_up, _ = gt_small.get("forward", 2, seed=6401, dtype=DATA_DTYPE)
+    x_down, _ = gt_small.get("backward", 2, seed=6402, dtype=DATA_DTYPE)
+    _run_up(op, x_up)
+    _run_down(op, x_down)
+    assert calls == [1, 4]
+
+
+def test_nonshared_handles_keep_distinct_k_hints(primary_grg_path, spmv_cache_dir, monkeypatch):
+    from pygrgl_spmv.backends.mkl_utils import MklSparseHandle
+
+    calls: list[tuple[int, int, bool]] = []
+    original = MklSparseHandle.set_mm_hint
+
+    def record(self, k, *, transpose=False, expected_calls=1000):
+        calls.append((id(self), int(k), bool(transpose)))
+        return original(self, k, transpose=transpose, expected_calls=expected_calls)
+
+    monkeypatch.setattr(MklSparseHandle, "set_mm_hint", record)
+    _ = SpmvGRG(
+        primary_grg_path,
+        make_backend_config(
+            "mkl",
+            plan_up=make_mkl_plan(store="N", fmt="CSR", n_threads=1, k_hint=2),
+            plan_down=make_mkl_plan(store="T", fmt="CSR", n_threads=1, k_hint=16),
+            log_level="WARNING",
+        ),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        cache_dir=spmv_cache_dir,
+    )
+
+    assert sorted(set(k for _, k, _ in calls)) == [2, 16]
+    assert all(not transpose for _, _, transpose in calls)
+    assert len({handle_id for handle_id, _, _ in calls}) >= 2
+
+
+def test_up_handles_store_transposed_blocks_when_plan_requests_store_t(primary_grg_path, spmv_cache_dir):
+    backend = _make_backend(
+        primary_grg_path,
+        spmv_cache_dir,
+        plan_up=make_mkl_plan(store="T", fmt="CSR", n_threads=1, k_hint=None),
+        plan_down=None,
+    )
+    reference = _make_backend(
+        primary_grg_path,
+        spmv_cache_dir,
+        plan_up=make_mkl_plan(store="N", fmt="CSR", n_threads=1, k_hint=None),
+        plan_down=None,
+    )
+
+    level, src_level, handle = _first_present_handle(backend._blocks_up)
+    reference_handle = reference._blocks_up[level][src_level]
+    assert reference_handle is not None
+    _assert_sparse_equal(handle._mat, reference_handle._mat.T)
+
+    block_op = _find_op(backend._ops_up, level=level, src_level=src_level, handle=handle)
+    assert block_op.transpose
+
+
+def test_down_handles_store_base_blocks_when_plan_requests_store_n(primary_grg_path, spmv_cache_dir):
+    backend = _make_backend(
+        primary_grg_path,
+        spmv_cache_dir,
+        plan_up=None,
+        plan_down=make_mkl_plan(store="N", fmt="CSC", n_threads=1, k_hint=None),
+    )
+    reference = _make_backend(
+        primary_grg_path,
+        spmv_cache_dir,
+        plan_up=None,
+        plan_down=make_mkl_plan(store="T", fmt="CSC", n_threads=1, k_hint=None),
+    )
+
+    level, src_offset, handle = _first_present_handle(backend._blocks_down)
+    src_level = level + src_offset + 1
+    reference_handle = reference._blocks_down[level][src_offset]
+    assert reference_handle is not None
+    _assert_sparse_equal(handle._mat, reference_handle._mat.T)
+
+    block_op = _find_op(backend._ops_down, level=level, src_level=src_level, handle=handle)
+    assert block_op.transpose
+
+
+def test_shared_down_ops_reuse_up_store_t_handles_without_extra_transpose(primary_grg_path, spmv_cache_dir):
+    backend = _make_backend(
+        primary_grg_path,
+        spmv_cache_dir,
+        plan_up=make_mkl_plan(store="T", fmt="CSC", n_threads=1, k_hint=None),
+        plan_down=make_mkl_plan(store="N", fmt="CSR", n_threads=1, k_hint=None),
+    )
+    reference = _make_backend(
+        primary_grg_path,
+        spmv_cache_dir,
+        plan_up=make_mkl_plan(store="N", fmt="CSC", n_threads=1, k_hint=None),
+        plan_down=None,
+    )
+
+    assert not backend._store_blocks_down
+    assert all(len(row) == 0 for row in backend._blocks_down)
+
+    level, src_level, handle = _first_present_handle(backend._blocks_up)
+    reference_handle = reference._blocks_up[level][src_level]
+    assert reference_handle is not None
+    _assert_sparse_equal(handle._mat, reference_handle._mat.T)
+
+    shared_op = _find_op(backend._ops_down, level=src_level, src_level=level, handle=handle)
+    assert not shared_op.transpose

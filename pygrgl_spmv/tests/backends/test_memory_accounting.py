@@ -9,7 +9,7 @@ import pytest
 
 from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.backends.memory import StaticBytes
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE
+from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, make_cusparse_config, make_mkl_config
 
 
 def _assert_static_bytes_equal(actual: StaticBytes, estimated: StaticBytes) -> None:
@@ -25,9 +25,9 @@ def _assert_static_bytes_equal(actual: StaticBytes, estimated: StaticBytes) -> N
 @pytest.mark.parametrize(
     "cfg",
     [
-        pytest.param({"type": "mkl", "n_threads": 1, "fmt_up": "csr", "fmt_down": None}, id="mkl-csr-none", marks=pytest.mark.smoke),
-        pytest.param({"type": "mkl", "n_threads": 1, "fmt_up": "csr", "fmt_down": "csr"}, id="mkl-csr-csr"),
-        pytest.param({"type": "mkl", "n_threads": 1, "fmt_up": "coo", "fmt_down": "coo"}, id="mkl-coo-coo"),
+        pytest.param(make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1), id="mkl-csr-none", marks=pytest.mark.smoke),
+        pytest.param(make_mkl_config(fmt_up="csr", fmt_down="csr", n_threads=1), id="mkl-csr-csr"),
+        pytest.param(make_mkl_config(fmt_up="coo", fmt_down="coo", n_threads=1), id="mkl-coo-coo"),
     ],
 )
 def test_mkl_static_estimate_matches_recorded(primary_grg_path, spmv_cache_dir, cfg):
@@ -42,16 +42,16 @@ def test_mkl_static_estimate_matches_recorded(primary_grg_path, spmv_cache_dir, 
     "cfg",
     [
         pytest.param(
-            {"type": "cusparse", "fmt_up": "csr", "fmt_down": None, "k_hint": None, "algo_up": "default", "algo_down": "default"},
+            make_cusparse_config(fmt_up="csr", fmt_down=None, k_hint=None, algo_up="default", algo_down="default"),
             id="cusparse-csr-none",
             marks=pytest.mark.smoke,
         ),
         pytest.param(
-            {"type": "cusparse", "fmt_up": None, "fmt_down": "csc", "k_hint": None, "algo_up": "default", "algo_down": "default"},
+            make_cusparse_config(fmt_up=None, fmt_down="csc", k_hint=None, algo_up="default", algo_down="default"),
             id="cusparse-none-csc",
         ),
         pytest.param(
-            {"type": "cusparse", "fmt_up": "coo", "fmt_down": "coo", "k_hint": None, "algo_up": "coo_alg1", "algo_down": "coo_alg2"},
+            make_cusparse_config(fmt_up="coo", fmt_down="coo", k_hint=None, algo_up="coo_alg1", algo_down="coo_alg2"),
             id="cusparse-coo-coo",
         ),
     ],
