@@ -34,18 +34,15 @@ class BackendSetup:
 
     A_blocks: list[list[sp.csr_matrix]]
     level_offsets: np.ndarray
-    n: int
-    K: int
+    num_samples: int
+    num_mutations: int
+    num_nodes: int
     sel_mut: sp.csr_matrix
     sel_miss: sp.csr_matrix
     sample_perm: np.ndarray
     inv_sample_perm: np.ndarray
     coalescence_counts: np.ndarray | None
     dtype: np.dtype
-
-    @property
-    def m(self) -> int:
-        return int(self.sel_mut.shape[0])
 
 
 def iter_direction_level_pairs(direction: Direction, H: int) -> Iterator[tuple[int, int, int]]:
@@ -135,48 +132,6 @@ def selector_rows_unique_from_csr_indptr(indptr: np.ndarray) -> bool:
     return bool(np.all(np.diff(np.asarray(indptr)) <= 1))
 
 
-def build_wavefront_level_stats(ops_by_level: list[list[object]]) -> tuple[np.ndarray, np.ndarray]:
-    """Build per-level wavefront call and nnz counts."""
-    calls = np.fromiter((len(ops) for ops in ops_by_level), dtype=np.int32, count=len(ops_by_level))
-    nnz = np.fromiter(
-        (sum(int(getattr(op, "nnz", 0)) for op in ops) for ops in ops_by_level),
-        dtype=np.int64,
-        count=len(ops_by_level),
-    )
-    return calls, nnz
-
-
-def log_wavefront_profile(
-    logger: logging.Logger,
-    *,
-    direction: Direction,
-    calls: np.ndarray,
-    nnz: np.ndarray,
-    level_ms: np.ndarray,
-) -> None:
-    """Log per-level wavefront timing breakdown at DEBUG level."""
-    records = [
-        (h, float(level_ms[h]), int(calls[h]), int(nnz[h]))
-        for h in range(len(level_ms))
-        if int(calls[h]) > 0
-    ]
-    if not records:
-        return
-
-    total_ms = sum(ms for _, ms, _, _ in records)
-    logger.debug("wavefront[%s] levels=%d total=%.3fms", direction.value, len(records), total_ms)
-    for h, ms, call_count, nnz_count in records:
-        pct = (100.0 * ms / total_ms) if total_ms > 0.0 else 0.0
-        logger.debug(
-            "  level=%2d ms=%.3f (%5.1f%%) calls=%3d nnz=%d",
-            h,
-            ms,
-            pct,
-            call_count,
-            nnz_count,
-        )
-
-
 def warn_k_hint_mismatch(*, backend: str, direction: Direction, runtime_k: int, k_hint: int) -> None:
     warnings.warn(
         (
@@ -197,6 +152,7 @@ class BackendBase:
         plan_up,
         plan_down,
         log_level: str = "WARNING",
+        instrumentation: bool = False,
     ) -> None:
         self._plan_up = plan_up
         self._plan_down = plan_down
@@ -205,6 +161,7 @@ class BackendBase:
 
         self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
         self._logger.setLevel(getattr(logging, str(log_level).upper(), logging.WARNING))
+        self._instrumentation = bool(instrumentation)
 
         if self._plan_up is None:
             share_storage = False
@@ -230,9 +187,9 @@ class BackendBase:
         self._coalescence_counts = None
         self._xtx_init = None
         self._dtype = np.float64
-        self._n = 0
-        self._K = 0
-        self._m = 0
+        self._num_samples = 0
+        self._num_nodes = 0
+        self._num_mutations = 0
         self.mem_usage = MemoryUsage()
 
     def _require_plan(self, direction: Direction):
@@ -270,9 +227,9 @@ class BackendBase:
     def _apply_setup_state(self, setup: BackendSetup) -> None:
         self._A_blocks = setup.A_blocks
         self._level_offsets = np.asarray(setup.level_offsets)
-        self._n = int(setup.n)
-        self._K = int(setup.K)
-        self._m = int(setup.m)
+        self._num_samples = int(setup.num_samples)
+        self._num_nodes = int(setup.num_nodes)
+        self._num_mutations = int(setup.num_mutations)
         self._sel_mut = setup.sel_mut
         self._sel_miss = setup.sel_miss
         self._sample_perm = np.asarray(setup.sample_perm)
@@ -288,7 +245,7 @@ class BackendBase:
             self._xtx_init = (2.0 * self._coalescence_counts).astype(
                 self._dtype,
                 copy=False,
-            ).reshape(self._K)
+            ).reshape(self._num_nodes)
 
     def _validate_init(self, init_mode: InitMode, init: np.ndarray | None, k: int) -> np.ndarray | None:
         match init_mode:
@@ -309,8 +266,8 @@ class BackendBase:
                 return arr
             case InitMode.MATRIX:
                 arr = np.asarray(init, dtype=self._dtype, order="C")
-                if arr.ndim != 2 or arr.shape != (self._K, k):
-                    raise ValueError(f"init matrix must have shape ({self._K}, {k}), got {arr.shape}")
+                if arr.ndim != 2 or arr.shape != (self._num_nodes, k):
+                    raise ValueError(f"init matrix must have shape ({self._num_nodes}, {k}), got {arr.shape}")
                 return arr
             case _:
                 raise ValueError(f"Unknown init_mode {init_mode!r}")
@@ -346,7 +303,7 @@ class BackendBase:
         x = np.asarray(primary, dtype=self._dtype, order="C")
         if x.ndim != 2:
             raise ValueError(f"primary input must be 2D, got shape {x.shape}")
-        expected_rows = self._n if direction == Direction.UP else self._m
+        expected_rows = self._num_samples if direction == Direction.UP else self._num_mutations
         if x.shape[0] != expected_rows:
             raise ValueError(
                 f"{direction.value.upper()} primary input must have {expected_rows} rows, got {x.shape[0]}"
@@ -357,8 +314,8 @@ class BackendBase:
         if miss is None:
             return None
         miss_arr = np.asarray(miss, dtype=self._dtype, order="C")
-        if miss_arr.shape != (self._m, k):
-            raise ValueError(f"miss input must have shape ({self._m}, {k}), got {miss_arr.shape}")
+        if miss_arr.shape != (self._num_mutations, k):
+            raise ValueError(f"miss input must have shape ({self._num_mutations}, {k}), got {miss_arr.shape}")
         return miss_arr
 
     def _warn_if_k_hint_mismatch(
@@ -384,17 +341,33 @@ class BackendBase:
     def estimate_static_bytes(self) -> tuple[StaticBytes, StaticBytes]:
         raise NotImplementedError
 
+    def run_up_nodes(
+        self,
+        primary: np.ndarray,
+        *,
+        init_mode: InitMode,
+        init: np.ndarray | None = None,
+    ) -> np.ndarray:
+        raise NotImplementedError
+
+    def run_down_nodes(
+        self,
+        primary: np.ndarray,
+        *,
+        init_mode: InitMode,
+        init: np.ndarray | None = None,
+    ) -> np.ndarray:
+        raise NotImplementedError
+
 
 __all__ = [
     "BackendBase",
     "BackendSetup",
     "_parse_optional_k_hint",
     "_sparse_host_bytes",
-    "build_wavefront_level_stats",
     "estimate_common_host_static_bytes",
     "estimate_sparse_payload_bytes",
     "iter_direction_level_pairs",
-    "log_wavefront_profile",
     "selector_rows_unique_from_csr_indptr",
     "warn_k_hint_mismatch",
 ]

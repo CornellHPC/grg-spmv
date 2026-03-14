@@ -1,23 +1,28 @@
-"""Plan-pair parsing and backend config expansion for benchmarks."""
+"""Plan-pair parsing and backend-builder expansion for benchmarks."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import re
-from typing import Any
 
 import numpy as np
 
+from pygrgl_spmv.backends import BackendBase
+
 PlanSpec = dict[str, str]
 PlanPairSpec = tuple[PlanSpec | None, PlanSpec | None]
-
 _PAIR_LITERAL_RE = re.compile(r"^\[(.*?)\]\[(.*?)\]$")
 
 
 @dataclass(frozen=True)
 class BenchConfig:
     label: str
-    config: dict[str, object]
+    backend_name: str
+    plan_up_text: str | None
+    plan_down_text: str | None
+    instrumentation: bool
+    build_backend: Callable[[], BackendBase]
 
 
 def _parse_plan_group(body: str, *, raw: str) -> PlanSpec | None:
@@ -47,7 +52,7 @@ def parse_plan_pair_literal(raw: str) -> PlanPairSpec:
     return pair
 
 
-def spec_to_literal(spec: PlanSpec) -> str:
+def spec_to_literal(spec: Mapping[str, str]) -> str:
     return "[" + ",".join(f"{key}={spec[key]}" for key in spec) + "]"
 
 
@@ -55,48 +60,59 @@ def spec_has_pattern(spec: PlanSpec | None) -> bool:
     return spec is not None and any(value == "*" or str(value).startswith("!") for value in spec.values())
 
 
-def render_plan(plan: object | None) -> str:
-    if plan is None:
-        return "<unspecified>"
-    return str(plan)
+def _render_plan_text(plan: str | None) -> str:
+    return "<unspecified>" if plan is None else plan
 
 
-def make_config_label(backend: str, plan_up: object | None, plan_down: object | None) -> str:
-    return f"{backend}-up={render_plan(plan_up)}-down={render_plan(plan_down)}"
+def make_config_label(backend_name: str, plan_up_text: str | None, plan_down_text: str | None) -> str:
+    return f"{backend_name}-up={_render_plan_text(plan_up_text)}-down={_render_plan_text(plan_down_text)}"
 
 
-def _bench_config(backend: str, plan_up: object | None, plan_down: object | None, *, log_level: str) -> BenchConfig:
+def _bench_config(
+    *,
+    backend_name: str,
+    plan_up_text: str | None,
+    plan_down_text: str | None,
+    log_level: str,
+    instrumentation: bool,
+    build_backend: Callable[[], BackendBase],
+) -> BenchConfig:
+    label = make_config_label(backend_name, plan_up_text, plan_down_text)
+    if instrumentation:
+        label = f"{label}-instr"
     return BenchConfig(
-        label=make_config_label(backend, plan_up, plan_down),
-        config={
-            "type": backend,
-            "plan_up": plan_up,
-            "plan_down": plan_down,
-            "log_level": str(log_level).upper(),
-        },
+        label=label,
+        backend_name=backend_name,
+        plan_up_text=plan_up_text,
+        plan_down_text=plan_down_text,
+        instrumentation=bool(instrumentation),
+        build_backend=build_backend,
     )
 
 
-def expand_mkl_configs(plan_pair_specs: list[PlanPairSpec], log_level: str) -> list[BenchConfig]:
-    from pygrgl_spmv.backends.mkl import MklPlan
+def expand_mkl_configs(plan_pair_specs: list[PlanPairSpec], log_level: str, instrumentation: bool = False) -> list[BenchConfig]:
+    from pygrgl_spmv.backends.mkl import MklBackend, MklPlan, MklPlanPair
 
     configs: list[BenchConfig] = []
     for up_spec, down_spec in plan_pair_specs:
         if spec_has_pattern(up_spec) or spec_has_pattern(down_spec):
             raise ValueError("MKL benchmark plans must be fully concrete; wildcard/negation expansion is cuSPARSE-only for now")
+        pair = MklPlanPair.from_dicts(up_spec, down_spec)
         configs.append(
             _bench_config(
-                "mkl",
-                None if up_spec is None else MklPlan.from_any(up_spec),
-                None if down_spec is None else MklPlan.from_any(down_spec),
+                backend_name="mkl",
+                plan_up_text=None if pair.plan_up is None else str(pair.plan_up),
+                plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
                 log_level=log_level,
+                instrumentation=instrumentation,
+                build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: MklBackend(
+                    pair=pair,
+                    log_level=log_level,
+                    instrumentation=instrumentation,
+                ),
             )
         )
     return configs
-
-
-def _cusparse_runtime_supported(plan) -> bool:
-    return plan.supported and not (plan.fmt == plan.fmt.CSC and plan.algo == plan.algo.CSR_ALG3)
 
 
 def _expand_cusparse_side(spec: PlanSpec | None, *, want_up: bool):
@@ -109,32 +125,125 @@ def _expand_cusparse_side(spec: PlanSpec | None, *, want_up: bool):
     return [
         plan
         for plan in CusparsePlan.expand_literal(spec_to_literal(spec))
-        if _cusparse_runtime_supported(plan) and plan.direction == direction
+        if plan.supported and plan.direction == direction
     ]
 
 
-def expand_cusparse_configs(plan_pair_specs: list[PlanPairSpec], log_level: str) -> list[BenchConfig]:
+def expand_cusparse_configs(
+    plan_pair_specs: list[PlanPairSpec],
+    log_level: str,
+    instrumentation: bool = False,
+) -> list[BenchConfig]:
+    from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlanPair
+
     configs: list[BenchConfig] = []
     for up_spec, down_spec in plan_pair_specs:
         for plan_up in _expand_cusparse_side(up_spec, want_up=True):
             for plan_down in _expand_cusparse_side(down_spec, want_up=False):
-                configs.append(_bench_config("cusparse", plan_up, plan_down, log_level=log_level))
+                pair = CusparsePlanPair(plan_up=plan_up, plan_down=plan_down)
+                configs.append(
+                    _bench_config(
+                        backend_name="cusparse",
+                        plan_up_text=None if pair.plan_up is None else str(pair.plan_up),
+                        plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
+                        log_level=log_level,
+                        instrumentation=instrumentation,
+                        build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: CusparseBackend(
+                            pair=pair,
+                            log_level=log_level,
+                            instrumentation=instrumentation,
+                        ),
+                    )
+                )
     return configs
 
 
-def format_dry_run_line(entry: BenchConfig, ks, options, *, dtype, index_dtype) -> str:
-    cfg = entry.config
+def _expand_triton_candidates(raw: str, all_values, parser, *, field_name: str):
+    token = str(raw).strip()
+    if token == "*":
+        return list(all_values)
+    if token.startswith("!"):
+        excluded = [piece for piece in token.split("!") if piece]
+        if not excluded:
+            raise ValueError(f"Invalid negation token for {field_name}: {raw!r}")
+        excluded_values = {parser(piece) for piece in excluded}
+        return [value for value in all_values if value not in excluded_values]
+    return [parser(token)]
+
+
+def _expand_triton_side(spec: PlanSpec | None, *, want_up: bool):
+    from pygrgl_spmv.backends.triton import TritonPlan
+    from pygrgl_spmv.backends.types import SparseFormat, StoredMatrix, parse_sparse_format, parse_store
+
+    if spec is None:
+        return [None]
+    allowed_keys = {"k_hint", "store", "fmt", "scratch"}
+    extra = sorted(set(spec) - allowed_keys)
+    if extra:
+        raise ValueError(f"Unknown Triton plan field(s): {extra}")
+    required_keys = {"k_hint", "store", "fmt"}
+    missing = sorted(required_keys - set(spec))
+    if missing:
+        raise ValueError(f"Missing Triton plan field(s): {missing}")
+    if str(spec["k_hint"]).strip() != "1":
+        raise ValueError(f"Triton benchmark plans require k_hint=1, got {spec['k_hint']!r}")
+    scratch = str(spec.get("scratch", "none")).strip()
+    if scratch == "*" or scratch.startswith("!"):
+        raise ValueError(f"Triton benchmark scratch does not support wildcard/negation, got {scratch!r}")
+
+    required_store = StoredMatrix.N if want_up else StoredMatrix.T
+    stores = _expand_triton_candidates(spec["store"], list(StoredMatrix), parse_store, field_name="store")
+    fmts = _expand_triton_candidates(spec["fmt"], [SparseFormat.CSR, SparseFormat.CSC], parse_sparse_format, field_name="fmt")
+    plans = [
+        TritonPlan.from_dict({"k_hint": 1, "store": store.value, "fmt": fmt.value, "scratch": scratch})
+        for store in stores
+        if store == required_store
+        for fmt in fmts
+    ]
+    plans.sort(key=str)
+    return plans
+
+
+def expand_triton_configs(
+    plan_pair_specs: list[PlanPairSpec],
+    log_level: str,
+    instrumentation: bool = False,
+) -> list[BenchConfig]:
+    from pygrgl_spmv.backends.triton import TritonBackend, TritonPlanPair
+
+    configs: list[BenchConfig] = []
+    for up_spec, down_spec in plan_pair_specs:
+        for plan_up in _expand_triton_side(up_spec, want_up=True):
+            for plan_down in _expand_triton_side(down_spec, want_up=False):
+                pair = TritonPlanPair(plan_up=plan_up, plan_down=plan_down)
+                configs.append(
+                    _bench_config(
+                        backend_name="triton",
+                        plan_up_text=None if pair.plan_up is None else str(pair.plan_up),
+                        plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
+                        log_level=log_level,
+                        instrumentation=instrumentation,
+                        build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: TritonBackend(
+                            pair=pair,
+                            log_level=log_level,
+                            instrumentation=instrumentation,
+                        ),
+                    )
+                )
+    return configs
+
+
+def format_dry_run_line(entry: BenchConfig, ks: list[int], options: list[str], *, dtype: np.dtype, index_dtype: np.dtype) -> str:
     parts = [
         entry.label,
         f"ks={','.join(str(k) for k in ks)}",
         f"options={','.join(options)}",
         f"dtype={np.dtype(dtype).name}",
         f"index_dtype={np.dtype(index_dtype).name}",
+        f"instrumentation={'on' if entry.instrumentation else 'off'}",
+        f"plan_up={_render_plan_text(entry.plan_up_text)}",
+        f"plan_down={_render_plan_text(entry.plan_down_text)}",
     ]
-    if "plan_up" in cfg:
-        parts.append(f"plan_up={render_plan(cfg['plan_up'])}")
-    if "plan_down" in cfg:
-        parts.append(f"plan_down={render_plan(cfg['plan_down'])}")
     return " ".join(parts)
 
 
@@ -144,10 +253,10 @@ __all__ = [
     "PlanSpec",
     "expand_cusparse_configs",
     "expand_mkl_configs",
+    "expand_triton_configs",
     "format_dry_run_line",
     "make_config_label",
     "parse_plan_pair_literal",
-    "render_plan",
     "spec_has_pattern",
     "spec_to_literal",
 ]

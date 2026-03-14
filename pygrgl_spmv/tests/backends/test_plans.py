@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from pygrgl_spmv.backends import ReferenceBackend
-from pygrgl_spmv.backends.mkl import MklPlan
+from pygrgl_spmv.backends import ReferenceBackend, ReferencePlanPair
+from pygrgl_spmv.backends.mkl import MklBackend, MklPlan, MklPlanPair
 from pygrgl_spmv.backends.types import SparseFormat, StoredMatrix
 from scripts.bench.configs import parse_plan_pair_literal
 
 
 def test_mkl_plan_string_literal():
-    plan = MklPlan.from_any({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": None})
+    plan = MklPlan.from_dict({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": None})
     assert str(plan) == "[k_hint=none,store=N,fmt=CSR,n_threads=4]"
 
 
@@ -34,7 +34,7 @@ def test_reference_plan_factory():
 )
 def test_shared_k_hint_parsing(raw, expected):
     reference = ReferenceBackend.plan(fmt="CSR", store="N", k_hint=raw)
-    mkl = MklPlan.from_any({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": raw})
+    mkl = MklPlan.from_dict({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": raw})
     assert reference.k_hint == expected
     assert mkl.k_hint == expected
 
@@ -44,23 +44,40 @@ def test_shared_k_hint_rejects_non_positive_values(raw):
     with pytest.raises(ValueError, match="k_hint must be positive or none"):
         ReferenceBackend.plan(fmt="CSR", store="N", k_hint=raw)
     with pytest.raises(ValueError, match="k_hint must be positive or none"):
-        MklPlan.from_any({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": raw})
+        MklPlan.from_dict({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": raw})
 
 
-def test_mkl_plan_from_any_and_storage_sharing():
-    up = MklPlan.from_any({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": None})
-    down_same = MklPlan.from_any({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": None})
-    down_transpose = MklPlan.from_any({"store": "T", "fmt": "CSC", "n_threads": 4, "k_hint": None})
+def test_mkl_plan_from_dict_and_storage_sharing():
+    up = MklPlan.from_dict({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": None})
+    down_same = MklPlan.from_dict({"store": "N", "fmt": "CSR", "n_threads": 4, "k_hint": None})
+    down_transpose = MklPlan.from_dict({"store": "T", "fmt": "CSC", "n_threads": 4, "k_hint": None})
     assert up.can_share_storage_with(down_same)
     assert up.can_share_storage_with(down_transpose)
 
 
-def test_mkl_plan_from_any_rejects_unknown_dict_fields():
+def test_mkl_plan_from_dict_rejects_unknown_dict_fields():
     with pytest.raises(ValueError, match=r"Unknown MklPlan field\(s\): \['n_thread'\]"):
-        MklPlan.from_any({"store": "N", "fmt": "CSR", "n_thread": 4})
+        MklPlan.from_dict({"store": "N", "fmt": "CSR", "n_thread": 4})
 
     with pytest.raises(ValueError, match=r"Unknown MklPlan field\(s\): \['fmt_up', 'old_key'\]"):
-        MklPlan.from_any({"store": "N", "fmt": "CSR", "fmt_up": "CSC", "old_key": 1})
+        MklPlan.from_dict({"store": "N", "fmt": "CSR", "fmt_up": "CSC", "old_key": 1})
+
+
+def test_mkl_plan_pair_rejects_both_missing():
+    with pytest.raises(ValueError, match="At least one of plan_up/plan_down"):
+        MklPlanPair(plan_up=None, plan_down=None)
+
+
+def test_mkl_backend_constructs_from_pair():
+    backend = MklBackend(
+        pair=MklPlanPair.from_dicts(
+            {"store": "N", "fmt": "CSR", "n_threads": 1, "k_hint": None},
+            {"store": "T", "fmt": "CSC", "n_threads": 1, "k_hint": None},
+        ),
+        log_level="WARNING",
+    )
+    assert backend._plan_up is not None
+    assert backend._plan_down is not None
 
 
 def test_parse_plan_pair_literal_allows_empty_sides():
@@ -76,12 +93,61 @@ def test_parse_plan_pair_literal_allows_empty_sides():
         parse_plan_pair_literal("[][]")
 
 
-def test_plan_from_any_accepts_none():
-    assert MklPlan.from_any(None) is None
+def test_triton_plan_parse_and_storage_sharing():
+    from pygrgl_spmv.backends.triton import TritonPlan
 
-    from pygrgl_spmv.backends.cusparse import CusparsePlan
+    up = TritonPlan.from_dict({"k_hint": 1, "store": "N", "fmt": "CSR"})
+    down = TritonPlan.from_dict({"k_hint": 1, "store": "T", "fmt": "CSC"})
+    literal = str(up)
+    assert literal == "[k_hint=1,store=N,fmt=CSR,scratch=none]"
+    assert up.k_hint == 1
+    assert up.store == StoredMatrix.N
+    assert up.fmt == SparseFormat.CSR
+    assert up.scratch == "none"
+    assert up.can_share_storage_with(down)
 
-    assert CusparsePlan.from_any(None) is None
+
+def test_triton_plan_scratch_normalization():
+    from pygrgl_spmv.backends.triton import TritonPlan
+
+    plan = TritonPlan.from_dict({"k_hint": 1, "store": "N", "fmt": "CSR", "scratch": "3|1|2"})
+    assert plan is not None
+    assert plan.scratch == "1|2|3"
+    assert str(plan) == "[k_hint=1,store=N,fmt=CSR,scratch=1|2|3]"
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        pytest.param({"k_hint": None, "store": "N", "fmt": "CSR"}, "k_hint=1", id="none-hint"),
+        pytest.param({"k_hint": 4, "store": "N", "fmt": "CSR"}, "k_hint=1", id="wrong-hint"),
+        pytest.param({"k_hint": 1, "store": "N", "fmt": "COO"}, "CSR/CSC", id="coo-format"),
+        pytest.param({"k_hint": 1, "store": "N", "fmt": "CSR", "algo": "naive"}, "Unknown TritonPlan field", id="unknown-field"),
+        pytest.param({"k_hint": 1, "store": "N", "fmt": "CSR", "scratch": "1||2"}, "Invalid Triton scratch", id="bad-scratch-empty"),
+        pytest.param({"k_hint": 1, "store": "N", "fmt": "CSR", "scratch": "1|1"}, "Duplicate Triton scratch level", id="bad-scratch-dup"),
+    ],
+)
+def test_triton_plan_rejects_invalid_values(raw, match):
+    from pygrgl_spmv.backends.triton import TritonPlan
+
+    with pytest.raises(ValueError, match=match):
+        TritonPlan.from_dict(raw)
+
+
+def test_triton_plan_pair_rejects_both_missing():
+    from pygrgl_spmv.backends.triton import TritonPlanPair
+
+    with pytest.raises(ValueError, match="At least one of plan_up/plan_down"):
+        TritonPlanPair(plan_up=None, plan_down=None)
+
+
+def test_triton_plan_pair_validates_store_direction():
+    from pygrgl_spmv.backends.triton import TritonPlanPair
+
+    with pytest.raises(ValueError, match="plan_up expects store=N"):
+        TritonPlanPair.from_dicts({"k_hint": 1, "store": "T", "fmt": "CSC"}, None)
+    with pytest.raises(ValueError, match="plan_down expects store=T"):
+        TritonPlanPair.from_dicts(None, {"k_hint": 1, "store": "N", "fmt": "CSR"})
 
 
 def test_cusparse_plan_parse_and_properties():
@@ -156,6 +222,11 @@ def test_cusparse_plan_expand_literal_and_storage_sharing():
     )
     assert up.can_share_storage_with(down)
 
+    transpose_down = CusparsePlan.from_literal(
+        "[k_hint=none,store=T,fmt=CSC,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+    )
+    assert up.can_share_storage_with(transpose_down)
+
 
 def test_cusparse_plan_coo_transpose_storage_does_not_share():
     from pygrgl_spmv.backends.cusparse import CusparsePlan
@@ -185,13 +256,13 @@ def test_cusparse_plan_negation_expansion():
     assert all(plan.fmt == SparseFormat.COO for plan in plans)
 
 
-def test_cusparse_plan_csr_alg3_runtime_subset():
+def test_cusparse_plan_csr_alg3_support_is_rejected_at_plan_layer():
     from pygrgl_spmv.backends.cusparse import CusparsePlan, is_valid_combo
 
     plan = CusparsePlan.from_literal(
         "[k_hint=none,store=N,fmt=CSC,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=CSR_ALG3]"
     )
-    assert plan.supported
+    assert not plan.supported
     assert not is_valid_combo("csc", False, "csr_alg3")
 
 
@@ -200,17 +271,19 @@ def test_cusparse_plan_csr_alg3_runtime_subset():
     [
         pytest.param(
             {
-                "plan_up": {
-                    "k_hint": None,
-                    "store": "T",
-                    "fmt": "CSC",
-                    "opA": "N",
-                    "opB": "N",
-                    "orderB": "ROW",
-                    "orderC": "ROW",
-                    "algo": "DEFAULT",
+                "pair": {
+                    "plan_up": {
+                        "k_hint": None,
+                        "store": "T",
+                        "fmt": "CSC",
+                        "opA": "N",
+                        "opB": "N",
+                        "orderB": "ROW",
+                        "orderC": "ROW",
+                        "algo": "DEFAULT",
+                    },
+                    "plan_down": None,
                 },
-                "plan_down": None,
                 "log_level": "WARNING",
             },
             r"cuSPARSE plan_up expects a UP plan, got DOWN",
@@ -218,16 +291,18 @@ def test_cusparse_plan_csr_alg3_runtime_subset():
         ),
         pytest.param(
             {
-                "plan_up": None,
-                "plan_down": {
-                    "k_hint": None,
-                    "store": "N",
-                    "fmt": "CSR",
-                    "opA": "N",
-                    "opB": "N",
-                    "orderB": "ROW",
-                    "orderC": "ROW",
-                    "algo": "DEFAULT",
+                "pair": {
+                    "plan_up": None,
+                    "plan_down": {
+                        "k_hint": None,
+                        "store": "N",
+                        "fmt": "CSR",
+                        "opA": "N",
+                        "opB": "N",
+                        "orderB": "ROW",
+                        "orderC": "ROW",
+                        "algo": "DEFAULT",
+                    },
                 },
                 "log_level": "WARNING",
             },
@@ -237,10 +312,14 @@ def test_cusparse_plan_csr_alg3_runtime_subset():
     ],
 )
 def test_cusparse_backend_rejects_slot_direction_mismatch(kwargs, match):
-    from pygrgl_spmv.backends.cusparse import CusparseBackend
+    from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlanPair
 
     with pytest.raises(ValueError, match=match):
-        CusparseBackend(**kwargs)
+        pair_dict = kwargs.pop("pair")
+        CusparseBackend(
+            pair=CusparsePlanPair.from_dicts(pair_dict["plan_up"], pair_dict["plan_down"]),
+            **kwargs,
+        )
 
 
 @pytest.mark.parametrize("runtime_version", [(12, 8, 0), (12, 9, 1)])

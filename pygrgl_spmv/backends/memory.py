@@ -19,6 +19,7 @@ class StaticBytes:
     blocks_down: int = 0
     selector_mut: int = 0
     selector_miss: int = 0
+    workspace: int = 0
 
     def total(self) -> int:
         return (
@@ -31,6 +32,7 @@ class StaticBytes:
             + int(self.blocks_down)
             + int(self.selector_mut)
             + int(self.selector_miss)
+            + int(self.workspace)
         )
 
 

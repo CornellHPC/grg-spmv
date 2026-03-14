@@ -9,6 +9,11 @@ import pygrgl
 import pytest
 
 from .conftest import grg_to_matrix
+from pygrgl_spmv.tests.conftest import matmul_expect_k_hint_warning
+
+
+def _matmul(op, matrix, direction, /, **kwargs):
+    return matmul_expect_k_hint_warning(op, matrix, direction, **kwargs)
 
 
 def _direction_helper(grg: pygrgl.GRG, op, direction: pygrgl.TraversalDirection):
@@ -28,7 +33,7 @@ def _direction_helper(grg: pygrgl.GRG, op, direction: pygrgl.TraversalDirection)
         np_result = mat @ genotype_matrix.T
 
     # Result 3: backend operator path.
-    op_result = op.matmul(mat, direction)
+    op_result = _matmul(op, mat, direction)
 
     np.testing.assert_allclose(dot_result, np_result)
     np.testing.assert_allclose(op_result, np_result)
@@ -54,7 +59,7 @@ def test_diploid(backend_config, basic_grg, basic_grg_path, make_operator):
     ref_result = pygrgl.matmul(
         basic_grg, rand_matrix, pygrgl.TraversalDirection.UP, by_individual=True
     )
-    op_result = op.matmul(rand_matrix, pygrgl.TraversalDirection.UP, by_individual=True)
+    op_result = _matmul(op, rand_matrix, pygrgl.TraversalDirection.UP, by_individual=True)
     np.testing.assert_allclose(ref_result, np_result)
     np.testing.assert_allclose(op_result, np_result)
 
@@ -65,7 +70,7 @@ def test_diploid(backend_config, basic_grg, basic_grg_path, make_operator):
     ref_result = pygrgl.matmul(
         basic_grg, rand_matrix, pygrgl.TraversalDirection.DOWN, by_individual=True
     )
-    op_result = op.matmul(rand_matrix, pygrgl.TraversalDirection.DOWN, by_individual=True)
+    op_result = _matmul(op, rand_matrix, pygrgl.TraversalDirection.DOWN, by_individual=True)
     np.testing.assert_allclose(ref_result, np_result)
     np.testing.assert_allclose(op_result, np_result)
 
@@ -91,7 +96,7 @@ def test_xtx_init(backend_config, basic_grg, basic_grg_path, make_operator):
         pygrgl.TraversalDirection.UP,
         init="xtx",
     )
-    got = op.matmul(X, pygrgl.TraversalDirection.UP, init="xtx")
+    got = _matmul(op, X, pygrgl.TraversalDirection.UP, init="xtx")
     np.testing.assert_allclose(got, ref)
 
     for mut_id, node_id in basic_grg.get_mutation_node_pairs():
@@ -109,8 +114,8 @@ def test_vector_init(backend_config, basic_grg, basic_grg_path, make_operator):
 
     ref_without = pygrgl.matmul(basic_grg, X, pygrgl.TraversalDirection.UP)
     ref_with = pygrgl.matmul(basic_grg, X, pygrgl.TraversalDirection.UP, init=init)
-    got_without = op.matmul(X, pygrgl.TraversalDirection.UP)
-    got_with = op.matmul(X, pygrgl.TraversalDirection.UP, init=init)
+    got_without = _matmul(op, X, pygrgl.TraversalDirection.UP)
+    got_with = _matmul(op, X, pygrgl.TraversalDirection.UP, init=init)
 
     assert got_without.shape == got_with.shape
     np.testing.assert_allclose(got_without, ref_without)
@@ -126,8 +131,8 @@ def test_matrix_init(backend_config, basic_grg, basic_grg_path, make_operator):
 
     ref_without = pygrgl.matmul(basic_grg, X, pygrgl.TraversalDirection.UP)
     ref_with = pygrgl.matmul(basic_grg, X, pygrgl.TraversalDirection.UP, init=init)
-    got_without = op.matmul(X, pygrgl.TraversalDirection.UP)
-    got_with = op.matmul(X, pygrgl.TraversalDirection.UP, init=init)
+    got_without = _matmul(op, X, pygrgl.TraversalDirection.UP)
+    got_with = _matmul(op, X, pygrgl.TraversalDirection.UP, init=init)
 
     np.testing.assert_allclose(got_without, ref_without)
     np.testing.assert_allclose(got_with, ref_with)
@@ -148,7 +153,7 @@ def test_matrix_init(backend_config, basic_grg, basic_grg_path, make_operator):
     ref_tweaked = pygrgl.matmul(
         basic_grg, X, pygrgl.TraversalDirection.UP, init=init
     )
-    got_tweaked = op.matmul(X, pygrgl.TraversalDirection.UP, init=init)
+    got_tweaked = _matmul(op, X, pygrgl.TraversalDirection.UP, init=init)
     np.testing.assert_allclose(got_tweaked, ref_tweaked)
 
     for i in range(got_tweaked.shape[0]):
@@ -205,7 +210,7 @@ def test_split_consistency(backend_config, basic_grg, basic_grg_path, make_opera
     rows = 4
     rng = np.random.default_rng(777)
     in_matrix = rng.standard_normal((rows, basic_grg.num_mutations), dtype=np.float64)
-    full_result = op_full.matmul(in_matrix, pygrgl.TraversalDirection.DOWN)
+    full_result = _matmul(op_full, in_matrix, pygrgl.TraversalDirection.DOWN)
 
     split_dir = tmp_path / "split"
     subprocess.check_call(
@@ -237,7 +242,7 @@ def test_split_consistency(backend_config, basic_grg, basic_grg_path, make_opera
         end = start + num_muts
         sub_matrix = in_matrix[:, start:end]
         op_part = make_operator(fn)
-        part_out = op_part.matmul(sub_matrix, pygrgl.TraversalDirection.DOWN)
+        part_out = _matmul(op_part, sub_matrix, pygrgl.TraversalDirection.DOWN)
         split_result = part_out.copy() if split_result is None else (split_result + part_out)
         start = end
     assert start == in_matrix.shape[1]

@@ -5,6 +5,7 @@ cusparse_plan = plan
 from .backend import CusparseBackend, is_valid_combo
 from .plan import (
     CusparsePlan,
+    CusparsePlanPair,
     DenseOrder,
     Operation,
     SparseFormat,
@@ -14,6 +15,7 @@ from .plan import (
 __all__ = [
     "CusparseBackend",
     "CusparsePlan",
+    "CusparsePlanPair",
     "DenseOrder",
     "Operation",
     "SparseFormat",

@@ -9,7 +9,7 @@
 - `operator/`
   - traversal correctness and numerical invariants
   - public matmul option semantics
-  - cache lifecycle + observability behaviors
+  - artifact lifecycle + observability behaviors
 - `bench/`
   - benchmark helper behavior (summary table + equivalence checks)
 - `endtoend/`
@@ -22,6 +22,11 @@ Implementation paths exercised by these tests:
 - GRG code lives under `pygrgl_spmv/grg/`
 - backend code lives under `pygrgl_spmv/backends/base.py`, `reference.py`, `mkl/`, and `cusparse/`
 - benchmark helper tests target the split modules in `scripts/bench/`
+
+Observability rule covered by the suite:
+
+- `log_level` changes verbosity only
+- `instrumentation` is the opt-in flag for slower profiling/observability behavior
 
 ## Markers
 

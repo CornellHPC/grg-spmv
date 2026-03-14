@@ -20,28 +20,34 @@ pip install "pygrgl-spmv[dev]"
 ```python
 import numpy as np
 from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.backends.mkl import MklPlan
+from pygrgl_spmv.backends.mkl import MklBackend, MklPlanPair
+
+pair = MklPlanPair.from_dicts(
+    {"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1},
+    {"k_hint": None, "store": "T", "fmt": "CSC", "n_threads": 1},
+)
+backend = MklBackend(pair=pair, instrumentation=False, log_level="WARNING")
 
 op = SpmvGRG(
     "/path/to/file.grg",
-    {
-        "type": "mkl",
-        "plan_up": MklPlan.from_any({"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1}),
-        "plan_down": MklPlan.from_any({"k_hint": None, "store": "T", "fmt": "CSC", "n_threads": 1}),
-    },
+    backend,
     np.float64,
-    np.uintp,
-    cache_dir="pygrgl_spmv_cache",
+    np.int32,
+    artifact_dir="pygrgl_spmv_artifacts",
 )
 ```
 
-Set `plan_up` or `plan_down` to `None` to build a one-sided operator.
+Set either side of the plan pair to `None` to build a one-sided operator.
 
-## Cache behavior
+`log_level` controls verbosity only. Set `instrumentation=True` when you want
+profiling/observability behavior that may reduce absolute performance.
 
-- `SpmvGRG` stores/loads NPZ caches under `cache_dir`
-- default cache root: `./pygrgl_spmv_cache`
-- cache file paths encode the full GRG path to avoid collisions between GRGs with the same filename in different directories
+## Artifact behavior
+
+- `SpmvGRG` stores/loads standalone `.grg_spmv` artifacts under `artifact_dir` when you construct from a `.grg`
+- default artifact root: `./pygrgl_spmv_artifacts`
+- derived artifact paths encode the full GRG path to avoid collisions between GRGs with the same filename in different directories
+- you can also construct `SpmvGRG` directly from a `.grg_spmv` file without the original `.grg`
 
 ## Benchmarks
 
@@ -49,8 +55,10 @@ Benchmark scripts:
 
 - `python -m scripts.bench.mkl`
 - `python -m scripts.bench.cusparse`
+- `python -m scripts.bench.triton`
 
-See `scripts/README.md` for the explicit `--plan-up-down` syntax, wildcard expansion, and search commands.
+See `scripts/README.md` for the explicit `--plan-up-down` syntax, wildcard
+expansion, search commands, and the shared `--instrumentation` flag.
 
 Internally, the GRG implementation now lives under `pygrgl_spmv/grg/`, and backend implementations live under `pygrgl_spmv/backends/mkl/` and `pygrgl_spmv/backends/cusparse/`.
 

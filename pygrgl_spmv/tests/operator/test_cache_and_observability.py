@@ -10,35 +10,42 @@ import pygrgl
 import pytest
 
 from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, HAS_MKL_RUNTIME, INDEX_DTYPE, make_mkl_config, tol
+from pygrgl_spmv.tests.conftest import (
+    DATA_DTYPE,
+    HAS_MKL_RUNTIME,
+    INDEX_DTYPE,
+    make_mkl_backend,
+    matmul_expect_k_hint_warning,
+    tol,
+)
 
 MKL_ONLY = pytest.mark.skipif(not HAS_MKL_RUNTIME, reason="MKL runtime unavailable (libmkl_rt.so not found)")
 
 
 @pytest.mark.smoke
-def test_wavefront_debug_logging_preserves_values(backend_config, primary_grg_path, spmv_cache_dir):
-    cfg_base = dict(backend_config)
-    cfg_wave = dict(backend_config)
-    cfg_wave["log_level"] = "DEBUG"
+def test_wavefront_debug_logging_preserves_values(backend_builder, primary_grg_path, spmv_cache_dir):
+    base_backend = backend_builder()
+    wave_backend = backend_builder()
+    wave_backend._logger.setLevel(logging.DEBUG)
 
-    op_base = SpmvGRG(primary_grg_path, cfg_base, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
-    op_wave = SpmvGRG(primary_grg_path, cfg_wave, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
+    op_base = SpmvGRG(primary_grg_path, base_backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    op_wave = SpmvGRG(primary_grg_path, wave_backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
 
     rng = np.random.default_rng(4404)
     rows = 2
-    x_up = rng.standard_normal((rows, op_base.n), dtype=DATA_DTYPE)
-    x_down = rng.standard_normal((rows, op_base.m), dtype=DATA_DTYPE)
+    x_up = rng.standard_normal((rows, op_base.num_samples), dtype=DATA_DTYPE)
+    x_down = rng.standard_normal((rows, op_base.num_mutations), dtype=DATA_DTYPE)
 
     atol, rtol = tol(DATA_DTYPE)
     np.testing.assert_allclose(
-        op_wave.matmul(x_up, pygrgl.TraversalDirection.UP),
-        op_base.matmul(x_up, pygrgl.TraversalDirection.UP),
+        matmul_expect_k_hint_warning(op_wave, x_up, pygrgl.TraversalDirection.UP),
+        matmul_expect_k_hint_warning(op_base, x_up, pygrgl.TraversalDirection.UP),
         atol=atol,
         rtol=rtol,
     )
     np.testing.assert_allclose(
-        op_wave.matmul(x_down, pygrgl.TraversalDirection.DOWN),
-        op_base.matmul(x_down, pygrgl.TraversalDirection.DOWN),
+        matmul_expect_k_hint_warning(op_wave, x_down, pygrgl.TraversalDirection.DOWN),
+        matmul_expect_k_hint_warning(op_base, x_down, pygrgl.TraversalDirection.DOWN),
         atol=atol,
         rtol=rtol,
     )
@@ -46,15 +53,37 @@ def test_wavefront_debug_logging_preserves_values(backend_config, primary_grg_pa
 
 @pytest.mark.mkl
 @MKL_ONLY
-def test_wavefront_debug_logs_all_levels(primary_grg_path, spmv_cache_dir, caplog):
-    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1, log_level="DEBUG")
+def test_wavefront_debug_logs_all_levels_when_instrumented(primary_grg_path, spmv_cache_dir, caplog):
     with caplog.at_level(logging.DEBUG, logger="pygrgl_spmv.backends.mkl.backend.MklBackend"):
-        op = SpmvGRG(primary_grg_path, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
-        x = np.ones((2, op.n), dtype=DATA_DTYPE)
+        op = SpmvGRG(
+            primary_grg_path,
+            make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1, log_level="DEBUG", instrumentation=True),
+            DATA_DTYPE,
+            INDEX_DTYPE,
+            artifact_dir=spmv_cache_dir,
+        )
+        x = np.ones((2, op.num_samples), dtype=DATA_DTYPE)
         _ = op.matmul(x, pygrgl.TraversalDirection.UP)
     messages = [rec.getMessage() for rec in caplog.records]
     assert any(msg.startswith("wavefront[up]") for msg in messages)
     assert any("  level=" in msg for msg in messages)
+
+
+@pytest.mark.mkl
+@MKL_ONLY
+def test_wavefront_debug_logging_is_quiet_without_instrumentation(primary_grg_path, spmv_cache_dir, caplog):
+    with caplog.at_level(logging.DEBUG, logger="pygrgl_spmv.backends.mkl.backend.MklBackend"):
+        op = SpmvGRG(
+            primary_grg_path,
+            make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1, log_level="DEBUG", instrumentation=False),
+            DATA_DTYPE,
+            INDEX_DTYPE,
+            artifact_dir=spmv_cache_dir,
+        )
+        x = np.ones((2, op.num_samples), dtype=DATA_DTYPE)
+        _ = op.matmul(x, pygrgl.TraversalDirection.UP)
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert not any(msg.startswith("wavefront[up]") for msg in messages)
 
 
 @pytest.mark.mkl
@@ -92,9 +121,14 @@ def test_cache_miss_build_uses_up_edges_and_fails_on_missing_coals(primary_grg_p
 
     monkeypatch.setattr(grg_module.pygrgl, "load_immutable_grg", _wrapped_loader)
 
-    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1)
     with pytest.raises(ValueError, match="missing coalescence counts"):
-        SpmvGRG(dst, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=cache_dir)
+        SpmvGRG(
+            dst,
+            make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+            DATA_DTYPE,
+            INDEX_DTYPE,
+            artifact_dir=cache_dir,
+        )
     assert calls["loader"] == 1
     assert calls["load_up_edges"] == [True]
     assert calls["calculate_missing_coals"] == 0
@@ -106,26 +140,36 @@ def test_cache_hit_does_not_reload_grg(primary_grg_path, tmp_path, monkeypatch):
     dst = tmp_path / "cache-hit.grg"
     shutil.copy2(primary_grg_path, dst)
     cache_dir = tmp_path / "cache"
-    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1)
-
-    first = SpmvGRG(dst, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=cache_dir)
+    first = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=cache_dir,
+    )
     import pygrgl_spmv.grg as grg_module
 
     def _forbidden_loader(*_args, **_kwargs):
         raise AssertionError("cache hit should not call pygrgl.load_immutable_grg")
 
     monkeypatch.setattr(grg_module.pygrgl, "load_immutable_grg", _forbidden_loader)
-    second = SpmvGRG(dst, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=cache_dir)
+    second = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=cache_dir,
+    )
     assert second.shape == first.shape
     np.testing.assert_array_equal(second.coalescence_counts, first.coalescence_counts)
-    np.testing.assert_allclose(second._init_vector_up_bias, first._init_vector_up_bias)
-    np.testing.assert_allclose(second._init_vector_down_bias, first._init_vector_down_bias)
-    if first._init_xtx_up_bias is None:
-        assert second._init_xtx_up_bias is None
-        assert second._init_xtx_down_bias is None
+    np.testing.assert_allclose(second.init_vector_up_bias, first.init_vector_up_bias)
+    np.testing.assert_allclose(second.init_vector_down_bias, first.init_vector_down_bias)
+    if first.init_xtx_up_bias is None:
+        assert second.init_xtx_up_bias is None
+        assert second.init_xtx_down_bias is None
     else:
-        np.testing.assert_allclose(second._init_xtx_up_bias, first._init_xtx_up_bias)
-        np.testing.assert_allclose(second._init_xtx_down_bias, first._init_xtx_down_bias)
+        np.testing.assert_allclose(second.init_xtx_up_bias, first.init_xtx_up_bias)
+        np.testing.assert_allclose(second.init_xtx_down_bias, first.init_xtx_down_bias)
 
 
 @pytest.mark.mkl
@@ -134,31 +178,130 @@ def test_cache_hit_skips_init_bias_rebuild(primary_grg_path, tmp_path, monkeypat
     dst = tmp_path / "cache-hit-no-rebuild.grg"
     shutil.copy2(primary_grg_path, dst)
     cache_dir = tmp_path / "cache"
-    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1)
-
-    _ = SpmvGRG(dst, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=cache_dir)
+    _ = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=cache_dir,
+    )
 
     import pygrgl_spmv.grg as grg_module
 
-    def _forbidden_rebuild(self):
+    def _forbidden_rebuild(self, _state):
         raise AssertionError("cache hit should not rebuild init bias cache")
 
-    monkeypatch.setattr(grg_module.SpmvGRG, "_build_init_bias_cache", _forbidden_rebuild)
-    second = SpmvGRG(dst, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=cache_dir)
+    monkeypatch.setattr(grg_module.SpmvGRG, "_build_init_biases", _forbidden_rebuild)
+    second = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=cache_dir,
+    )
     assert second.shape[0] > 0
+
+
+@pytest.mark.mkl
+@MKL_ONLY
+def test_artifact_path_uses_grg_spmv_suffix(primary_grg_path, tmp_path):
+    dst = tmp_path / "artifact-path.grg"
+    shutil.copy2(primary_grg_path, dst)
+    artifact_dir = tmp_path / "artifact-root"
+    op = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=artifact_dir,
+    )
+    assert op.artifact_path.suffix == ".grg_spmv"
+    assert op.artifact_path.exists()
+
+
+@pytest.mark.mkl
+@MKL_ONLY
+def test_direct_artifact_load_skips_grg_loader(primary_grg_path, tmp_path, monkeypatch):
+    dst = tmp_path / "direct-artifact.grg"
+    shutil.copy2(primary_grg_path, dst)
+    artifact_dir = tmp_path / "artifact-root"
+    first = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=artifact_dir,
+    )
+
+    import pygrgl_spmv.grg as grg_module
+
+    def _forbidden_loader(*_args, **_kwargs):
+        raise AssertionError("direct .grg_spmv load should not call pygrgl.load_immutable_grg")
+
+    monkeypatch.setattr(grg_module.pygrgl, "load_immutable_grg", _forbidden_loader)
+    second = SpmvGRG(
+        first.artifact_path,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=artifact_dir,
+    )
+
+    assert second.shape == first.shape
+    assert second.num_samples == first.num_samples
+    assert second.num_individuals == first.num_individuals
+    assert second.num_mutations == first.num_mutations
+    assert second.num_nodes == first.num_nodes
+    assert second.num_edges == first.num_edges
+    assert second.has_missing_data == first.has_missing_data
+    for mutation_id in range(first.num_mutations):
+        left = first.get_mutation_by_id(mutation_id)
+        right = second.get_mutation_by_id(mutation_id)
+        assert right.position == left.position
+        assert right.time == left.time
+        assert right.allele == left.allele
+        assert right.ref_allele == left.ref_allele
+
+
+@pytest.mark.mkl
+@MKL_ONLY
+def test_artifact_index_dtype_mismatch_rejected(primary_grg_path, tmp_path):
+    dst = tmp_path / "artifact-dtype.grg"
+    shutil.copy2(primary_grg_path, dst)
+    artifact_dir = tmp_path / "artifact-root"
+    first = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        np.int32,
+        artifact_dir=artifact_dir,
+    )
+    with pytest.raises(ValueError, match="structural dtype"):
+        _ = SpmvGRG(
+            first.artifact_path,
+            make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+            DATA_DTYPE,
+            np.int64,
+            artifact_dir=artifact_dir,
+        )
 
 
 @pytest.mark.smoke
 @pytest.mark.mkl
 @MKL_ONLY
 def test_mem_usage_records_setup_and_calls(primary_grg_path, spmv_cache_dir):
-    cfg = make_mkl_config(fmt_up="csr", fmt_down=None, n_threads=1, log_level="WARNING")
-    op = SpmvGRG(primary_grg_path, cfg, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
+    op = SpmvGRG(
+        primary_grg_path,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1, log_level="WARNING"),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=spmv_cache_dir,
+    )
     assert op._backend.mem_usage.host_static.level_offsets > 0
     assert len(op._backend.mem_usage.calls) == 0
 
-    x_up = np.ones((2, op.n), dtype=DATA_DTYPE)
-    x_down = np.ones((2, op.m), dtype=DATA_DTYPE)
+    x_up = np.ones((2, op.num_samples), dtype=DATA_DTYPE)
+    x_down = np.ones((2, op.num_mutations), dtype=DATA_DTYPE)
     _ = op.matmul(x_up, pygrgl.TraversalDirection.UP)
     _ = op.matmul(x_down, pygrgl.TraversalDirection.DOWN)
 

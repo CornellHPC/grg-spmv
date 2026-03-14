@@ -2,23 +2,32 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
+import pygrgl
 import pytest
 import scipy.sparse as sp
 
 from pygrgl_spmv.backends.memory import MemoryRecord, MemoryUsage, RuntimeBytes, StaticBytes
 from pygrgl_spmv.backends.mkl import MklPlan
 from scripts.bench.cli import parse_dtype, parse_index_dtype, tolerances_for_dtype
-from scripts.bench.configs import BenchConfig, format_dry_run_line
+from scripts.bench.configs import BenchConfig, expand_triton_configs, format_dry_run_line, parse_plan_pair_literal
 from scripts.bench.report import evaluate_output_equivalence, print_summary_table, summarize_intra_diagnostics
-from scripts.bench.run import _validate_and_extract_runtime_memory, benchmark_config
+from scripts.bench.run import (
+    _reference_output,
+    _summarize_reference_diagnostics,
+    _validate_and_extract_runtime_memory,
+    benchmark_config,
+)
 
 
-def _save_arr(path, arr):
-    np.save(path, arr, allow_pickle=False)
-    return str(path)
+def _equiv_row(*, config, scenario, direction, k, output):
+    return {
+        "config": config,
+        "scenario": scenario,
+        "direction": direction,
+        "k": k,
+        "output": np.asarray(output),
+    }
 
 
 def test_dtype_parsers_and_tolerances():
@@ -38,12 +47,11 @@ def test_format_dry_run_line_includes_dtype_and_index_dtype():
     line = format_dry_run_line(
         BenchConfig(
             label="x",
-            config={
-                "type": "mkl",
-                "plan_up": MklPlan.from_any({"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1}),
-                "plan_down": None,
-                "log_level": "WARNING",
-            },
+            backend_name="mkl",
+            plan_up_text=str(MklPlan.from_dict({"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1})),
+            plan_down_text=None,
+            instrumentation=False,
+            build_backend=lambda: None,  # type: ignore[return-value]
         ),
         [1, 4],
         ["baseline"],
@@ -52,15 +60,60 @@ def test_format_dry_run_line_includes_dtype_and_index_dtype():
     )
     assert "dtype=float32" in line
     assert "index_dtype=int32" in line
+    assert "instrumentation=off" in line
+
+
+def test_expand_triton_configs_one_sided_exhaustive():
+    up_configs = expand_triton_configs(
+        [parse_plan_pair_literal("[k_hint=1,store=*,fmt=*][]")],
+        log_level="WARNING",
+    )
+    down_configs = expand_triton_configs(
+        [parse_plan_pair_literal("[][k_hint=1,store=*,fmt=*]")],
+        log_level="WARNING",
+    )
+    assert [str(cfg.plan_up_text) for cfg in up_configs] == [
+        "[k_hint=1,store=N,fmt=CSC,scratch=none]",
+        "[k_hint=1,store=N,fmt=CSR,scratch=none]",
+    ]
+    assert [str(cfg.plan_down_text) for cfg in down_configs] == [
+        "[k_hint=1,store=T,fmt=CSC,scratch=none]",
+        "[k_hint=1,store=T,fmt=CSR,scratch=none]",
+    ]
+
+
+def test_expand_triton_configs_with_scratch():
+    up_configs = expand_triton_configs(
+        [parse_plan_pair_literal("[k_hint=1,store=*,fmt=CSR,scratch=2|1][]")],
+        log_level="WARNING",
+    )
+    assert [str(cfg.plan_up_text) for cfg in up_configs] == [
+        "[k_hint=1,store=N,fmt=CSR,scratch=1|2]",
+    ]
+
+
+def test_expand_triton_configs_with_instrumentation():
+    configs = expand_triton_configs(
+        [parse_plan_pair_literal("[k_hint=1,store=N,fmt=CSR][]")],
+        log_level="WARNING",
+        instrumentation=True,
+    )
+    assert len(configs) == 1
+    assert configs[0].label.endswith("-instr")
+    assert configs[0].instrumentation is True
 
 
 @pytest.mark.smoke
-def test_output_equivalence_passes_for_same_class(tmp_path):
-    p0 = _save_arr(tmp_path / "a.npy", np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64))
-    p1 = _save_arr(tmp_path / "b.npy", np.array([[1.0 + 1e-10, 2.0], [3.0, 4.0 - 1e-10]], dtype=np.float64))
+def test_output_equivalence_passes_for_same_class():
     rows = [
-        {"config": "cfg-a", "scenario": "baseline", "direction": "up", "k": 4, "path": p0},
-        {"config": "cfg-b", "scenario": "baseline", "direction": "up", "k": 4, "path": p1},
+        _equiv_row(config="cfg-a", scenario="baseline", direction="up", k=4, output=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)),
+        _equiv_row(
+            config="cfg-b",
+            scenario="baseline",
+            direction="up",
+            k=4,
+            output=np.array([[1.0 + 1e-10, 2.0], [3.0, 4.0 - 1e-10]], dtype=np.float64),
+        ),
     ]
     summary, per_config = evaluate_output_equivalence(rows, atol=1e-8, rtol=1e-5)
     assert summary == {"classes": 1, "comparisons": 1, "errors": 0}
@@ -68,12 +121,10 @@ def test_output_equivalence_passes_for_same_class(tmp_path):
     assert per_config["cfg-b"] == {"failures": 0, "trials": 1}
 
 
-def test_output_equivalence_collects_failures(tmp_path):
-    p0 = _save_arr(tmp_path / "a.npy", np.array([[1.0, 2.0]], dtype=np.float64))
-    p1 = _save_arr(tmp_path / "b.npy", np.array([[1.0, 9.0]], dtype=np.float64))
+def test_output_equivalence_collects_failures():
     rows = [
-        {"config": "cfg-a", "scenario": "baseline", "direction": "up", "k": 4, "path": p0},
-        {"config": "cfg-b", "scenario": "baseline", "direction": "up", "k": 4, "path": p1},
+        _equiv_row(config="cfg-a", scenario="baseline", direction="up", k=4, output=np.array([[1.0, 2.0]], dtype=np.float64)),
+        _equiv_row(config="cfg-b", scenario="baseline", direction="up", k=4, output=np.array([[1.0, 9.0]], dtype=np.float64)),
     ]
     summary, per_config = evaluate_output_equivalence(rows, atol=1e-8, rtol=1e-5)
     assert summary == {"classes": 1, "comparisons": 1, "errors": 1}
@@ -81,12 +132,10 @@ def test_output_equivalence_collects_failures(tmp_path):
     assert per_config["cfg-b"] == {"failures": 1, "trials": 1}
 
 
-def test_output_equivalence_maps_up_miss_to_baseline(tmp_path):
-    p0 = _save_arr(tmp_path / "a.npy", np.array([[11.0, 12.0]], dtype=np.float64))
-    p1 = _save_arr(tmp_path / "b.npy", np.array([[11.0, 12.0]], dtype=np.float64))
+def test_output_equivalence_maps_up_miss_to_baseline():
     rows = [
-        {"config": "cfg-a", "scenario": "baseline", "direction": "up", "k": 2, "path": p0},
-        {"config": "cfg-b", "scenario": "miss", "direction": "up", "k": 2, "path": p1},
+        _equiv_row(config="cfg-a", scenario="baseline", direction="up", k=2, output=np.array([[11.0, 12.0]], dtype=np.float64)),
+        _equiv_row(config="cfg-b", scenario="miss", direction="up", k=2, output=np.array([[11.0, 12.0]], dtype=np.float64)),
     ]
     summary, per_config = evaluate_output_equivalence(rows, atol=1e-8, rtol=1e-5)
     assert summary == {"classes": 1, "comparisons": 1, "errors": 0}
@@ -94,14 +143,11 @@ def test_output_equivalence_maps_up_miss_to_baseline(tmp_path):
     assert per_config["cfg-b"] == {"failures": 0, "trials": 1}
 
 
-def test_output_equivalence_pairwise_counts(tmp_path):
-    p0 = _save_arr(tmp_path / "a.npy", np.array([[1.0]], dtype=np.float64))
-    p1 = _save_arr(tmp_path / "b.npy", np.array([[2.0]], dtype=np.float64))
-    p2 = _save_arr(tmp_path / "c.npy", np.array([[1.0]], dtype=np.float64))
+def test_output_equivalence_pairwise_counts():
     rows = [
-        {"config": "cfg-a", "scenario": "baseline", "direction": "up", "k": 1, "path": p0},
-        {"config": "cfg-b", "scenario": "baseline", "direction": "up", "k": 1, "path": p1},
-        {"config": "cfg-c", "scenario": "baseline", "direction": "up", "k": 1, "path": p2},
+        _equiv_row(config="cfg-a", scenario="baseline", direction="up", k=1, output=np.array([[1.0]], dtype=np.float64)),
+        _equiv_row(config="cfg-b", scenario="baseline", direction="up", k=1, output=np.array([[2.0]], dtype=np.float64)),
+        _equiv_row(config="cfg-c", scenario="baseline", direction="up", k=1, output=np.array([[1.0]], dtype=np.float64)),
     ]
     summary, per_config = evaluate_output_equivalence(rows, atol=1e-8, rtol=1e-5)
     assert summary == {"classes": 1, "comparisons": 3, "errors": 2}
@@ -110,16 +156,14 @@ def test_output_equivalence_pairwise_counts(tmp_path):
     assert per_config["cfg-c"] == {"failures": 1, "trials": 2}
 
 
-def test_output_equivalence_is_order_invariant_for_asymmetric_allclose_case(tmp_path):
-    p0 = _save_arr(tmp_path / "a.npy", np.array([[1000.0]], dtype=np.float64))
-    p1 = _save_arr(tmp_path / "b.npy", np.array([[1105.0]], dtype=np.float64))
+def test_output_equivalence_is_order_invariant_for_asymmetric_allclose_case():
     rows_ab = [
-        {"config": "cfg-a", "scenario": "baseline", "direction": "up", "k": 1, "path": p0},
-        {"config": "cfg-b", "scenario": "baseline", "direction": "up", "k": 1, "path": p1},
+        _equiv_row(config="cfg-a", scenario="baseline", direction="up", k=1, output=np.array([[1000.0]], dtype=np.float64)),
+        _equiv_row(config="cfg-b", scenario="baseline", direction="up", k=1, output=np.array([[1105.0]], dtype=np.float64)),
     ]
     rows_ba = [
-        {"config": "cfg-b", "scenario": "baseline", "direction": "up", "k": 1, "path": p1},
-        {"config": "cfg-a", "scenario": "baseline", "direction": "up", "k": 1, "path": p0},
+        _equiv_row(config="cfg-b", scenario="baseline", direction="up", k=1, output=np.array([[1105.0]], dtype=np.float64)),
+        _equiv_row(config="cfg-a", scenario="baseline", direction="up", k=1, output=np.array([[1000.0]], dtype=np.float64)),
     ]
     summary_ab, per_cfg_ab = evaluate_output_equivalence(rows_ab, atol=1e-8, rtol=1e-1)
     summary_ba, per_cfg_ba = evaluate_output_equivalence(rows_ba, atol=1e-8, rtol=1e-1)
@@ -321,11 +365,11 @@ class _FakeBackend:
 
 class _FakeOp:
     def __init__(self, *, directions=("up", "down")):
-        self.n = 3
-        self.m = 2
-        self.K = 4
+        self.num_samples = 3
+        self.num_mutations = 2
+        self.num_nodes = 4
         self.num_individuals = 3
-        self.sel_miss = sp.csr_matrix((self.m, self.K), dtype=np.float64)
+        self.sel_miss = sp.csr_matrix((self.num_mutations, self.num_nodes), dtype=np.float64)
         self._backend = _FakeBackend(directions=directions)
 
     def matmul(self, matrix, direction, **_kwargs):
@@ -338,7 +382,7 @@ class _FakeOp:
                 device_runtime=RuntimeBytes(level_buffers=200),
                 meta={"direction": "up", "mode": "n/a"},
             )
-            return np.zeros((k, self.m), dtype=np.float64)
+            return np.zeros((k, self.num_mutations), dtype=np.float64)
         if direction == "down":
             self._backend.mem_usage.record(
                 stage="run_down",
@@ -347,25 +391,40 @@ class _FakeOp:
                 device_runtime=RuntimeBytes(level_buffers=400),
                 meta={"direction": "down", "mode": "n/a"},
             )
-            return np.zeros((k, self.n), dtype=np.float64)
+            return np.zeros((k, self.num_samples), dtype=np.float64)
         raise ValueError(direction)
 
 
-def test_benchmark_config_orders_rows_by_execution(tmp_path):
+def test_benchmark_config_orders_rows_by_execution():
+    import scripts.bench.run as bench_run
+
     op = _FakeOp()
-    summary_rows, output_rows = benchmark_config(
-        op=op,
-        label="cfg-x",
-        ks=[1, 2],
-        options=["baseline"],
-        n_trials=1,
-        n_warmup=0,
-        seed_base=123,
-        output_dir=tmp_path,
+    grg_ref = object()
+    monkey_ref = lambda **kwargs: np.zeros(
+        (
+            kwargs["matrix"].shape[0],
+            op.num_mutations if kwargs["direction"] == "up" else op.num_samples,
+        ),
         dtype=np.float64,
-        output_atol=1e-8,
-        output_rtol=1e-5,
     )
+    original_reference = bench_run._reference_output
+    bench_run._reference_output = monkey_ref
+    try:
+        summary_rows, output_rows = benchmark_config(
+            op=op,
+            grg_ref=grg_ref,
+            label="cfg-x",
+            ks=[1, 2],
+            options=["baseline"],
+            n_trials=1,
+            n_warmup=0,
+            seed_base=123,
+            dtype=np.float64,
+            output_atol=1e-8,
+            output_rtol=1e-5,
+        )
+    finally:
+        bench_run._reference_output = original_reference
 
     assert [row["scenario"] for row in summary_rows[:2]] == ["static", "static_est"]
     assert [(row["direction"], row["k"]) for row in summary_rows[2:]] == [
@@ -375,31 +434,72 @@ def test_benchmark_config_orders_rows_by_execution(tmp_path):
         ("down", 2),
     ]
     assert len(output_rows) == 4
-    for row in output_rows:
-        assert Path(str(row["path"])).exists()
+    assert all("output" in row for row in output_rows)
+    assert all("path" not in row for row in output_rows)
 
 
-def test_benchmark_config_omits_unspecified_direction_rows(tmp_path):
-    op = _FakeOp(directions=("up",))
-    summary_rows, output_rows = benchmark_config(
-        op=op,
-        label="cfg-x",
-        ks=[1],
-        options=["baseline"],
-        n_trials=1,
-        n_warmup=0,
-        seed_base=123,
-        output_dir=tmp_path,
+def test_benchmark_config_does_not_call_np_save(monkeypatch):
+    import scripts.bench.run as bench_run
+
+    op = _FakeOp()
+    grg_ref = object()
+    original_reference = bench_run._reference_output
+    bench_run._reference_output = lambda **kwargs: np.zeros(
+        (
+            kwargs["matrix"].shape[0],
+            op.num_mutations if kwargs["direction"] == "up" else op.num_samples,
+        ),
         dtype=np.float64,
-        output_atol=1e-8,
-        output_rtol=1e-5,
     )
+    monkeypatch.setattr(bench_run.np, "save", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("np.save called")))
+    try:
+        benchmark_config(
+            op=op,
+            grg_ref=grg_ref,
+            label="cfg-x",
+            ks=[1],
+            options=["baseline"],
+            n_trials=1,
+            n_warmup=0,
+            seed_base=123,
+            dtype=np.float64,
+            output_atol=1e-8,
+            output_rtol=1e-5,
+        )
+    finally:
+        bench_run._reference_output = original_reference
+
+
+def test_benchmark_config_omits_unspecified_direction_rows():
+    import scripts.bench.run as bench_run
+
+    op = _FakeOp(directions=("up",))
+    grg_ref = object()
+    original_reference = bench_run._reference_output
+    bench_run._reference_output = lambda **kwargs: np.zeros((kwargs["matrix"].shape[0], op.num_mutations), dtype=np.float64)
+    try:
+        summary_rows, output_rows = benchmark_config(
+            op=op,
+            grg_ref=grg_ref,
+            label="cfg-x",
+            ks=[1],
+            options=["baseline"],
+            n_trials=1,
+            n_warmup=0,
+            seed_base=123,
+            dtype=np.float64,
+            output_atol=1e-8,
+            output_rtol=1e-5,
+        )
+    finally:
+        bench_run._reference_output = original_reference
 
     assert [row["direction"] for row in summary_rows] == ["-", "-", "up"]
     assert "skip" not in summary_rows[-1]
     assert len(output_rows) == 1
     assert output_rows[0]["direction"] == "up"
     assert output_rows[0]["scenario"] == "baseline"
+    assert "output" in output_rows[0]
 
 
 class _FakeWarmupMismatchOp(_FakeOp):
@@ -417,21 +517,35 @@ class _FakeWarmupMismatchOp(_FakeOp):
         return out
 
 
-def test_benchmark_config_checks_warmup_outputs(tmp_path):
+def test_benchmark_config_checks_warmup_outputs():
+    import scripts.bench.run as bench_run
+
     op = _FakeWarmupMismatchOp()
-    summary_rows, output_rows = benchmark_config(
-        op=op,
-        label="cfg-x",
-        ks=[1],
-        options=["baseline"],
-        n_trials=1,
-        n_warmup=2,
-        seed_base=123,
-        output_dir=tmp_path,
+    grg_ref = object()
+    original_reference = bench_run._reference_output
+    bench_run._reference_output = lambda **kwargs: np.zeros(
+        (
+            kwargs["matrix"].shape[0],
+            op.num_mutations if kwargs["direction"] == "up" else op.num_samples,
+        ),
         dtype=np.float64,
-        output_atol=1e-8,
-        output_rtol=1e-5,
     )
+    try:
+        summary_rows, output_rows = benchmark_config(
+            op=op,
+            grg_ref=grg_ref,
+            label="cfg-x",
+            ks=[1],
+            options=["baseline"],
+            n_trials=1,
+            n_warmup=2,
+            seed_base=123,
+            dtype=np.float64,
+            output_atol=1e-8,
+            output_rtol=1e-5,
+        )
+    finally:
+        bench_run._reference_output = original_reference
     assert len(output_rows) == 2
     up_row = next(row for row in summary_rows if row.get("scenario") == "baseline" and row.get("direction") == "up")
     assert up_row["intra_errors"] == 1
@@ -443,6 +557,70 @@ def test_benchmark_config_checks_warmup_outputs(tmp_path):
     assert up_row["rel_err_max"] == pytest.approx(1e30)
 
 
+def test_run_benchmark_suite_does_not_report_saved_output_dirs(monkeypatch, capsys):
+    import pygrgl_spmv
+    import scripts.bench.run as bench_run
+
+    config = BenchConfig(
+        label="cfg-x",
+        backend_name="fake",
+        plan_up_text=None,
+        plan_down_text=None,
+        instrumentation=False,
+        build_backend=lambda: object(),
+    )
+
+    monkeypatch.setattr(pygrgl_spmv, "SpmvGRG", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(bench_run.pygrgl, "load_immutable_grg", lambda _path: object())
+    monkeypatch.setattr(
+        bench_run,
+        "benchmark_config",
+        lambda **_kwargs: (
+            [
+                {
+                    "config": "cfg-x",
+                    "scenario": "baseline",
+                    "direction": "up",
+                    "k": 1,
+                    "call_ms_mean": 1.0,
+                    "call_ms_std": 0.0,
+                    "host_gib": 0.0,
+                    "device_gib": 0.0,
+                    "note": "mode=n/a",
+                    "intra_errors": 0,
+                    "intra_trials": 0,
+                    "intra_fail_indices": [],
+                    "abs_err_avg": None,
+                    "abs_err_max": None,
+                    "rel_err_avg": None,
+                    "rel_err_max": None,
+                    "ref_error": 0,
+                    "ref_abs_err_max": 0.0,
+                    "ref_rel_err_max": 0.0,
+                }
+            ],
+            [_equiv_row(config="cfg-x", scenario="baseline", direction="up", k=1, output=np.array([[1.0]], dtype=np.float64))],
+        ),
+    )
+
+    bench_run.run_benchmark_suite(
+        grg_path="fake.grg",
+        configs=[config],
+        ks=[1],
+        options=["baseline"],
+        n_trials=1,
+        n_warmup=0,
+        dtype=np.float64,
+        index_dtype=np.int32,
+        output_atol=1e-8,
+        output_rtol=1e-5,
+        skip_note=False,
+    )
+
+    out = capsys.readouterr().out
+    assert "Saved benchmark reference outputs to:" not in out
+
+
 def test_summarize_intra_diagnostics_counts_runtime_rows_only():
     rows = [
         {"scenario": "static"},
@@ -452,3 +630,25 @@ def test_summarize_intra_diagnostics_counts_runtime_rows_only():
         {"scenario": "miss", "skip": "reason", "intra_errors": 99, "intra_trials": 99},
     ]
     assert summarize_intra_diagnostics(rows) == (3, 8)
+
+
+def test_reference_output_matches_pygrgl():
+    grg = pygrgl.load_immutable_grg("pygrgl_spmv/tests/data/msprime.example.igd.final.grg")
+    rng = np.random.default_rng(123)
+    matrix = rng.standard_normal((1, grg.num_samples), dtype=np.float64)
+    expected = np.asarray(pygrgl.matmul(grg, matrix, pygrgl.TraversalDirection.UP))
+    actual = _reference_output(grg_ref=grg, matrix=matrix, direction="up", kwargs={})
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_summarize_reference_diagnostics():
+    errors, checked, abs_max, rel_max = _summarize_reference_diagnostics(
+        [
+            {"scenario": "static"},
+            {"scenario": "baseline", "ref_error": 1, "ref_abs_err_max": 1e-6, "ref_rel_err_max": 2e-6},
+            {"scenario": "baseline", "ref_error": 0, "ref_abs_err_max": 3e-6, "ref_rel_err_max": 1e-6},
+        ]
+    )
+    assert (errors, checked) == (1, 2)
+    assert abs_max == pytest.approx(3e-6)
+    assert rel_max == pytest.approx(2e-6)

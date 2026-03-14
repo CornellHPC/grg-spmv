@@ -11,7 +11,7 @@ import numpy as np
 from scripts.bench.configs import PlanPairSpec, parse_plan_pair_literal
 
 DTYPE = np.float64
-INDEX_DTYPE = np.int64
+INDEX_DTYPE = np.int32
 DEFAULT_MATMUL_OPTIONS = (
     "baseline",
     "by_individual",
@@ -42,6 +42,7 @@ class CommonBenchArgs:
     output_atol: float
     output_rtol: float
     log_level: str
+    instrumentation: bool
     dry_run: bool
     skip_note: bool
 
@@ -69,6 +70,11 @@ def add_common_bench_args(parser: argparse.ArgumentParser) -> None:
         default="WARNING",
         choices=list(LOG_LEVEL_CHOICES),
         help="Log level passed to SpmvGRG and backend",
+    )
+    parser.add_argument(
+        "--instrumentation",
+        action="store_true",
+        help="Enable profiling/instrumentation mode even when it reduces absolute performance",
     )
     parser.add_argument(
         "--dtype",
@@ -168,6 +174,7 @@ def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
         output_atol=output_atol,
         output_rtol=output_rtol,
         log_level=str(args.log_level),
+        instrumentation=bool(args.instrumentation),
         dry_run=bool(args.dry_run),
         skip_note=bool(args.skip_note),
     )

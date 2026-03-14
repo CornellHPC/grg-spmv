@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from functools import cache
 from dataclasses import dataclass
-from enum import IntEnum, StrEnum
+from enum import IntEnum
 from itertools import product
 from typing import Any, Mapping
 import re
@@ -191,19 +191,7 @@ class CusparsePlan:
         return _runtime_cuda_version()
 
     @classmethod
-    def from_any(cls, value: Any) -> CusparsePlan | None:
-        if value is None:
-            return None
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, str):
-            return cls.from_literal(value)
-        if isinstance(value, Mapping):
-            return cls.from_mapping(value)
-        raise TypeError(f"Cannot construct CusparsePlan from {type(value).__name__}")
-
-    @classmethod
-    def from_mapping(cls, mapping: Mapping[str, Any]) -> CusparsePlan:
+    def from_dict(cls, mapping: Mapping[str, object]) -> "CusparsePlan":
         extra = sorted(set(mapping) - set(_REQUIRED_KEYS))
         if extra:
             raise ValueError(f"Unknown CusparsePlan field(s): {extra}")
@@ -226,7 +214,7 @@ class CusparsePlan:
         mapping = parse_plan_literal(raw)
         if any(value == "*" or str(value).startswith("!") for value in mapping.values()):
             raise ValueError(f"Wildcard or negation is not allowed in concrete plan literal {raw!r}")
-        return cls.from_mapping(mapping)
+        return cls.from_dict(mapping)
 
     @classmethod
     def expand_literal(cls, raw: str) -> list[CusparsePlan]:
@@ -285,7 +273,7 @@ class CusparsePlan:
         if self.algo in {SpMMAlgorithm.CSR_ALG1, SpMMAlgorithm.CSR_ALG2}:
             return self.fmt in {SparseFormat.CSR, SparseFormat.CSC}
         if self.algo == SpMMAlgorithm.CSR_ALG3:
-            return self.fmt in {SparseFormat.CSR, SparseFormat.CSC} and self.op_a == Operation.N
+            return self.fmt == SparseFormat.CSR and self.op_a == Operation.N
         return False
 
     @property
@@ -341,6 +329,42 @@ class CusparsePlan:
         )
 
 
+@dataclass(frozen=True)
+class CusparsePlanPair:
+    plan_up: CusparsePlan | None
+    plan_down: CusparsePlan | None
+
+    def __post_init__(self) -> None:
+        if self.plan_up is None and self.plan_down is None:
+            raise ValueError("At least one of plan_up/plan_down must be provided")
+        if self.plan_up is not None:
+            actual = str(getattr(self.plan_up.direction, "name", self.plan_up.direction)).lower()
+            if actual != "up":
+                raise ValueError(f"cuSPARSE plan_up expects a UP plan, got {actual.upper()}: {self.plan_up}")
+        if self.plan_down is not None:
+            actual = str(getattr(self.plan_down.direction, "name", self.plan_down.direction)).lower()
+            if actual != "down":
+                raise ValueError(f"cuSPARSE plan_down expects a DOWN plan, got {actual.upper()}: {self.plan_down}")
+
+    @classmethod
+    def from_dicts(
+        cls,
+        plan_up: Mapping[str, object] | None,
+        plan_down: Mapping[str, object] | None,
+    ) -> "CusparsePlanPair":
+        return cls(
+            plan_up=None if plan_up is None else CusparsePlan.from_dict(plan_up),
+            plan_down=None if plan_down is None else CusparsePlan.from_dict(plan_down),
+        )
+
+    @classmethod
+    def from_literals(cls, plan_up: str | None, plan_down: str | None) -> "CusparsePlanPair":
+        return cls(
+            plan_up=None if plan_up is None else CusparsePlan.from_literal(plan_up),
+            plan_down=None if plan_down is None else CusparsePlan.from_literal(plan_down),
+        )
+
+
 def parse_plan_literal(raw: str) -> dict[str, str]:
     match = _LITERAL_RE.fullmatch(str(raw).strip())
     if match is None:
@@ -370,6 +394,7 @@ def parse_plan_literal(raw: str) -> dict[str, str]:
 
 __all__ = [
     "CusparsePlan",
+    "CusparsePlanPair",
     "DenseOrder",
     "Operation",
     "SpMMAlgorithm",

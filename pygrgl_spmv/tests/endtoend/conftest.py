@@ -7,18 +7,25 @@ import pygrgl
 import pytest
 
 from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, default_backend_params
+from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, default_backend_builders
 
 
-@pytest.fixture(scope="session", params=default_backend_params(log_level="INFO"))
-def backend_config(request, backend_filter):
-    cfg = request.param
-    btype = cfg['type']
+@pytest.fixture(scope="session", params=default_backend_builders(log_level="INFO"))
+def backend_builder(request, backend_filter):
+    backend_name, builder = request.param
+    btype = str(backend_name)
     if backend_filter == "mkl" and btype != "mkl":
         pytest.skip("filtered to mkl backend")
     if backend_filter == "cusparse" and btype != "cusparse":
         pytest.skip("filtered to cusparse backend")
-    return cfg
+    if backend_filter == "triton" and btype != "triton":
+        pytest.skip("filtered to triton backend")
+    return builder
+
+
+@pytest.fixture
+def backend_config(backend_builder):
+    return backend_builder()
 
 
 @pytest.fixture(scope="session")
@@ -37,9 +44,9 @@ def missing_grg(missing_grg_path):
 
 
 @pytest.fixture
-def make_operator(backend_config, spmv_cache_dir):
+def make_operator(backend_builder, spmv_cache_dir):
     def _make(path: str, dtype=DATA_DTYPE):
-        return SpmvGRG(path, backend_config, dtype, INDEX_DTYPE, cache_dir=spmv_cache_dir)
+        return SpmvGRG(path, backend_builder(), dtype, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
 
     return _make
 

@@ -4,6 +4,7 @@ Backend-specific entrypoints:
 
 - `python -m scripts.bench.mkl`
 - `python -m scripts.bench.cusparse`
+- `python -m scripts.bench.triton`
 
 Each script expands explicit backend plan pairs, runs the requested scenarios,
 then prints one unified summary table.
@@ -49,7 +50,7 @@ Row semantics:
 
 ## Output equivalence checks
 
-Benchmark correctness checks use full-output arrays and do not stop the run:
+Benchmark correctness checks use full-output arrays in memory and do not stop the run:
 
 - intra-case warmup/trial outputs are checked with `np.allclose`
 - cross-config outputs are checked with full pairwise comparisons inside each equivalence class:
@@ -68,10 +69,18 @@ Benchmark correctness checks use full-output arrays and do not stop the run:
 - `--plan-up-down`
 - `--matmul-options`
 - `--log-level`
+- `--instrumentation`
 - `--dtype` (`float32` or `float64`)
 - `--index-dtype` (`int32` or `int64`)
 - `--dry-run`
 - `--skip-note`
+
+`--log-level` changes verbosity only. `--instrumentation` is the opt-in switch
+for slower observability/profiling behavior:
+
+- MKL: per-level CPU-side wavefront debug logging
+- cuSPARSE: NVTX ranges/marks and dynamic scheduler execution
+- Triton: NVTX ranges/marks and dynamic scheduler execution
 
 `--plan-up-down` uses two adjacent bracketed plan literals:
 
@@ -86,7 +95,25 @@ Pass them as one argument with no delimiter between the two bracket groups:
 --plan-up-down="[...][...]"
 ```
 
-For cuSPARSE, `*` is allowed for every field except `k_hint`. Negation is also supported for enum-like fields, for example `fmt=!COO` or `fmt=!CSR!CSC`. Empty sides are allowed: `[][PLAN]` means benchmark DOWN only, `[PLAN][]` means benchmark UP only. The current executor now supports the broader docs-valid dense-side plan space, including `opB=T` and column-major `orderB/orderC`, except for separately-guarded runtime quirks such as `CSC + CSR_ALG3`.
+For cuSPARSE, `*` is allowed for every field except `k_hint`. Negation is also supported for enum-like fields, for example `fmt=!COO` or `fmt=!CSR!CSC`. Empty sides are allowed: `[][PLAN]` means benchmark DOWN only, `[PLAN][]` means benchmark UP only. The current executor now supports the broader docs-valid dense-side plan space, including `opB=T` and column-major `orderB/orderC`. Unsupported combinations such as `CSC + CSR_ALG3` are rejected directly by `CusparsePlan.supported`.
+
+For Triton, benchmark plans currently expose only `k_hint`, `store`, and `fmt`.
+`k_hint` must be `1`. Wildcards and negation are supported for `store` and `fmt`.
+One-sided dry-run examples:
+
+```bash
+uv run python -m scripts.bench.triton \
+  --dry-run \
+  --ks 1 \
+  --matmul-options baseline \
+  --plan-up-down="[k_hint=1,store=*,fmt=*][]"
+
+uv run python -m scripts.bench.triton \
+  --dry-run \
+  --ks 1 \
+  --matmul-options baseline \
+  --plan-up-down="[][k_hint=1,store=*,fmt=*]"
+```
 
 ## Examples
 
@@ -98,7 +125,7 @@ uv run python -m scripts.bench.mkl \
   --ks 4,16 \
   --warmup 1 --trials 3 \
   --dtype float64 \
-  --index-dtype int64 \
+  --index-dtype int32 \
   --plan-up-down="[k_hint=none,store=N,fmt=CSR,n_threads=1][k_hint=none,store=T,fmt=CSC,n_threads=1]" \
   --matmul-options baseline,init_vector
 ```
@@ -137,4 +164,28 @@ uv run python -m scripts.bench.cusparse \
   --skip-note \
   --plan-up-down="[k_hint=none,store=*,fmt=*,opA=*,opB=*,orderB=*,orderC=*,algo=*][k_hint=none,store=*,fmt=*,opA=*,opB=*,orderB=*,orderC=*,algo=*]" \
   --plan-up-down="[k_hint=1,store=*,fmt=*,opA=*,opB=*,orderB=*,orderC=*,algo=*][k_hint=1,store=*,fmt=*,opA=*,opB=*,orderB=*,orderC=*,algo=*]"
+```
+
+Triton logged benchmark examples:
+
+```bash
+mkdir -p bench_logs/triton/run1
+
+uv run python -m scripts.bench.triton \
+  --ks 1 \
+  --warmup 3 \
+  --trials 10 \
+  --dtype float64 \
+  --matmul-options baseline \
+  --plan-up-down="[k_hint=1,store=*,fmt=*][]" \
+  2>&1 | tee bench_logs/triton/run1/fp64_up.log
+
+uv run python -m scripts.bench.triton \
+  --ks 1 \
+  --warmup 3 \
+  --trials 10 \
+  --dtype float64 \
+  --matmul-options baseline \
+  --plan-up-down="[][k_hint=1,store=*,fmt=*]" \
+  2>&1 | tee bench_logs/triton/run1/fp64_down.log
 ```

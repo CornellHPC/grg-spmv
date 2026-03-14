@@ -31,6 +31,9 @@ dependencies = [
 [project.optional-dependencies]
 gpu = [
     "cupy-cuda12x>=13.6.0",
+    "nvtx>=0.2.14",
+    "torch>=2.10.0",
+    "triton>=3.6.0",
 ]
 dev = [
     "pytest>=9.0.2",
@@ -75,6 +78,8 @@ markers = [
     "smoke: core fast tests selected by --smoke",
     "gpu: tests requiring a GPU (CuPy + cuSPARSE)",
     "mkl: tests specific to MKL backend",
+    "cusparse: tests specific to cuSPARSE backend",
+    "triton: tests specific to Triton backend",
 ]
 
 [tool.pyright]
@@ -84,4 +89,4 @@ pythonVersion = "3.10"
 pythonPlatform = "x86_64-unknown-linux-gnu"
 
 [tool.uv.sources]
-pygrgl = { git = "ssh://git@github.com/nalzok/grgl.git", rev = "nalzok-patch-submodule" }
+pygrgl = { git = "ssh://git@github.com/aprilweilab/grgl.git", rev = "main" }

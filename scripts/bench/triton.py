@@ -1,4 +1,4 @@
-"""Benchmark SpmvGRG matmul for the cuSPARSE backend."""
+"""Benchmark SpmvGRG matmul for the Triton backend."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from .cli import (
     configure_logging,
     parse_common_bench_args,
 )
-from .configs import expand_cusparse_configs, format_dry_run_line
+from .configs import expand_triton_configs, format_dry_run_line
 from .run import run_benchmark_suite
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark SpmvGRG matmul for cuSPARSE backend")
+    parser = argparse.ArgumentParser(description="Benchmark SpmvGRG matmul for the Triton backend")
     add_common_bench_args(parser)
     return parser.parse_args()
 
@@ -28,7 +28,7 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(f"Argument error: {exc}") from exc
 
-    configs = expand_cusparse_configs(common.plan_pair_specs, common.log_level, common.instrumentation)
+    configs = expand_triton_configs(common.plan_pair_specs, common.log_level, common.instrumentation)
     if common.dry_run:
         for entry in configs:
             print(

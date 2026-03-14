@@ -6,15 +6,15 @@ import numpy as np
 import pytest
 
 from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, K_MATRIX, binary_pm1, tol
+from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, K_MATRIX, binary_pm1, matmul_expect_k_hint_warning, tol
 
 
 def _run_up(op: SpmvGRG, X_col_major: np.ndarray) -> np.ndarray:
-    return op.matmul(X_col_major.T, "up").T
+    return matmul_expect_k_hint_warning(op, X_col_major.T, "up").T
 
 
 def _run_down(op: SpmvGRG, X_col_major: np.ndarray) -> np.ndarray:
-    return op.matmul(X_col_major.T, "down").T
+    return matmul_expect_k_hint_warning(op, X_col_major.T, "down").T
 
 
 @pytest.mark.smoke
@@ -22,7 +22,7 @@ def test_shape_smoke(backend_config, primary_grg_path, spmv_cache_dir):
     import pygrgl
 
     grg = pygrgl.load_immutable_grg(primary_grg_path)
-    op = SpmvGRG(primary_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
+    op = SpmvGRG(primary_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
     assert op.shape == (grg.num_samples, grg.num_mutations)
 
 
@@ -55,14 +55,14 @@ def test_backward_full(op, gt_small, k):
 
 
 def test_rcm_forward_path(backend_config, primary_grg_path, gt_small, spmv_cache_dir):
-    op = SpmvGRG(primary_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
+    op = SpmvGRG(primary_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
     X, Y_expected = gt_small.get("forward", 4, seed=11, dtype=DATA_DTYPE)
     atol, rtol = tol(DATA_DTYPE)
     np.testing.assert_allclose(_run_up(op, X), Y_expected, atol=atol, rtol=rtol)
 
 
 def test_rcm_backward_path(backend_config, primary_grg_path, gt_small, spmv_cache_dir):
-    op = SpmvGRG(primary_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE, cache_dir=spmv_cache_dir)
+    op = SpmvGRG(primary_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
     X, Y_expected = gt_small.get("backward", 4, seed=11, dtype=DATA_DTYPE)
     atol, rtol = tol(DATA_DTYPE)
     np.testing.assert_allclose(_run_down(op, X), Y_expected, atol=atol, rtol=rtol)
@@ -92,7 +92,7 @@ def test_allele_counts(op, gt_small):
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["f32", "f64"])
 def test_dtype_forward(backend_config, primary_grg_path, gt_small, spmv_cache_dir, dtype):
-    op = SpmvGRG(primary_grg_path, backend_config, dtype, INDEX_DTYPE, cache_dir=spmv_cache_dir)
+    op = SpmvGRG(primary_grg_path, backend_config, dtype, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
     X, Y_expected = gt_small.get("forward", 4, seed=200, dtype=dtype)
     atol, rtol = tol(dtype)
     np.testing.assert_allclose(_run_up(op, X), Y_expected, atol=atol, rtol=rtol)
@@ -100,7 +100,7 @@ def test_dtype_forward(backend_config, primary_grg_path, gt_small, spmv_cache_di
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["f32", "f64"])
 def test_dtype_backward(backend_config, primary_grg_path, gt_small, spmv_cache_dir, dtype):
-    op = SpmvGRG(primary_grg_path, backend_config, dtype, INDEX_DTYPE, cache_dir=spmv_cache_dir)
+    op = SpmvGRG(primary_grg_path, backend_config, dtype, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
     X, Y_expected = gt_small.get("backward", 4, seed=200, dtype=dtype)
     atol, rtol = tol(dtype)
     np.testing.assert_allclose(_run_down(op, X), Y_expected, atol=atol, rtol=rtol)
@@ -121,10 +121,10 @@ def test_repeated_backward_is_stable(op, gt_small):
 
 
 def test_zero_forward(op):
-    X = np.zeros((op.n, 4), dtype=DATA_DTYPE)
+    X = np.zeros((op.num_samples, 4), dtype=DATA_DTYPE)
     np.testing.assert_array_equal(_run_up(op, X), 0.0)
 
 
 def test_zero_backward(op):
-    X = np.zeros((op.m, 4), dtype=DATA_DTYPE)
+    X = np.zeros((op.num_mutations, 4), dtype=DATA_DTYPE)
     np.testing.assert_array_equal(_run_down(op, X), 0.0)

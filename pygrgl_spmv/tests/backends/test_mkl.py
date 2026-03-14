@@ -8,13 +8,13 @@ import numpy as np
 import pytest
 
 from pygrgl_spmv import SpmvGRG
+from pygrgl_spmv.backends.mkl import MklBackend, MklPlan, MklPlanPair
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
     INDEX_DTYPE,
     K_CORE,
     K_MATRIX,
-    make_backend_config,
-    make_mkl_config,
+    make_mkl_backend,
     make_mkl_plan,
     tol,
 )
@@ -37,16 +37,17 @@ def _make_mkl_op(
 ):
     return SpmvGRG(
         grg_path,
-        make_mkl_config(
+        make_mkl_backend(
             fmt_up=fmt_up,
             fmt_down=fmt_down,
             k_hint=k_hint,
             n_threads=n_threads,
             infer_missing=infer_missing,
+            log_level="WARNING",
         ),
         dtype,
         INDEX_DTYPE,
-        cache_dir=cache_dir,
+        artifact_dir=cache_dir,
     )
 
 
@@ -82,10 +83,16 @@ def _find_op(ops_by_level, *, level: int, src_level: int, handle):
 def _make_backend(primary_grg_path, spmv_cache_dir, *, plan_up, plan_down):
     op = SpmvGRG(
         primary_grg_path,
-        make_backend_config("mkl", plan_up=plan_up, plan_down=plan_down, log_level="WARNING"),
+        MklBackend(
+            pair=MklPlanPair(
+                plan_up=None if plan_up is None else MklPlan.from_dict(plan_up),
+                plan_down=None if plan_down is None else MklPlan.from_dict(plan_down),
+            ),
+            log_level="WARNING",
+        ),
         DATA_DTYPE,
         INDEX_DTYPE,
-        cache_dir=spmv_cache_dir,
+        artifact_dir=spmv_cache_dir,
     )
     return op._backend
 
@@ -227,15 +234,16 @@ def test_run_uses_per_direction_thread_counts(primary_grg_path, gt_small, spmv_c
     monkeypatch.setattr(mkl_backend, "mkl_set_num_threads", lambda n: calls.append(int(n)))
     op = SpmvGRG(
         primary_grg_path,
-        make_backend_config(
-            "mkl",
-            plan_up=make_mkl_plan(store="N", fmt="CSR", n_threads=1, k_hint=None),
-            plan_down=make_mkl_plan(store="T", fmt="CSC", n_threads=4, k_hint=None),
+        MklBackend(
+            pair=MklPlanPair.from_dicts(
+                make_mkl_plan(store="N", fmt="CSR", n_threads=1, k_hint=None),
+                make_mkl_plan(store="T", fmt="CSC", n_threads=4, k_hint=None),
+            ),
             log_level="WARNING",
         ),
         DATA_DTYPE,
         INDEX_DTYPE,
-        cache_dir=spmv_cache_dir,
+        artifact_dir=spmv_cache_dir,
     )
 
     calls.clear()
@@ -259,15 +267,16 @@ def test_nonshared_handles_keep_distinct_k_hints(primary_grg_path, spmv_cache_di
     monkeypatch.setattr(MklSparseHandle, "set_mm_hint", record)
     _ = SpmvGRG(
         primary_grg_path,
-        make_backend_config(
-            "mkl",
-            plan_up=make_mkl_plan(store="N", fmt="CSR", n_threads=1, k_hint=2),
-            plan_down=make_mkl_plan(store="T", fmt="CSR", n_threads=1, k_hint=16),
+        MklBackend(
+            pair=MklPlanPair.from_dicts(
+                make_mkl_plan(store="N", fmt="CSR", n_threads=1, k_hint=2),
+                make_mkl_plan(store="T", fmt="CSR", n_threads=1, k_hint=16),
+            ),
             log_level="WARNING",
         ),
         DATA_DTYPE,
         INDEX_DTYPE,
-        cache_dir=spmv_cache_dir,
+        artifact_dir=spmv_cache_dir,
     )
 
     assert sorted(set(k for _, k, _ in calls)) == [2, 16]

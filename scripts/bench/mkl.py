@@ -28,7 +28,7 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(f"Argument error: {exc}") from exc
 
-    configs = expand_mkl_configs(common.plan_pair_specs, common.log_level)
+    configs = expand_mkl_configs(common.plan_pair_specs, common.log_level, common.instrumentation)
     if common.dry_run:
         for entry in configs:
             print(format_dry_run_line(entry, common.ks, common.options, dtype=common.dtype, index_dtype=common.index_dtype))

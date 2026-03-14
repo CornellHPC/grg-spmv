@@ -22,6 +22,7 @@ This document describes how memory usage is tracked for all backends through
 - `blocks_down`
 - `selector_mut`
 - `selector_miss`
+- `workspace`
 
 ### Runtime memory (`RuntimeBytes`) keys
 
@@ -38,30 +39,40 @@ This document describes how memory usage is tracked for all backends through
 
 ## Layout
 
-- `pygrgl_spmv/backends/base.py`: shared backend scaffolding, setup payloads, validation, and profiling helpers
+- `pygrgl_spmv/backends/base.py`: shared backend scaffolding, setup payloads, and validation
 - `pygrgl_spmv/backends/reference.py`: `ReferenceBackend` and `ReferencePlan`
-- `pygrgl_spmv/backends/registry.py`: backend factory from the public config dict
 - `pygrgl_spmv/backends/mkl/`: MKL plan, backend, and FFI modules
-- `pygrgl_spmv/backends/cusparse/`: cuSPARSE plan, backend, storage/runtime helpers, and FFI modules
+- `pygrgl_spmv/backends/cusparse/`: cuSPARSE plan, backend, and FFI modules
 
 ## Plan-driven backends
 
-Backends are now constructed from explicit `plan_up` / `plan_down` objects
-instead of shorthand format pairs.
+Backends are constructed from explicit backend-specific plan-pair objects.
 
 - `MklPlan` carries MKL-specific storage/runtime hints (`store`, `fmt`,
   `n_threads`, `k_hint`)
 - `CusparsePlan` carries explicit cuSPARSE SpMM choices (`store`, `fmt`,
   `opA`, `opB`, `orderB`, `orderC`, `algo`, and `k_hint`); the current CUDA
   runtime version remains available as an environment-derived property
+- each backend exposes a backend-specific `*PlanPair` type that validates
+  its `plan_up` / `plan_down` pair before backend construction
 
 The plan object is the single source of truth for backend execution semantics.
 Runtime helper objects may still cache raw storage buffers or workspaces, but
 should not duplicate plan metadata such as algorithm, dense order, or transpose
 mode.
 
-Either side may be omitted: `plan_up=None` builds a DOWN-only backend and
-`plan_down=None` builds an UP-only backend.
+Either side of a `*PlanPair` may be omitted: `plan_up=None` builds a DOWN-only
+backend and `plan_down=None` builds an UP-only backend.
+
+## Backend config instrumentation
+
+All public backends accept a common backend-config flag:
+
+- `instrumentation=False` (default): keep the normal fast path
+- `instrumentation=True`: enable slower observability behavior
+
+This flag is runtime/config state, not plan state. `log_level` only controls
+verbosity and must not change execution mode by itself.
 
 ## MKL backend details
 
@@ -75,7 +86,7 @@ Either side may be omitted: `plan_up=None` builds a DOWN-only backend and
 
 ## cuSPARSE backend details
 
-- sparse blocks are device payloads with separate sparse descriptors for static
+- sparse blocks are device payloads with separate sparse descriptors for graph
   and dynamic preprocess state
 - selector row/col index buffers are stored on device
 - optional `xtx_init` vectors are stored on device when coalescence counts are
@@ -85,10 +96,8 @@ Either side may be omitted: `plan_up=None` builds a DOWN-only backend and
 
 ### cuSPARSE package layout
 
-- `pygrgl_spmv/backends/cusparse/backend.py`: `CusparseBackend`
+- `pygrgl_spmv/backends/cusparse/backend.py`: `CusparseBackend`, sparse-block descriptors, selector routing, dense-view logic, workspace helpers, and execution
 - `pygrgl_spmv/backends/cusparse/plan.py`: `CusparsePlan` and its enums/parsers
-- `pygrgl_spmv/backends/cusparse/storage.py`: sparse-block descriptors and storage accounting helpers
-- `pygrgl_spmv/backends/cusparse/runtime.py`: selector routing, dense-view, and workspace helpers
 - `pygrgl_spmv/backends/cusparse/ffi.py`: ctypes bindings and CUDA/cuSPARSE constants
 
 ### `CusparsePlan`

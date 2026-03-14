@@ -6,7 +6,7 @@ import numpy as np
 import pygrgl
 import pytest
 
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, tol
+from pygrgl_spmv.tests.conftest import DATA_DTYPE, matmul_expect_k_hint_warning, tol
 
 
 @pytest.mark.smoke
@@ -20,9 +20,14 @@ def test_init_modes_up_down_smoke(op, grg_ref):
     atol, rtol = tol(DATA_DTYPE)
     expected_up = pygrgl.matmul(grg_ref, x_up, pygrgl.TraversalDirection.UP, init=init_vec)
     expected_down = pygrgl.matmul(grg_ref, x_down, pygrgl.TraversalDirection.DOWN, init=init_vec)
-    np.testing.assert_allclose(op.matmul(x_up, pygrgl.TraversalDirection.UP, init=init_vec), expected_up, atol=atol, rtol=rtol)
     np.testing.assert_allclose(
-        op.matmul(x_down, pygrgl.TraversalDirection.DOWN, init=init_vec),
+        matmul_expect_k_hint_warning(op, x_up, pygrgl.TraversalDirection.UP, init=init_vec),
+        expected_up,
+        atol=atol,
+        rtol=rtol,
+    )
+    np.testing.assert_allclose(
+        matmul_expect_k_hint_warning(op, x_down, pygrgl.TraversalDirection.DOWN, init=init_vec),
         expected_down,
         atol=atol,
         rtol=rtol,
@@ -40,8 +45,8 @@ def test_by_individual(op, grg_ref):
 
     expected_up = pygrgl.matmul(grg_ref, x_up, pygrgl.TraversalDirection.UP, by_individual=True)
     expected_down = pygrgl.matmul(grg_ref, x_down, pygrgl.TraversalDirection.DOWN, by_individual=True)
-    actual_up = op.matmul(x_up, pygrgl.TraversalDirection.UP, by_individual=True)
-    actual_down = op.matmul(x_down, pygrgl.TraversalDirection.DOWN, by_individual=True)
+    actual_up = matmul_expect_k_hint_warning(op, x_up, pygrgl.TraversalDirection.UP, by_individual=True)
+    actual_down = matmul_expect_k_hint_warning(op, x_down, pygrgl.TraversalDirection.DOWN, by_individual=True)
     atol, rtol = tol(DATA_DTYPE)
     np.testing.assert_allclose(actual_up, expected_up, atol=atol, rtol=rtol)
     np.testing.assert_allclose(actual_down, expected_down, atol=atol, rtol=rtol)
@@ -63,9 +68,14 @@ def test_init_modes_both_directions(op, grg_ref):
     for init in init_modes:
         expected_up = pygrgl.matmul(grg_ref, x_up, pygrgl.TraversalDirection.UP, init=init)
         expected_down = pygrgl.matmul(grg_ref, x_down, pygrgl.TraversalDirection.DOWN, init=init)
-        np.testing.assert_allclose(op.matmul(x_up, pygrgl.TraversalDirection.UP, init=init), expected_up, atol=atol, rtol=rtol)
         np.testing.assert_allclose(
-            op.matmul(x_down, pygrgl.TraversalDirection.DOWN, init=init),
+            matmul_expect_k_hint_warning(op, x_up, pygrgl.TraversalDirection.UP, init=init),
+            expected_up,
+            atol=atol,
+            rtol=rtol,
+        )
+        np.testing.assert_allclose(
+            matmul_expect_k_hint_warning(op, x_down, pygrgl.TraversalDirection.DOWN, init=init),
             expected_down,
             atol=atol,
             rtol=rtol,
@@ -91,7 +101,8 @@ def test_missing_input_output(op_missing, missing_grg_ref):
         by_individual=True,
         miss=miss_expected,
     )
-    actual_up = op_missing.matmul(
+    actual_up = matmul_expect_k_hint_warning(
+        op_missing,
         x_up,
         pygrgl.TraversalDirection.UP,
         by_individual=True,
@@ -107,7 +118,8 @@ def test_missing_input_output(op_missing, missing_grg_ref):
         by_individual=True,
         miss=miss_down.copy(),
     )
-    actual_down = op_missing.matmul(
+    actual_down = matmul_expect_k_hint_warning(
+        op_missing,
         x_down,
         pygrgl.TraversalDirection.DOWN,
         by_individual=True,
@@ -124,27 +136,38 @@ def test_bool_init_dtype_strict_behavior(op):
     rng = np.random.default_rng(5505)
     rows = 4
 
-    up_bool = rng.integers(0, 2, size=(rows, op.n), dtype=np.int8).astype(bool)
-    down_bool = rng.integers(0, 2, size=(rows, op.m), dtype=np.int8).astype(bool)
+    up_bool = rng.integers(0, 2, size=(rows, op.num_samples), dtype=np.int8).astype(bool)
+    down_bool = rng.integers(0, 2, size=(rows, op.num_mutations), dtype=np.int8).astype(bool)
     init_vec_bool = rng.integers(0, 2, size=(rows,), dtype=np.int8).astype(bool)
-    init_mat_bool = rng.integers(0, 2, size=(rows, op.K), dtype=np.int8).astype(bool)
+    init_mat_bool = rng.integers(0, 2, size=(rows, op.num_nodes), dtype=np.int8).astype(bool)
 
     atol, rtol = tol(DATA_DTYPE)
     np.testing.assert_allclose(
-        op.matmul(up_bool, pygrgl.TraversalDirection.UP, init=init_vec_bool),
-        op.matmul(up_bool.astype(DATA_DTYPE), pygrgl.TraversalDirection.UP, init=init_vec_bool.astype(DATA_DTYPE)),
+        matmul_expect_k_hint_warning(op, up_bool, pygrgl.TraversalDirection.UP, init=init_vec_bool),
+        matmul_expect_k_hint_warning(
+            op,
+            up_bool.astype(DATA_DTYPE),
+            pygrgl.TraversalDirection.UP,
+            init=init_vec_bool.astype(DATA_DTYPE),
+        ),
         atol=atol,
         rtol=rtol,
     )
     np.testing.assert_allclose(
-        op.matmul(up_bool, pygrgl.TraversalDirection.UP, init=init_mat_bool),
-        op.matmul(up_bool.astype(DATA_DTYPE), pygrgl.TraversalDirection.UP, init=init_mat_bool.astype(DATA_DTYPE)),
+        matmul_expect_k_hint_warning(op, up_bool, pygrgl.TraversalDirection.UP, init=init_mat_bool),
+        matmul_expect_k_hint_warning(
+            op,
+            up_bool.astype(DATA_DTYPE),
+            pygrgl.TraversalDirection.UP,
+            init=init_mat_bool.astype(DATA_DTYPE),
+        ),
         atol=atol,
         rtol=rtol,
     )
     np.testing.assert_allclose(
-        op.matmul(down_bool, pygrgl.TraversalDirection.DOWN, init=init_vec_bool),
-        op.matmul(
+        matmul_expect_k_hint_warning(op, down_bool, pygrgl.TraversalDirection.DOWN, init=init_vec_bool),
+        matmul_expect_k_hint_warning(
+            op,
             down_bool.astype(DATA_DTYPE),
             pygrgl.TraversalDirection.DOWN,
             init=init_vec_bool.astype(DATA_DTYPE),
@@ -153,8 +176,9 @@ def test_bool_init_dtype_strict_behavior(op):
         rtol=rtol,
     )
     np.testing.assert_allclose(
-        op.matmul(down_bool, pygrgl.TraversalDirection.DOWN, init=init_mat_bool),
-        op.matmul(
+        matmul_expect_k_hint_warning(op, down_bool, pygrgl.TraversalDirection.DOWN, init=init_mat_bool),
+        matmul_expect_k_hint_warning(
+            op,
             down_bool.astype(DATA_DTYPE),
             pygrgl.TraversalDirection.DOWN,
             init=init_mat_bool.astype(DATA_DTYPE),
@@ -164,4 +188,4 @@ def test_bool_init_dtype_strict_behavior(op):
     )
 
     with pytest.raises(TypeError):
-        op.matmul(up_bool.astype(DATA_DTYPE), pygrgl.TraversalDirection.UP, init=init_vec_bool)
+        matmul_expect_k_hint_warning(op, up_bool.astype(DATA_DTYPE), pygrgl.TraversalDirection.UP, init=init_vec_bool)

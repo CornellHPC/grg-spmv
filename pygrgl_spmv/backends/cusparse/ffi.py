@@ -7,11 +7,17 @@ high-level cuSPARSE calls.
 
 import ctypes
 import logging
+import os
 from ctypes import c_int, c_int64, c_size_t, c_void_p, byref, POINTER
+from pathlib import Path
 
 import numpy as np
 
 _LOGGER = logging.getLogger(__name__)
+_CUDA_ROOT_ENV_VARS = ("CUDA_HOME", "NVHPC_CUDA_HOME", "CUDATOOLKIT_HOME", "CRAY_CUDATOOLKIT_DIR")
+_RTLD_NOW = getattr(os, "RTLD_NOW", 0)
+_RTLD_GLOBAL = getattr(os, "RTLD_GLOBAL", 0)
+_RTLD_DEEPBIND = getattr(os, "RTLD_DEEPBIND", 0)
 
 # ---------------------------------------------------------------------------
 # cuSPARSE enum constants  (values from cusparse.h / library_types.h)
@@ -79,6 +85,54 @@ def parse_algo(algo: str):
     if algo_key not in algo_map:
         raise ValueError(f"Unknown algo: {algo}. Valid options: {list(algo_map.keys())}")
     return algo_map[algo_key]
+
+
+def _iter_unique_paths(paths):
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield path
+
+
+def _cuda_roots() -> list[Path]:
+    roots = [Path(raw) for name in _CUDA_ROOT_ENV_VARS if (raw := os.environ.get(name))]
+    return [path for path in _iter_unique_paths(roots) if path.exists()]
+
+
+def _ld_library_dirs() -> list[Path]:
+    raw = os.environ.get("LD_LIBRARY_PATH", "")
+    return [Path(token) for token in raw.split(":") if token]
+
+
+def _nvhpc_math_lib_dir(cuda_root: Path) -> Path | None:
+    if cuda_root.parent.name != "cuda":
+        return None
+    return cuda_root.parent.parent / "math_libs" / cuda_root.name / "lib64"
+
+
+def _candidate_library_dirs(*, for_cusparse: bool) -> list[Path]:
+    dirs: list[Path] = []
+    for cuda_root in _cuda_roots():
+        if for_cusparse:
+            math_lib = _nvhpc_math_lib_dir(cuda_root)
+            if math_lib is not None:
+                dirs.append(math_lib)
+        dirs.append(cuda_root / "lib64")
+        if not for_cusparse:
+            dirs.append(cuda_root / "nvvm" / "lib64")
+    dirs.extend(_ld_library_dirs())
+    return [path for path in _iter_unique_paths(dirs) if path.exists()]
+
+
+def _resolve_library_path(name: str, dirs: list[Path]) -> Path | None:
+    for directory in dirs:
+        candidate = directory / name
+        if candidate.exists():
+            return candidate
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -169,10 +223,29 @@ def _setup_cusparse_signatures(lib):
     lib.cusparseSpMM.restype = c_int
 
 
-def _load_cusparse():
+def _load_cusparse_library():
     """Load libcusparse.so and configure all ctypes signatures."""
-    lib = ctypes.cdll.LoadLibrary('libcusparse.so')
+    nvjit_path = _resolve_library_path("libnvJitLink.so.12", _candidate_library_dirs(for_cusparse=False))
+    if nvjit_path is not None:
+        ctypes.CDLL(str(nvjit_path), mode=_RTLD_GLOBAL | _RTLD_NOW)
+    else:
+        try:
+            ctypes.CDLL("libnvJitLink.so.12", mode=_RTLD_GLOBAL | _RTLD_NOW)
+        except OSError:
+            pass
+
+    cusparse_path = _resolve_library_path("libcusparse.so", _candidate_library_dirs(for_cusparse=True))
+    cusparse_ref = "libcusparse.so" if cusparse_path is None else str(cusparse_path)
+    cusparse_mode = _RTLD_GLOBAL | _RTLD_NOW
+    if _RTLD_DEEPBIND:
+        cusparse_mode |= _RTLD_DEEPBIND
+    lib = ctypes.CDLL(cusparse_ref, mode=cusparse_mode)
     _setup_cusparse_signatures(lib)
+    _LOGGER.debug(
+        "Loaded cuSPARSE runtime nvJitLink=%s libcusparse=%s",
+        "<default>" if nvjit_path is None else str(nvjit_path),
+        cusparse_ref,
+    )
     return lib
 
 
@@ -189,7 +262,7 @@ class CuSparseLib:
     """
 
     def __init__(self):
-        self._lib = _load_cusparse()
+        self._lib = _load_cusparse_library()
         self._handle = c_void_p()
         _check_status(
             self._lib.cusparseCreate(byref(self._handle)),
@@ -320,52 +393,3 @@ class CuSparseLib:
         )
         v = ver.value
         return f"{v // 10000}.{(v % 10000) // 100}.{v % 100}"
-
-
-# ---------------------------------------------------------------------------
-# GPU timing
-# ---------------------------------------------------------------------------
-
-class GpuTimer:
-    """CUDA event-based GPU timer. Zero overhead when not created.
-
-    Records CUDA events on a stream and reports elapsed time between them.
-    Uses GPU-side timestamps for accurate kernel timing; H2D/D2H phases
-    measure wall-clock time between event recordings (accurate because
-    the stream is idle during synchronous memcpy).
-
-    Usage::
-
-        timer = GpuTimer(cp, stream) if verbose else None
-        if timer: timer.mark()
-        do_h2d()
-        if timer: timer.mark('H2D')
-        launch_kernel()
-        if timer: timer.mark('kernel')
-        stream.synchronize()
-        do_d2h()
-        if timer:
-            timer.mark('D2H')
-            timer.report('forward (graph)')
-    """
-    __slots__ = ('_cp', '_s', '_ev')
-
-    def __init__(self, cp, stream):
-        self._cp = cp
-        self._s = stream
-        self._ev = []
-
-    def mark(self, label=''):
-        ev = self._cp.cuda.Event()
-        ev.record(self._s)
-        self._ev.append((ev, label))
-
-    def report(self, prefix):
-        self._ev[-1][0].synchronize()
-        parts = []
-        total = 0.0
-        for i in range(len(self._ev) - 1):
-            dt = self._cp.cuda.get_elapsed_time(self._ev[i][0], self._ev[i + 1][0])
-            parts.append(f"{self._ev[i + 1][1]}={dt:.2f}ms")
-            total += dt
-        _LOGGER.info("%s: %s total=%.2fms", prefix, " ".join(parts), total)

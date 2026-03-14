@@ -23,11 +23,9 @@ Everything else is plain lists and helper methods so the hot path stays direct.
 
 from __future__ import annotations
 
-import logging
 import warnings
 from ctypes import c_void_p
 from dataclasses import dataclass
-from time import perf_counter
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -37,25 +35,21 @@ import scipy.sparse as sp
 from pygrgl_spmv.backends import (
     BackendBase,
     BackendSetup,
-    build_wavefront_level_stats,
     estimate_common_host_static_bytes,
     estimate_sparse_payload_bytes,
     iter_direction_level_pairs,
-    log_wavefront_profile,
     selector_rows_unique_from_csr_indptr,
     warn_k_hint_mismatch,
 )
+from pygrgl_spmv.backends._nvtx import make_cupy_tracer
 from pygrgl_spmv.backends.cusparse.ffi import (
-    CUSPARSE_OPERATION_NON_TRANSPOSE,
-    CUSPARSE_OPERATION_TRANSPOSE,
-    CUSPARSE_ORDER_ROW,
     CuSparseLib,
     cuda_dtype,
 )
 from pygrgl_spmv.backends.memory import RuntimeBytes, StaticBytes
 from pygrgl_spmv.backends.types import Direction, InitMode, SparseFormat, parse_init_mode
 from . import plan as cusparse_plan
-from .plan import CusparsePlan, DenseOrder, Operation, SpMMAlgorithm
+from .plan import CusparsePlan, CusparsePlanPair, DenseOrder, Operation, SpMMAlgorithm
 
 if TYPE_CHECKING:
     import cupy as cp
@@ -70,17 +64,9 @@ else:
     CupyGraph = Any
     CupyStream = Any
 
-_OP_N = CUSPARSE_OPERATION_NON_TRANSPOSE
-_OP_T = CUSPARSE_OPERATION_TRANSPOSE
-
-
-def _runtime_supported(plan: CusparsePlan) -> bool:
-    return plan.supported and not (plan.fmt == plan.fmt.CSC and plan.algo == plan.algo.CSR_ALG3)
-
-
 def is_valid_combo(fmt: str, transpose_bool: bool, algo: str) -> bool:
     """Return whether a combo is executable on the current backend/runtime path."""
-    plan = CusparsePlan.from_mapping(
+    plan = CusparsePlan.from_dict(
         {
             "k_hint": None,
             "store": "N",
@@ -92,15 +78,7 @@ def is_valid_combo(fmt: str, transpose_bool: bool, algo: str) -> bool:
             "algo": str(algo).upper(),
         }
     )
-    return _runtime_supported(plan)
-
-
-def _validate_plan_slot(*, slot: str, expected: Direction, plan: CusparsePlan) -> None:
-    actual = str(getattr(plan.direction, "name", plan.direction)).lower()
-    if actual != expected.value:
-        raise ValueError(
-            f"cuSPARSE {slot} expects a {expected.value.upper()} plan, got {actual.upper()}: {plan}"
-        )
+    return plan.supported
 
 
 @dataclass
@@ -112,8 +90,8 @@ class _CuBlock:
     ncols: int
     nnz: int
     buffers: tuple[CupyArray, CupyArray, CupyArray]
-    desc_static: c_void_p
-    desc_dynamic: c_void_p
+    graph_desc: c_void_p
+    dynamic_desc: c_void_p
     payload_key: tuple[int, int, int]
 
     @classmethod
@@ -157,12 +135,12 @@ class _CuBlock:
             ncols=int(mat.shape[1]),
             nnz=int(mat.nnz),
             buffers=buffers,
-            desc_static=c_void_p(),
-            desc_dynamic=c_void_p(),
+            graph_desc=c_void_p(),
+            dynamic_desc=c_void_p(),
             payload_key=tuple(int(buf.data.ptr) for buf in buffers),
         )
-        block.desc_static = block._create_desc(cslib=cslib, cuda_dtype_id=cuda_dtype_id)
-        block.desc_dynamic = block._create_desc(cslib=cslib, cuda_dtype_id=cuda_dtype_id)
+        block.graph_desc = block._create_desc(cslib=cslib, cuda_dtype_id=cuda_dtype_id)
+        block.dynamic_desc = block._create_desc(cslib=cslib, cuda_dtype_id=cuda_dtype_id)
         return block
 
     @classmethod
@@ -184,12 +162,12 @@ class _CuBlock:
             ncols=int(ncols),
             nnz=int(nnz),
             buffers=buffers,
-            desc_static=c_void_p(),
-            desc_dynamic=c_void_p(),
+            graph_desc=c_void_p(),
+            dynamic_desc=c_void_p(),
             payload_key=payload_key,
         )
-        block.desc_static = block._create_desc(cslib=cslib, cuda_dtype_id=cuda_dtype_id)
-        block.desc_dynamic = block._create_desc(cslib=cslib, cuda_dtype_id=cuda_dtype_id)
+        block.graph_desc = block._create_desc(cslib=cslib, cuda_dtype_id=cuda_dtype_id)
+        block.dynamic_desc = block._create_desc(cslib=cslib, cuda_dtype_id=cuda_dtype_id)
         return block
 
     def _create_desc(self, *, cslib: CuSparseLib, cuda_dtype_id: int) -> c_void_p:
@@ -226,9 +204,6 @@ class _CuBlock:
             )
         raise ValueError(f"Unknown sparse format: {self.fmt!r}")
 
-    def desc(self, *, use_static: bool) -> c_void_p:
-        return self.desc_static if use_static else self.desc_dynamic
-
     def nbytes(self) -> int:
         return int(sum(int(buf.nbytes) for buf in self.buffers))
 
@@ -243,7 +218,7 @@ class _CuBlock:
         )
 
     def destroy(self, *, cslib: CuSparseLib) -> None:
-        for desc in (self.desc_static, self.desc_dynamic):
+        for desc in (self.graph_desc, self.dynamic_desc):
             cslib.destroy_sp_mat(desc)
 
 
@@ -254,16 +229,6 @@ class _BlockOp:
     src_level: int
     block: _CuBlock
     nnz: int
-
-
-@dataclass(frozen=True)
-class _CuDirectionSpec:
-    direction: Direction
-    plan: CusparsePlan
-    static_workspace_attr: str
-    stage_name: str
-    calls: np.ndarray
-    nnz: np.ndarray
 
 
 @dataclass
@@ -433,7 +398,7 @@ class _Workspace:
     """Reusable device state for one runtime ``k``."""
 
     k: int
-    use_static_descs: bool
+    use_graph_descs: bool
     up_dense: _DenseViews
     down_dense: _DenseViews
     gather_temp: list[CupyArray | None]
@@ -552,7 +517,7 @@ def _build_direction_state(
     ops_by_level: list[list[_BlockOp]],
     src_descs: list[c_void_p],
     dst_descs: list[c_void_p],
-    use_static_descs: bool,
+    use_graph_descs: bool,
     cslib: CuSparseLib,
     alpha: CupyArray,
     beta_one: CupyArray,
@@ -565,7 +530,7 @@ def _build_direction_state(
     for dst_level, ops in enumerate(ops_by_level):
         row: list[CupyArray] = []
         for op in ops:
-            sp_desc = op.block.desc(use_static=use_static_descs)
+            sp_desc = op.block.graph_desc if use_graph_descs else op.block.dynamic_desc
             ext = cslib.spmm_buffer_size(
                 cp,
                 algo_id,
@@ -599,8 +564,6 @@ def _build_direction_state(
         graph=None,
         fork_event=cp.cuda.Event(),
         ready_events=[cp.cuda.Event() for _ in range(H)],
-        start_events=[cp.cuda.Event() for _ in range(H)],
-        end_events=[cp.cuda.Event() for _ in range(H)],
     )
 
 
@@ -658,18 +621,12 @@ class CusparseBackend(BackendBase):
     def __init__(
         self,
         *,
-        plan_up: CusparsePlan | None,
-        plan_down: CusparsePlan | None,
+        pair: CusparsePlanPair,
         log_level: str = "WARNING",
+        instrumentation: bool = False,
     ):
-        up = None if plan_up is None else CusparsePlan.from_any(plan_up)
-        down = None if plan_down is None else CusparsePlan.from_any(plan_down)
-        if up is not None:
-            _validate_plan_slot(slot="plan_up", expected=Direction.UP, plan=up)
-        if down is not None:
-            _validate_plan_slot(slot="plan_down", expected=Direction.DOWN, plan=down)
-        for name, plan in (("UP", up), ("DOWN", down)):
-            if plan is not None and not _runtime_supported(plan):
+        for name, plan in (("UP", pair.plan_up), ("DOWN", pair.plan_down)):
+            if plan is not None and not plan.supported:
                 raise ValueError(f"Unsupported cuSPARSE {name} plan: {plan}")
 
         try:
@@ -679,7 +636,12 @@ class CusparseBackend(BackendBase):
         except ImportError as exc:
             raise ImportError("CuPy required: pip install cupy-cuda12x") from exc
 
-        super().__init__(plan_up=up, plan_down=down, log_level=log_level)
+        super().__init__(
+            plan_up=pair.plan_up,
+            plan_down=pair.plan_down,
+            log_level=log_level,
+            instrumentation=instrumentation,
+        )
 
         self._cslib = CuSparseLib()
         runtime_version = cusparse_plan._runtime_cuda_version()
@@ -693,9 +655,9 @@ class CusparseBackend(BackendBase):
         self._beta_one: CupyArray | None = None
 
         self._H = 0
-        self._n = 0
-        self._m = 0
-        self._K = 0
+        self._num_samples = 0
+        self._num_mutations = 0
+        self._num_nodes = 0
         self._level_offsets = np.empty(0, dtype=np.int64)
 
         self._sample_perm_host = np.empty(0, dtype=np.int64)
@@ -707,15 +669,12 @@ class CusparseBackend(BackendBase):
         self._blocks_down: list[list[_CuBlock | None]] = []
         self._ops_up: list[list[_BlockOp]] = []
         self._ops_down: list[list[_BlockOp]] = []
-        self._up_calls = np.empty(0, dtype=np.int32)
-        self._down_calls = np.empty(0, dtype=np.int32)
-        self._up_nnz = np.empty(0, dtype=np.int64)
-        self._down_nnz = np.empty(0, dtype=np.int64)
 
         self._mut_selector: _SelectorLevels | None = None
         self._miss_selector: _SelectorLevels | None = None
         self._sample_routing: _SampleRouting | None = None
-        self._workspaces = SimpleNamespace(static_up=None, static_down=None, dynamic=None)
+        self._workspaces = SimpleNamespace(graph_up=None, graph_down=None, dynamic=None)
+        self._nvtx = make_cupy_tracer("grg.cusparse", self._cp) if self._instrumentation else None
 
         self._logger.info(
             "cuSPARSE runtime levels: CUDA runtime=%s cuSPARSE=%s",
@@ -728,27 +687,16 @@ class CusparseBackend(BackendBase):
                 runtime_token,
             )
 
-    def _direction_spec(self, direction: Direction) -> _CuDirectionSpec | None:
-        plan = self._plan_for(direction)
-        if plan is None:
-            return None
-        return _CuDirectionSpec(
-            direction=direction,
-            plan=plan,
-            static_workspace_attr="static_up" if direction == Direction.UP else "static_down",
-            stage_name="run_up" if direction == Direction.UP else "run_down",
-            calls=self._up_calls if direction == Direction.UP else self._down_calls,
-            nnz=self._up_nnz if direction == Direction.UP else self._down_nnz,
-        )
-
-    def _require_direction_spec(self, direction: Direction) -> _CuDirectionSpec:
-        spec = self._direction_spec(direction)
-        if spec is None:
-            raise ValueError(f"{direction.value.upper()} plan is not configured")
-        return spec
-
     def _has_xtx_init(self) -> bool:
         return bool(self._xtx_levels)
+
+    def _grid_for(self, direction: Direction) -> list[list[_CuBlock | None]]:
+        return self._blocks_up if direction == Direction.UP else self._blocks_down
+
+    def _operator_matrix(self, direction: Direction, *, dst_level: int, src_level: int) -> sp.spmatrix:
+        if direction == Direction.UP:
+            return self._A_blocks[dst_level][src_level]
+        return self._A_blocks[src_level][dst_level]
 
     def setup(
         self,
@@ -771,12 +719,10 @@ class CusparseBackend(BackendBase):
         self._alpha = self._cp.ones(1, dtype=self._dtype)
         self._beta_one = self._cp.ones(1, dtype=self._dtype)
 
-        self._blocks_up = self._build_direction_blocks(self._A_blocks, direction=Direction.UP)
-        self._blocks_down = self._build_direction_blocks(self._A_blocks, direction=Direction.DOWN)
+        self._blocks_up = self._build_direction_blocks(direction=Direction.UP)
+        self._blocks_down = self._build_direction_blocks(direction=Direction.DOWN)
         self._ops_up = self._build_direction_ops(Direction.UP)
         self._ops_down = self._build_direction_ops(Direction.DOWN)
-        self._up_calls, self._up_nnz = build_wavefront_level_stats(self._ops_up)
-        self._down_calls, self._down_nnz = build_wavefront_level_stats(self._ops_down)
 
         self._mut_selector = _SelectorLevels.from_csr(
             cp=self._cp,
@@ -796,7 +742,7 @@ class CusparseBackend(BackendBase):
             inv_sample_perm=self._inv_sample_perm_host,
             level_offsets=self._level_offsets,
             H=self._H,
-            n=self._n,
+            n=self._num_samples,
         )
         self._level_streams = [self._cp.cuda.Stream(non_blocking=True) for _ in range(self._H)]
 
@@ -808,6 +754,10 @@ class CusparseBackend(BackendBase):
                 hi = int(self._level_offsets[h + 1])
                 self._xtx_levels.append(self._cp.asarray(xtx[lo:hi, None], dtype=self._dtype))
 
+        self._A_blocks = []
+        self._sel_mut = sp.csr_matrix((0, 0))
+        self._sel_miss = sp.csr_matrix((0, 0))
+
         self.mem_usage.reset()
         common_host = estimate_common_host_static_bytes(
             level_offsets=self._level_offsets,
@@ -817,9 +767,8 @@ class CusparseBackend(BackendBase):
             xtx_init=None,
         )
         self.mem_usage.host_static = common_host
-        share_storage = self._plan_up is not None and self._plan_down is not None and self._plan_up.can_share_storage_with(self._plan_down)
         self.mem_usage.device_static.blocks_up = _block_grid_bytes(self._blocks_up)
-        self.mem_usage.device_static.blocks_down = 0 if share_storage else _block_grid_bytes(self._blocks_down)
+        self.mem_usage.device_static.blocks_down = 0 if not self._store_blocks_down else _block_grid_bytes(self._blocks_down)
         self.mem_usage.device_static.selector_mut = 0 if self._mut_selector is None else self._mut_selector.nbytes()
         self.mem_usage.device_static.selector_miss = 0 if self._miss_selector is None else self._miss_selector.nbytes()
         self.mem_usage.device_static.xtx_init = _gpu_nbytes(self._xtx_levels)
@@ -827,63 +776,82 @@ class CusparseBackend(BackendBase):
         self._logger.info(
             "CusparseBackend setup: H=%d K=%d n=%d m=%d plan_up=%s plan_down=%s",
             self._H,
-            self._K,
-            self._n,
-            self._m,
+            self._num_nodes,
+            self._num_samples,
+            self._num_mutations,
             "<unspecified>" if self._plan_up is None else str(self._plan_up),
             "<unspecified>" if self._plan_down is None else str(self._plan_down),
         )
 
-        self._workspaces = SimpleNamespace(static_up=None, static_down=None, dynamic=None)
+        if self._instrumentation:
+            for direction in self._configured_directions():
+                plan = self._require_plan(direction)
+                if plan.k_hint is None:
+                    continue
+                warnings.warn(
+                    (
+                        f"cuSPARSE {direction.value} graph capture/replay disabled because "
+                        "instrumentation=True uses the dynamic scheduler for observability."
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
-    def _build_direction_blocks(self, A_blocks: list[list[sp.csr_matrix]], *, direction: Direction) -> list[list[_CuBlock | None]]:
+        self._workspaces = SimpleNamespace(graph_up=None, graph_down=None, dynamic=None)
+
+    def _build_direction_blocks(self, *, direction: Direction) -> list[list[_CuBlock | None]]:
         if self._cuda_dtype is None:
             raise RuntimeError("CUDA dtype not initialized")
-        spec = self._direction_spec(direction)
-        if spec is None:
+        plan = self._plan_for(direction)
+        if plan is None:
             return [[] for _ in range(self._H)]
         rows = [
             [None] * (dst_level if direction == Direction.UP else max(self._H - dst_level - 1, 0))
             for dst_level in range(self._H)
         ]
-        plan = spec.plan
-        if plan is None:
-            return rows
-        share = (
-            direction == Direction.DOWN
-            and self._plan_up is not None
-            and self._plan_down is not None
-            and self._plan_up.can_share_storage_with(self._plan_down)
-        )
-
-        for dst, src, row_index in iter_direction_level_pairs(direction, self._H):
-            matrix = A_blocks[dst][src] if direction == Direction.UP else A_blocks[src][dst]
-            if matrix.nnz == 0:
-                continue
-            if share:
-                source = self._blocks_up[src][dst]
-                if source is None:
+        store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
+        if store_actual:
+            for dst_level, src_level, row_index in iter_direction_level_pairs(direction, self._H):
+                matrix = self._operator_matrix(direction, dst_level=dst_level, src_level=src_level)
+                if matrix.nnz == 0:
                     continue
-                nrows, ncols = matrix.shape
-                if plan.store == plan.store.T:
-                    nrows, ncols = ncols, nrows
-                rows[dst][row_index] = _CuBlock.from_buffers(
+                stored = matrix if plan.store == plan.store.N else matrix.T.tocsr()
+                rows[dst_level][row_index] = _CuBlock.from_scipy(
+                    stored,
                     fmt=plan.fmt.value.lower(),
-                    nrows=nrows,
-                    ncols=ncols,
-                    nnz=source.nnz,
-                    buffers=source.buffers,
-                    payload_key=source.payload_key,
+                    cp=self._cp,
+                    dtype=self._dtype,
                     cslib=self._cslib,
                     cuda_dtype_id=self._cuda_dtype,
                 )
+            return rows
+
+        owner_direction = (
+            Direction.UP
+            if (self._up_ops_owner if direction == Direction.UP else self._down_ops_owner) == "up"
+            else Direction.DOWN
+        )
+        owner_grid = self._grid_for(owner_direction)
+        for dst_level, src_level, row_index in iter_direction_level_pairs(direction, self._H):
+            owner_dst = dst_level if owner_direction == direction else src_level
+            owner_src = src_level if owner_direction == direction else dst_level
+            owner_row_index = owner_src if owner_direction == Direction.UP else owner_src - owner_dst - 1
+            owner_block = owner_grid[owner_dst][owner_row_index]
+            if owner_block is None:
                 continue
-            stored = matrix if plan.store == plan.store.N else matrix.T.tocsr()
-            rows[dst][row_index] = _CuBlock.from_scipy(
-                stored,
+            matrix = self._operator_matrix(direction, dst_level=dst_level, src_level=src_level)
+            if matrix.nnz == 0:
+                continue
+            nrows, ncols = matrix.shape
+            if plan.store == plan.store.T:
+                nrows, ncols = ncols, nrows
+            rows[dst_level][row_index] = _CuBlock.from_buffers(
                 fmt=plan.fmt.value.lower(),
-                cp=self._cp,
-                dtype=self._dtype,
+                nrows=nrows,
+                ncols=ncols,
+                nnz=owner_block.nnz,
+                buffers=owner_block.buffers,
+                payload_key=owner_block.payload_key,
                 cslib=self._cslib,
                 cuda_dtype_id=self._cuda_dtype,
             )
@@ -891,15 +859,11 @@ class CusparseBackend(BackendBase):
 
     def _build_direction_ops(self, direction: Direction) -> list[list[_BlockOp]]:
         ops: list[list[_BlockOp]] = [[] for _ in range(self._H)]
-        spec = self._direction_spec(direction)
-        if spec is None:
+        if self._plan_for(direction) is None:
             return ops
+        grid = self._grid_for(direction)
         for dst, src, row_index in iter_direction_level_pairs(direction, self._H):
-            block = (
-                self._blocks_up[dst][row_index]
-                if direction == Direction.UP
-                else self._blocks_down[dst][row_index]
-            )
+            block = grid[dst][row_index]
             if block is None:
                 continue
             ops[dst].append(_BlockOp(src_level=src, block=block, nnz=block.nnz))
@@ -907,8 +871,8 @@ class CusparseBackend(BackendBase):
 
     def _destroy_workspace_cache(self) -> None:
         for ws in (
-            getattr(self._workspaces, "static_up", None),
-            getattr(self._workspaces, "static_down", None),
+            getattr(self._workspaces, "graph_up", None),
+            getattr(self._workspaces, "graph_down", None),
             getattr(self._workspaces, "dynamic", None),
         ):
             if ws is None:
@@ -917,9 +881,9 @@ class CusparseBackend(BackendBase):
                 ws.destroy(cslib=self._cslib)
             except Exception:
                 pass
-        self._workspaces = SimpleNamespace(static_up=None, static_down=None, dynamic=None)
+        self._workspaces = SimpleNamespace(graph_up=None, graph_down=None, dynamic=None)
 
-    def _create_workspace(self, k: int, *, use_static_descs: bool) -> _Workspace:
+    def _create_workspace(self, k: int, *, use_graph_descs: bool) -> _Workspace:
         if self._cuda_dtype is None or self._alpha is None or self._beta_one is None:
             raise RuntimeError("cuSPARSE runtime constants are uninitialized")
         if self._sample_routing is None:
@@ -954,16 +918,16 @@ class CusparseBackend(BackendBase):
 
         ws = _Workspace(
             k=int(k),
-            use_static_descs=bool(use_static_descs),
+            use_graph_descs=bool(use_graph_descs),
             up_dense=up_dense,
             down_dense=down_dense,
             gather_temp=gather_temp,
-            fwd_input=self._cp.zeros((self._n, k), dtype=self._dtype, order="C"),
-            bwd_input_mut=self._cp.zeros((self._m, k), dtype=self._dtype, order="C"),
+            fwd_input=self._cp.zeros((self._num_samples, k), dtype=self._dtype, order="C"),
+            bwd_input_mut=self._cp.zeros((self._num_mutations, k), dtype=self._dtype, order="C"),
             bwd_input_miss=None,
-            mut_out=self._cp.zeros((self._m, k), dtype=self._dtype, order="C"),
-            miss_out=self._cp.zeros((self._m, k), dtype=self._dtype, order="C"),
-            sample_out=self._cp.zeros((self._n, k), dtype=self._dtype, order="C"),
+            mut_out=self._cp.zeros((self._num_mutations, k), dtype=self._dtype, order="C"),
+            miss_out=self._cp.zeros((self._num_mutations, k), dtype=self._dtype, order="C"),
+            sample_out=self._cp.zeros((self._num_samples, k), dtype=self._dtype, order="C"),
             init_vec=self._cp.zeros((1, k), dtype=self._dtype, order="C"),
             init_matrix=None,
             up=None,
@@ -974,7 +938,7 @@ class CusparseBackend(BackendBase):
             ops_by_level=self._ops_up,
             src_descs=ws.up_dense.src_descs,
             dst_descs=ws.up_dense.dst_descs,
-            use_static_descs=use_static_descs,
+            use_graph_descs=use_graph_descs,
             cslib=self._cslib,
             alpha=self._alpha,
             beta_one=self._beta_one,
@@ -988,7 +952,7 @@ class CusparseBackend(BackendBase):
             ops_by_level=self._ops_down,
             src_descs=ws.down_dense.src_descs,
             dst_descs=ws.down_dense.dst_descs,
-            use_static_descs=use_static_descs,
+            use_graph_descs=use_graph_descs,
             cslib=self._cslib,
             alpha=self._alpha,
             beta_one=self._beta_one,
@@ -997,55 +961,48 @@ class CusparseBackend(BackendBase):
             op_a=int(self._plan_down.op_a) if self._plan_down is not None else int(Operation.N),
             op_b=int(self._plan_down.op_b) if self._plan_down is not None else int(Operation.N),
         )
-        self._logger.debug("workspace ready k=%d static_descs=%s", k, use_static_descs)
+        self._logger.debug("workspace ready k=%d graph_descs=%s", k, use_graph_descs)
         return ws
 
-    def _ensure_workspace(self, spec: _CuDirectionSpec, k: int) -> _Workspace:
-        hint_k = spec.plan.k_hint
-        if hint_k is not None and int(k) == int(hint_k):
-            ws = getattr(self._workspaces, spec.static_workspace_attr)
+    def _ensure_workspace(self, direction: Direction, k: int) -> _Workspace:
+        hint_k = self._require_plan(direction).k_hint
+        if not self._instrumentation and hint_k is not None and int(k) == int(hint_k):
+            key = "graph_up" if direction == Direction.UP else "graph_down"
+            ws = getattr(self._workspaces, key)
             if ws is None:
-                ws = self._create_workspace(int(k), use_static_descs=True)
-                state = ws.up if spec.direction == Direction.UP else ws.down
-                state.graph = self._capture_graph(ws, spec.direction)
-                setattr(self._workspaces, spec.static_workspace_attr, ws)
+                ws = self._create_workspace(int(k), use_graph_descs=True)
+                state = ws.up if direction == Direction.UP else ws.down
+                state.graph = self._capture_wavefront_graph(ws, direction)
+                setattr(self._workspaces, key, ws)
             return ws
 
         ws = self._workspaces.dynamic
         if ws is None or int(ws.k) != int(k):
             if ws is not None:
                 ws.destroy(cslib=self._cslib)
-            ws = self._create_workspace(int(k), use_static_descs=False)
+            ws = self._create_workspace(int(k), use_graph_descs=False)
             self._workspaces.dynamic = ws
         return ws
 
-    def _stage_inputs(
+    def _copy_inputs_to_device(
         self,
-        spec: _CuDirectionSpec,
+        direction: Direction,
         ws: _Workspace,
         x: np.ndarray,
         *,
         miss_arr: np.ndarray | None,
         init_mode: InitMode,
         init_payload: np.ndarray | None,
-    ) -> tuple[float, float, float]:
-        t0 = perf_counter()
-        if spec.direction == Direction.UP:
+    ) -> None:
+        if direction == Direction.UP:
             ws.fwd_input.set(x, stream=self._stream)
         else:
             ws.bwd_input_mut.set(x, stream=self._stream)
-        self._stream.synchronize()
-        h2d_primary_ms = (perf_counter() - t0) * 1000.0
 
-        h2d_miss_ms = 0.0
         if miss_arr is not None:
-            t0 = perf_counter()
-            miss_buf = ws.ensure_miss_input(cp=self._cp, m=self._m, dtype=self._dtype)
+            miss_buf = ws.ensure_miss_input(cp=self._cp, m=self._num_mutations, dtype=self._dtype)
             miss_buf.set(miss_arr, stream=self._stream)
-            self._stream.synchronize()
-            h2d_miss_ms = (perf_counter() - t0) * 1000.0
 
-        t0 = perf_counter()
         match init_mode:
             case InitMode.NONE | InitMode.XTX:
                 pass
@@ -1058,19 +1015,16 @@ class CusparseBackend(BackendBase):
                 if init_payload is None:
                     raise ValueError("init matrix payload is required for init_mode=matrix")
                 with self._stream:
-                    ws.ensure_init_matrix(cp=self._cp, K=self._K, dtype=self._dtype).set(
+                    ws.ensure_init_matrix(cp=self._cp, K=self._num_nodes, dtype=self._dtype).set(
                         init_payload,
                         stream=self._stream,
                     )
             case _:
                 raise ValueError(f"Unknown init mode: {init_mode!r}")
-        self._stream.synchronize()
-        init_stage_ms = (perf_counter() - t0) * 1000.0
-        return h2d_primary_ms, h2d_miss_ms, init_stage_ms
 
-    def _seed_direction(
+    def _enqueue_seed(
         self,
-        spec: _CuDirectionSpec,
+        direction: Direction,
         ws: _Workspace,
         *,
         init_mode: InitMode,
@@ -1079,19 +1033,19 @@ class CusparseBackend(BackendBase):
         if self._mut_selector is None or self._miss_selector is None or self._sample_routing is None:
             raise RuntimeError("cuSPARSE backend is not initialized")
 
-        self._zero_level_buffers(ws, spec.direction)
-        if spec.direction == Direction.UP:
+        self._zero_level_buffers(ws, direction)
+        if direction == Direction.UP:
             self._sample_routing.scatter(
                 cp=self._cp,
                 stream=self._stream,
                 x_gpu=ws.fwd_input,
-                level_buffers=ws.dense(spec.direction).state_bufs,
+                level_buffers=ws.dense(direction).state_bufs,
             )
         else:
             self._mut_selector.scatter_add(
                 cp=self._cp,
                 stream=self._stream,
-                level_buffers=ws.dense(spec.direction).state_bufs,
+                level_buffers=ws.dense(direction).state_bufs,
                 x_gpu=ws.bwd_input_mut,
             )
             if miss_arr is not None:
@@ -1100,7 +1054,7 @@ class CusparseBackend(BackendBase):
                 self._miss_selector.scatter_add(
                     cp=self._cp,
                     stream=self._stream,
-                    level_buffers=ws.dense(spec.direction).state_bufs,
+                    level_buffers=ws.dense(direction).state_bufs,
                     x_gpu=ws.bwd_input_miss,
                 )
 
@@ -1113,74 +1067,89 @@ class CusparseBackend(BackendBase):
                     if not self._xtx_levels:
                         raise ValueError("init_mode=xtx requires GRG coalescence counts")
                     for h, xtx in enumerate(self._xtx_levels):
-                        ws.dense(spec.direction).state_bufs[h] += xtx
+                        ws.dense(direction).state_bufs[h] += xtx
                 case InitMode.VECTOR:
-                    for buf in ws.dense(spec.direction).state_bufs:
+                    for buf in ws.dense(direction).state_bufs:
                         buf += ws.init_vec
                 case InitMode.MATRIX:
-                    init_matrix = ws.ensure_init_matrix(cp=self._cp, K=self._K, dtype=self._dtype)
+                    init_matrix = ws.ensure_init_matrix(cp=self._cp, K=self._num_nodes, dtype=self._dtype)
                     for h in range(self._H):
                         lo = int(self._level_offsets[h])
                         hi = int(self._level_offsets[h + 1])
-                        ws.dense(spec.direction).state_bufs[h] += init_matrix[lo:hi]
+                        ws.dense(direction).state_bufs[h] += init_matrix[lo:hi]
                 case _:
                     raise ValueError(f"Unknown init mode: {init_mode!r}")
 
-    def _collect_outputs(
+    def _copy_outputs_to_host(
         self,
-        spec: _CuDirectionSpec,
+        direction: Direction,
         ws: _Workspace,
         *,
         need_miss_output: bool,
-    ) -> tuple[tuple[np.ndarray, np.ndarray | None] | np.ndarray, float, float, float]:
+    ) -> tuple[np.ndarray, np.ndarray | None] | np.ndarray:
         if self._mut_selector is None or self._miss_selector is None or self._sample_routing is None:
             raise RuntimeError("cuSPARSE backend is not initialized")
 
-        if spec.direction == Direction.UP:
-            t0 = perf_counter()
+        if direction == Direction.UP:
             self._mut_selector.gather(
                 cp=self._cp,
                 stream=self._stream,
-                level_buffers=ws.dense(spec.direction).state_bufs,
+                level_buffers=ws.dense(direction).state_bufs,
                 out_gpu=ws.mut_out,
             )
             if need_miss_output:
                 self._miss_selector.gather(
                     cp=self._cp,
                     stream=self._stream,
-                    level_buffers=ws.dense(spec.direction).state_bufs,
+                    level_buffers=ws.dense(direction).state_bufs,
                     out_gpu=ws.miss_out,
                 )
-            self._stream.synchronize()
-            gather_ms = (perf_counter() - t0) * 1000.0
 
-            t0 = perf_counter()
+            tracer = self._nvtx
+            if tracer is not None:
+                with tracer.range("await_outputs", dir=direction.value):
+                    self._stream.synchronize()
+            else:
+                self._stream.synchronize()
+
             out_mut = ws.mut_out.get()
-            d2h_ms = float((perf_counter() - t0) * 1000.0)
             out_miss = None
-            d2h_miss_ms = 0.0
             if need_miss_output:
-                t0 = perf_counter()
                 out_miss = ws.miss_out.get()
-                d2h_miss_ms = (perf_counter() - t0) * 1000.0
-            return (out_mut, out_miss), gather_ms, d2h_ms, d2h_miss_ms
+            return out_mut, out_miss
 
-        t0 = perf_counter()
         self._sample_routing.gather(
             cp=self._cp,
             stream=self._stream,
-            level_buffers=ws.dense(spec.direction).state_bufs,
+            level_buffers=ws.dense(direction).state_bufs,
             gather_temp=ws.gather_temp,
             out_gpu=ws.sample_out,
         )
-        self._stream.synchronize()
-        gather_ms = (perf_counter() - t0) * 1000.0
-        t0 = perf_counter()
-        out = ws.sample_out.get()
-        d2h_ms = (perf_counter() - t0) * 1000.0
-        return out, gather_ms, d2h_ms, 0.0
+        tracer = self._nvtx
+        if tracer is not None:
+            with tracer.range("await_outputs", dir=direction.value):
+                self._stream.synchronize()
+        else:
+            self._stream.synchronize()
+        return ws.sample_out.get()
 
-    def _run_wavefront(self, ws: _Workspace, direction: Direction, *, track_timing: bool) -> np.ndarray | None:
+    def _copy_node_outputs_to_host(self, direction: Direction, ws: _Workspace) -> np.ndarray:
+        dense = ws.dense(direction)
+        tracer = self._nvtx
+        if tracer is not None:
+            with tracer.range("await_outputs", dir=direction.value):
+                self._stream.synchronize()
+        else:
+            self._stream.synchronize()
+        out = np.empty((self._num_nodes, ws.k), dtype=self._dtype)
+        offset = 0
+        for buf in dense.state_bufs:
+            rows = int(buf.shape[0])
+            out[offset : offset + rows] = buf.get()
+            offset += rows
+        return out
+
+    def _enqueue_wavefront(self, ws: _Workspace, direction: Direction) -> None:
         if self._alpha is None or self._beta_one is None or self._cuda_dtype is None:
             raise RuntimeError("cuSPARSE runtime constants are uninitialized")
 
@@ -1211,11 +1180,9 @@ class CusparseBackend(BackendBase):
             stream = self._level_streams[dst_level]
             ops = ops_by_level[dst_level]
             with stream:
-                if track_timing and ops:
-                    state.start_events[dst_level].record(stream)
                 for idx, op in enumerate(ops):
                     stream.wait_event(state.ready_events[op.src_level])
-                    sp_desc = op.block.desc(use_static=ws.use_static_descs)
+                    sp_desc = op.block.graph_desc if ws.use_graph_descs else op.block.dynamic_desc
                     self._cslib.set_stream(stream.ptr)
                     self._cslib.spmm(
                         int(plan.algo),
@@ -1230,24 +1197,93 @@ class CusparseBackend(BackendBase):
                         state.ext_buffers[dst_level][idx].data.ptr,
                     )
                 _publish_level_source(cp=self._cp, dense=dense, plan=plan, level=dst_level)
-                if track_timing and ops:
-                    state.end_events[dst_level].record(stream)
                 state.ready_events[dst_level].record(stream)
 
         with self._stream:
             for event in state.ready_events:
                 self._stream.wait_event(event)
 
-        if not track_timing:
-            return None
+    def _enqueue_wavefront_nvtx(self, ws: _Workspace, direction: Direction) -> None:
+        tracer = self._nvtx
+        if tracer is None:
+            raise RuntimeError("cuSPARSE NVTX tracer is not initialized")
+        if self._alpha is None or self._beta_one is None or self._cuda_dtype is None:
+            raise RuntimeError("cuSPARSE runtime constants are uninitialized")
 
-        level_ms = np.zeros(self._H, dtype=np.float64)
-        self._stream.synchronize()
-        idx_iter = range(1, self._H) if direction == Direction.UP else range(self._H - 1)
-        for h in idx_iter:
-            if ops_by_level[h]:
-                level_ms[h] = self._cp.cuda.get_elapsed_time(state.start_events[h], state.end_events[h])
-        return level_ms
+        dense = ws.dense(direction)
+        plan = self._require_plan(direction)
+        if direction == Direction.UP:
+            ops_by_level = self._ops_up
+            state = ws.up
+            seed_level = 0
+            level_iter = range(1, self._H)
+        else:
+            ops_by_level = self._ops_down
+            state = ws.down
+            seed_level = self._H - 1
+            level_iter = range(self._H - 2, -1, -1)
+
+        with tracer.range("wavefront", dir=direction.value):
+            with self._stream:
+                state.fork_event.record(self._stream)
+                tracer.mark("event.record_fork", dir=direction.value)
+            for stream in self._level_streams:
+                stream.wait_event(state.fork_event)
+
+            seed_stream = self._level_streams[seed_level]
+            with seed_stream:
+                with tracer.range("seed", dir=direction.value, level=seed_level):
+                    _publish_level_source(cp=self._cp, dense=dense, plan=plan, level=seed_level)
+                    state.ready_events[seed_level].record(seed_stream)
+                    tracer.mark("event.record_ready", dir=direction.value, level=seed_level)
+
+            for dst_level in level_iter:
+                stream = self._level_streams[dst_level]
+                ops = ops_by_level[dst_level]
+                with tracer.range("level", dir=direction.value, dst=dst_level, ops=len(ops)):
+                    with stream:
+                        for idx, op in enumerate(ops):
+                            tracer.mark("wait_ready", dir=direction.value, dst=dst_level, src=op.src_level)
+                            stream.wait_event(state.ready_events[op.src_level])
+                            sp_desc = op.block.graph_desc if ws.use_graph_descs else op.block.dynamic_desc
+                            self._cslib.set_stream(stream.ptr)
+                            with tracer.range(
+                                "launch",
+                                dir=direction.value,
+                                dst=dst_level,
+                                src=op.src_level,
+                                fmt=op.block.fmt,
+                                rows=op.block.nrows,
+                                cols=op.block.ncols,
+                                nnz=op.nnz,
+                            ):
+                                self._cslib.spmm(
+                                    int(plan.algo),
+                                    int(plan.op_a),
+                                    int(plan.op_b),
+                                    self._alpha.data.ptr,
+                                    sp_desc,
+                                    dense.src_descs[op.src_level],
+                                    self._beta_one.data.ptr,
+                                    dense.dst_descs[dst_level],
+                                    self._cuda_dtype,
+                                    state.ext_buffers[dst_level][idx].data.ptr,
+                                )
+                        with tracer.range("publish_level", dir=direction.value, level=dst_level):
+                            _publish_level_source(cp=self._cp, dense=dense, plan=plan, level=dst_level)
+                        state.ready_events[dst_level].record(stream)
+                        tracer.mark("event.record_ready", dir=direction.value, level=dst_level)
+
+            with tracer.range("join_ready", dir=direction.value):
+                with self._stream:
+                    for event in state.ready_events:
+                        self._stream.wait_event(event)
+
+    def _run_wavefront(self, ws: _Workspace, direction: Direction) -> None:
+        if self._instrumentation:
+            self._enqueue_wavefront_nvtx(ws, direction)
+            return
+        self._enqueue_wavefront(ws, direction)
 
     def _zero_level_buffers(self, ws: _Workspace, direction: Direction) -> None:
         dense = ws.dense(direction)
@@ -1255,14 +1291,14 @@ class CusparseBackend(BackendBase):
             for buf in dense.state_bufs:
                 buf.fill(0)
 
-    def _capture_graph(self, ws: _Workspace, direction: Direction) -> CupyGraph:
+    def _capture_wavefront_graph(self, ws: _Workspace, direction: Direction) -> CupyGraph:
         self._zero_level_buffers(ws, direction)
-        self._run_wavefront(ws, direction, track_timing=False)
+        self._enqueue_wavefront(ws, direction)
         self._stream.synchronize()
 
         self._stream.begin_capture()
         try:
-            self._run_wavefront(ws, direction, track_timing=False)
+            self._enqueue_wavefront(ws, direction)
             graph = self._stream.end_capture()
         except Exception:
             try:
@@ -1275,43 +1311,29 @@ class CusparseBackend(BackendBase):
         self._stream.synchronize()
         return graph
 
-    def _log_wavefront_profile(self, direction: Direction, level_ms: np.ndarray) -> None:
-        spec = self._require_direction_spec(direction)
-        log_wavefront_profile(
-            self._logger,
-            direction=direction,
-            calls=spec.calls,
-            nnz=spec.nnz,
-            level_ms=level_ms,
-        )
-
     def _run_direction(
         self,
-        spec: _CuDirectionSpec,
+        direction: Direction,
         primary: np.ndarray,
         *,
         miss: np.ndarray | None,
         init_mode: InitMode,
         init: np.ndarray | None,
         need_miss_output: bool,
+        emit_all_nodes: bool,
     ) -> tuple[np.ndarray, np.ndarray | None] | np.ndarray:
-        total_t0 = perf_counter()
-        t0 = perf_counter()
-        x, k = self._normalize_primary_input(direction=spec.direction, primary=primary)
-        parse_ms = (perf_counter() - t0) * 1000.0
+        plan = self._require_plan(direction)
+        x, k = self._normalize_primary_input(direction=direction, primary=primary)
 
-        miss_arr = self._normalize_down_miss_input(miss, k=k) if spec.direction == Direction.DOWN else None
+        miss_arr = self._normalize_down_miss_input(miss, k=k) if direction == Direction.DOWN else None
 
         mode = parse_init_mode(init_mode)
-        t0 = perf_counter()
         init_payload = self._validate_init(mode, init, k)
-        init_parse_ms = (perf_counter() - t0) * 1000.0
 
-        track_wave = self._logger.isEnabledFor(logging.DEBUG)
-        hint_k = spec.plan.k_hint
-        ws = self._ensure_workspace(spec, int(k))
-        h2d_primary_ms, h2d_miss_ms, init_stage_ms = self._stage_inputs(
-            spec,
+        hint_k = plan.k_hint
+        ws = self._ensure_workspace(direction, int(k))
+        self._copy_inputs_to_device(
+            direction,
             ws,
             x,
             miss_arr=miss_arr,
@@ -1319,49 +1341,92 @@ class CusparseBackend(BackendBase):
             init_payload=init_payload,
         )
 
-        exec_mode = "dynamic"
-        level_ms = None
-        t0 = perf_counter()
-        self._seed_direction(spec, ws, init_mode=mode, miss_arr=miss_arr)
-        use_graph = False
-        if hint_k is not None and int(k) == int(hint_k) and not track_wave:
-            use_graph = True
-        elif hint_k is not None and int(k) != int(hint_k):
-            self._warn_if_k_hint_mismatch(
-                backend="cuSPARSE",
-                direction=spec.direction,
-                runtime_k=int(k),
-                k_hint=int(hint_k),
-            )
-        elif hint_k is not None and track_wave:
-            warnings.warn(
-                (
-                    f"cuSPARSE {spec.direction.value} graph disabled: per-level wavefront timing "
-                    "requires dynamic execution."
-                ),
-                RuntimeWarning,
-                stacklevel=3,
-            )
-        if use_graph:
-            exec_mode = "graph"
-            graph = ws.up.graph if spec.direction == Direction.UP else ws.down.graph
-            if graph is None:
-                raise RuntimeError(
-                    f"Missing captured {spec.direction.value.upper()} CUDA graph for configured k_hint"
-                )
-            with self._stream:
-                graph.launch(self._stream)
+        tracer = self._nvtx
+        if tracer is not None:
+            exec_mode = "instrumented"
+            with tracer.range("run_direction", dir=direction.value):
+                with tracer.range("seed_direction", dir=direction.value):
+                    self._enqueue_seed(direction, ws, init_mode=mode, miss_arr=miss_arr)
+                self._run_wavefront(ws, direction)
+                with tracer.range("collect_outputs", dir=direction.value):
+                    outputs = (
+                        self._copy_node_outputs_to_host(direction, ws)
+                        if emit_all_nodes
+                        else self._copy_outputs_to_host(
+                            direction,
+                            ws,
+                            need_miss_output=need_miss_output,
+                        )
+                    )
         else:
-            level_ms = self._run_wavefront(ws, spec.direction, track_timing=track_wave)
+            self._enqueue_seed(direction, ws, init_mode=mode, miss_arr=miss_arr)
+            use_graph = bool(hint_k is not None and int(k) == int(hint_k))
+            if hint_k is not None and int(k) != int(hint_k):
+                self._warn_if_k_hint_mismatch(
+                    backend="cuSPARSE",
+                    direction=direction,
+                    runtime_k=int(k),
+                    k_hint=int(hint_k),
+                )
+            if use_graph:
+                exec_mode = "graph"
+                graph = ws.up.graph if direction == Direction.UP else ws.down.graph
+                if graph is None:
+                    raise RuntimeError(
+                        f"Missing captured {direction.value.upper()} CUDA graph for configured k_hint"
+                    )
+                with self._stream:
+                    graph.launch(self._stream)
+            else:
+                exec_mode = "dynamic"
+                self._run_wavefront(ws, direction)
+            outputs = (
+                self._copy_node_outputs_to_host(direction, ws)
+                if emit_all_nodes
+                else self._copy_outputs_to_host(
+                    direction,
+                    ws,
+                    need_miss_output=need_miss_output,
+                )
+            )
 
-        outputs, _gather_ms, d2h_ms, d2h_miss_ms = self._collect_outputs(
-            spec,
-            ws,
-            need_miss_output=need_miss_output,
-        )
-        compute_ms = (perf_counter() - t0) * 1000.0 - d2h_ms - d2h_miss_ms
+        if emit_all_nodes:
+            out = outputs
+            host_runtime = RuntimeBytes(
+                level_buffers=0,
+                inputs=int(x.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
+                outputs=int(out.nbytes),
+                aux=0 if init_payload is None else int(init_payload.nbytes),
+            )
+            device_runtime = RuntimeBytes(
+                level_buffers=int(_dense_views_nbytes(ws.dense(direction))),
+                inputs=int(
+                    ws.fwd_input.nbytes
+                    if direction == Direction.UP
+                    else ws.bwd_input_mut.nbytes + (0 if ws.bwd_input_miss is None or miss_arr is None else ws.bwd_input_miss.nbytes)
+                ),
+                outputs=0,
+                aux=int(
+                    (_gpu_nbytes(ws.up.ext_buffers) if direction == Direction.UP else _gpu_nbytes(ws.down.ext_buffers))
+                    + (0 if direction == Direction.UP else _gpu_nbytes(ws.gather_temp))
+                    + int(ws.init_vec.nbytes)
+                    + _gpu_nbytes(ws.init_matrix)
+                ),
+            )
+            self.mem_usage.record(
+                stage="run_up" if direction == Direction.UP else "run_down",
+                runtime_k=k,
+                host_runtime=host_runtime,
+                device_runtime=device_runtime,
+                meta={
+                    "direction": direction.value,
+                    "emit_all_nodes": True,
+                    "mode": exec_mode,
+                },
+            )
+            return out
 
-        if spec.direction == Direction.UP:
+        if direction == Direction.UP:
             out_mut, out_miss = outputs
             host_runtime = RuntimeBytes(
                 level_buffers=0,
@@ -1370,49 +1435,26 @@ class CusparseBackend(BackendBase):
                 aux=0 if init_payload is None else int(init_payload.nbytes),
             )
             device_runtime = RuntimeBytes(
-                level_buffers=int(_dense_views_nbytes(ws.dense(spec.direction))),
+                level_buffers=int(_dense_views_nbytes(ws.dense(direction))),
                 inputs=int(ws.fwd_input.nbytes),
                 outputs=int(ws.mut_out.nbytes + (ws.miss_out.nbytes if need_miss_output else 0)),
                 aux=int(
                     _gpu_nbytes(ws.up.ext_buffers)
                     + int(ws.init_vec.nbytes)
                     + _gpu_nbytes(ws.init_matrix)
-                    + (0 if level_ms is None else level_ms.nbytes)
                 ),
             )
             self.mem_usage.record(
-                stage=spec.stage_name,
+                stage="run_up",
                 runtime_k=k,
                 host_runtime=host_runtime,
                 device_runtime=device_runtime,
                 meta={
-                    "direction": spec.direction.value,
+                    "direction": direction.value,
                     "need_miss_output": bool(need_miss_output),
                     "mode": exec_mode,
                 },
             )
-            if self._logger.isEnabledFor(logging.INFO):
-                total_ms = (perf_counter() - total_t0) * 1000.0
-                self._logger.info(
-                    (
-                        "cusparse.run_up k=%d mode=%s init=%s miss_out=%s: parse=%.3fms init_parse=%.3fms "
-                        "H2D=%.3fms init_stage=%.3fms compute=%.3fms D2H_mut=%.3fms D2H_miss=%.3fms total=%.3fms"
-                    ),
-                    k,
-                    exec_mode,
-                    mode.value,
-                    need_miss_output,
-                    parse_ms,
-                    init_parse_ms,
-                    h2d_primary_ms,
-                    init_stage_ms,
-                    compute_ms,
-                    d2h_ms,
-                    d2h_miss_ms,
-                    total_ms,
-                )
-                if track_wave and level_ms is not None:
-                    self._log_wavefront_profile(spec.direction, level_ms)
             return out_mut, out_miss
 
         out = outputs
@@ -1423,7 +1465,7 @@ class CusparseBackend(BackendBase):
             aux=0 if init_payload is None else int(init_payload.nbytes),
         )
         device_runtime = RuntimeBytes(
-            level_buffers=int(_dense_views_nbytes(ws.dense(spec.direction))),
+            level_buffers=int(_dense_views_nbytes(ws.dense(direction))),
             inputs=int(
                 ws.bwd_input_mut.nbytes
                 + (0 if ws.bwd_input_miss is None or miss_arr is None else ws.bwd_input_miss.nbytes)
@@ -1434,42 +1476,19 @@ class CusparseBackend(BackendBase):
                 + _gpu_nbytes(ws.gather_temp)
                 + int(ws.init_vec.nbytes)
                 + _gpu_nbytes(ws.init_matrix)
-                + (0 if level_ms is None else level_ms.nbytes)
             ),
         )
         self.mem_usage.record(
-            stage=spec.stage_name,
+            stage="run_down",
             runtime_k=k,
             host_runtime=host_runtime,
             device_runtime=device_runtime,
             meta={
-                "direction": spec.direction.value,
+                "direction": direction.value,
                 "has_miss_input": bool(miss_arr is not None),
                 "mode": exec_mode,
             },
         )
-        if self._logger.isEnabledFor(logging.INFO):
-            total_ms = (perf_counter() - total_t0) * 1000.0
-            self._logger.info(
-                (
-                    "cusparse.run_down k=%d mode=%s init=%s miss_in=%s: parse=%.3fms init_parse=%.3fms "
-                    "H2D_mut=%.3fms H2D_miss=%.3fms init_stage=%.3fms compute=%.3fms D2H=%.3fms total=%.3fms"
-                ),
-                k,
-                exec_mode,
-                mode.value,
-                miss_arr is not None,
-                parse_ms,
-                init_parse_ms,
-                h2d_primary_ms,
-                h2d_miss_ms,
-                init_stage_ms,
-                compute_ms,
-                d2h_ms,
-                total_ms,
-            )
-            if track_wave and level_ms is not None:
-                self._log_wavefront_profile(spec.direction, level_ms)
         return out
 
     def run_up(
@@ -1480,14 +1499,14 @@ class CusparseBackend(BackendBase):
         init: np.ndarray | None = None,
         need_miss_output: bool = False,
     ) -> tuple[np.ndarray, np.ndarray | None]:
-        spec = self._require_direction_spec(Direction.UP)
         out_mut, out_miss = self._run_direction(
-            spec,
+            Direction.UP,
             primary,
             miss=None,
             init_mode=init_mode,
             init=init,
             need_miss_output=need_miss_output,
+            emit_all_nodes=False,
         )
         return out_mut, out_miss
 
@@ -1499,16 +1518,50 @@ class CusparseBackend(BackendBase):
         init_mode: InitMode,
         init: np.ndarray | None = None,
     ) -> np.ndarray:
-        spec = self._require_direction_spec(Direction.DOWN)
         out = self._run_direction(
-            spec,
+            Direction.DOWN,
             primary,
             miss=miss,
             init_mode=init_mode,
             init=init,
             need_miss_output=False,
+            emit_all_nodes=False,
         )
         return out
+
+    def run_up_nodes(
+        self,
+        primary: np.ndarray,
+        *,
+        init_mode: InitMode,
+        init: np.ndarray | None = None,
+    ) -> np.ndarray:
+        return self._run_direction(
+            Direction.UP,
+            primary,
+            miss=None,
+            init_mode=init_mode,
+            init=init,
+            need_miss_output=False,
+            emit_all_nodes=True,
+        )
+
+    def run_down_nodes(
+        self,
+        primary: np.ndarray,
+        *,
+        init_mode: InitMode,
+        init: np.ndarray | None = None,
+    ) -> np.ndarray:
+        return self._run_direction(
+            Direction.DOWN,
+            primary,
+            miss=None,
+            init_mode=init_mode,
+            init=init,
+            need_miss_output=False,
+            emit_all_nodes=True,
+        )
 
     def estimate_static_bytes(self) -> tuple[StaticBytes, StaticBytes]:
         host = estimate_common_host_static_bytes(
@@ -1521,13 +1574,12 @@ class CusparseBackend(BackendBase):
         device = StaticBytes()
         data_itemsize = int(np.dtype(self._dtype).itemsize)
         index_itemsize = int(np.dtype(np.int32).itemsize)
-        share_storage = self._plan_up is not None and self._plan_down is not None and self._plan_up.can_share_storage_with(self._plan_down)
         device.blocks_up = _estimate_block_grid_bytes(
             self._blocks_up,
             data_itemsize=data_itemsize,
             index_itemsize=index_itemsize,
         )
-        device.blocks_down = 0 if share_storage else _estimate_block_grid_bytes(
+        device.blocks_down = 0 if not self._store_blocks_down else _estimate_block_grid_bytes(
             self._blocks_down,
             data_itemsize=data_itemsize,
             index_itemsize=index_itemsize,

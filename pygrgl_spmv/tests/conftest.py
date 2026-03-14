@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pytest
@@ -12,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PRIMARY_GRG = str(REPO_ROOT / "pygrgl_spmv" / "tests" / "data" / "msprime.example.igd.final.grg")
 DEFAULT_MISSING_GRG = str(REPO_ROOT / "pygrgl_spmv" / "tests" / "data" / "test-200-samples.miss.final.grg")
 
-INDEX_DTYPE = np.uintp
+INDEX_DTYPE = np.int32
 DATA_DTYPE = np.float64
 K_CORE = [1, 2, 4]
 K_MATRIX = [1, 2, 3, 7, 8, 9, 16, 20]
@@ -54,6 +56,15 @@ def make_mkl_plan(*, k_hint=None, store="N", fmt="CSR", n_threads=0):
     }
 
 
+def make_triton_plan(*, k_hint=1, store="N", fmt="CSR", scratch="none"):
+    return {
+        "k_hint": k_hint,
+        "store": store,
+        "fmt": fmt,
+        "scratch": scratch,
+    }
+
+
 def transpose_compatible_fmt(fmt: str) -> str:
     token = str(fmt).lower()
     if token not in _TRANSPOSE_COMPATIBLE_FMT:
@@ -61,99 +72,45 @@ def transpose_compatible_fmt(fmt: str) -> str:
     return _TRANSPOSE_COMPATIBLE_FMT[token]
 
 
-def make_backend_config(backend_type: str, *, plan_up, plan_down, log_level="WARNING"):
-    if plan_up is None and plan_down is None:
-        raise ValueError("plan_up/plan_down")
-    return {
-        "type": str(backend_type),
-        "plan_up": plan_up,
-        "plan_down": plan_down,
-        "log_level": log_level,
-    }
+def make_mkl_backend(
+    *,
+    fmt_up="csr",
+    fmt_down=None,
+    k_hint=None,
+    n_threads=0,
+    log_level="WARNING",
+    instrumentation=False,
+    infer_missing=True,
+):
+    from pygrgl_spmv.backends.mkl import MklBackend, MklPlanPair
 
+    plan_up = None
+    if fmt_up is not None:
+        plan_up = make_mkl_plan(k_hint=k_hint, store="N", fmt=str(fmt_up).upper(), n_threads=n_threads)
+    elif infer_missing:
+        assert fmt_down is not None
+        plan_up = make_mkl_plan(k_hint=k_hint, store="T", fmt=str(fmt_down).upper(), n_threads=n_threads)
 
-def default_backend_params(*, log_level="INFO"):
-    params = [
-        pytest.param(
-            make_backend_config(
-                "mkl",
-                plan_up=make_mkl_plan(store="N", fmt="CSR", n_threads=0, k_hint=None),
-                plan_down=make_mkl_plan(store="T", fmt="CSC", n_threads=0, k_hint=None),
-                log_level=log_level,
-            ),
-            id="mkl",
-            marks=pytest.mark.mkl,
-        ),
-    ]
-    try:
-        import cupy  # noqa: F401
-    except ImportError:
-        return params
+    plan_down = None
+    if fmt_down is not None:
+        plan_down = make_mkl_plan(k_hint=k_hint, store="T", fmt=str(fmt_down).upper(), n_threads=n_threads)
+    elif infer_missing:
+        assert fmt_up is not None
+        plan_down = make_mkl_plan(
+            k_hint=k_hint,
+            store="T",
+            fmt=transpose_compatible_fmt(fmt_up),
+            n_threads=n_threads,
+        )
 
-    params.extend(
-        [
-            pytest.param(
-                make_backend_config(
-                    "cusparse",
-                    plan_up=make_cusparse_plan(
-                        k_hint=None,
-                        store="N",
-                        fmt="CSR",
-                        op_a="N",
-                        op_b="N",
-                        order_b="ROW",
-                        order_c="ROW",
-                        algo="DEFAULT",
-                    ),
-                    plan_down=make_cusparse_plan(
-                        k_hint=None,
-                        store="T",
-                        fmt="CSC",
-                        op_a="N",
-                        op_b="N",
-                        order_b="ROW",
-                        order_c="ROW",
-                        algo="DEFAULT",
-                    ),
-                    log_level=log_level,
-                ),
-                id="cusparse-dyn",
-                marks=pytest.mark.gpu,
-            ),
-            pytest.param(
-                make_backend_config(
-                    "cusparse",
-                    plan_up=make_cusparse_plan(
-                        k_hint=4,
-                        store="N",
-                        fmt="CSR",
-                        op_a="N",
-                        op_b="N",
-                        order_b="ROW",
-                        order_c="ROW",
-                        algo="DEFAULT",
-                    ),
-                    plan_down=make_cusparse_plan(
-                        k_hint=4,
-                        store="T",
-                        fmt="CSC",
-                        op_a="N",
-                        op_b="N",
-                        order_b="ROW",
-                        order_c="ROW",
-                        algo="DEFAULT",
-                    ),
-                    log_level=log_level,
-                ),
-                id="cusparse-graph-k4",
-                marks=pytest.mark.gpu,
-            ),
-        ]
+    return MklBackend(
+        pair=MklPlanPair.from_dicts(plan_up, plan_down),
+        log_level=log_level,
+        instrumentation=instrumentation,
     )
-    return params
 
 
-def make_cusparse_config(
+def make_cusparse_backend(
     *,
     fmt_up="csr",
     fmt_down=None,
@@ -161,8 +118,11 @@ def make_cusparse_config(
     algo_up="default",
     algo_down="default",
     log_level="WARNING",
+    instrumentation=False,
     infer_missing=True,
 ):
+    from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlanPair
+
     if fmt_up is None and fmt_down is None:
         raise ValueError("fmt_up/fmt_down")
     if not isinstance(algo_up, str):
@@ -220,38 +180,119 @@ def make_cusparse_config(
             algo=algo_down.upper(),
         )
 
-    return make_backend_config("cusparse", plan_up=plan_up, plan_down=plan_down, log_level=log_level)
+    return CusparseBackend(
+        pair=CusparsePlanPair.from_dicts(plan_up, plan_down),
+        log_level=log_level,
+        instrumentation=instrumentation,
+    )
 
 
-def make_mkl_config(
+def make_triton_backend(
     *,
     fmt_up="csr",
     fmt_down=None,
-    k_hint=None,
-    n_threads=0,
+    k_hint=1,
+    scratch_up="none",
+    scratch_down="none",
     log_level="WARNING",
+    instrumentation=False,
     infer_missing=True,
 ):
+    from pygrgl_spmv.backends.triton import TritonBackend, TritonPlanPair
+
+    if fmt_up is None and fmt_down is None:
+        raise ValueError("fmt_up/fmt_down")
+    if k_hint != 1:
+        raise ValueError("Triton backend requires k_hint=1")
+
     plan_up = None
     if fmt_up is not None:
-        plan_up = make_mkl_plan(k_hint=k_hint, store="N", fmt=str(fmt_up).upper(), n_threads=n_threads)
+        plan_up = make_triton_plan(k_hint=1, store="N", fmt=str(fmt_up).upper(), scratch=scratch_up)
     elif infer_missing:
         assert fmt_down is not None
-        plan_up = make_mkl_plan(k_hint=k_hint, store="T", fmt=str(fmt_down).upper(), n_threads=n_threads)
+        plan_up = make_triton_plan(k_hint=1, store="N", fmt=transpose_compatible_fmt(fmt_down), scratch=scratch_up)
 
     plan_down = None
     if fmt_down is not None:
-        plan_down = make_mkl_plan(k_hint=k_hint, store="T", fmt=str(fmt_down).upper(), n_threads=n_threads)
+        plan_down = make_triton_plan(k_hint=1, store="T", fmt=str(fmt_down).upper(), scratch=scratch_down)
     elif infer_missing:
         assert fmt_up is not None
-        plan_down = make_mkl_plan(
-            k_hint=k_hint,
-            store="T",
-            fmt=transpose_compatible_fmt(fmt_up),
-            n_threads=n_threads,
-        )
+        plan_down = make_triton_plan(k_hint=1, store="T", fmt=transpose_compatible_fmt(fmt_up), scratch=scratch_down)
 
-    return make_backend_config("mkl", plan_up=plan_up, plan_down=plan_down, log_level=log_level)
+    return TritonBackend(
+        pair=TritonPlanPair.from_dicts(plan_up, plan_down),
+        log_level=log_level,
+        instrumentation=instrumentation,
+    )
+
+
+def default_backend_builders(*, log_level="INFO", instrumentation=False):
+    params = [
+        pytest.param(
+            ("mkl", lambda: make_mkl_backend(
+                fmt_up="csr",
+                fmt_down="csc",
+                n_threads=0,
+                k_hint=None,
+                log_level=log_level,
+                instrumentation=instrumentation,
+            )),
+            id="mkl",
+            marks=pytest.mark.mkl,
+        ),
+    ]
+    try:
+        import cupy  # noqa: F401
+    except ImportError:
+        return params
+
+    params.extend(
+        [
+            pytest.param(
+                ("cusparse", lambda: make_cusparse_backend(
+                    fmt_up="csr",
+                    fmt_down="csc",
+                    k_hint=None,
+                    algo_up="default",
+                    algo_down="default",
+                    log_level=log_level,
+                    instrumentation=instrumentation,
+                )),
+                id="cusparse-dyn",
+                marks=pytest.mark.gpu,
+            ),
+            pytest.param(
+                ("cusparse", lambda: make_cusparse_backend(
+                    fmt_up="csr",
+                    fmt_down="csc",
+                    k_hint=4,
+                    algo_up="default",
+                    algo_down="default",
+                    log_level=log_level,
+                    instrumentation=instrumentation,
+                )),
+                id="cusparse-graph-k4",
+                marks=pytest.mark.gpu,
+            ),
+        ]
+    )
+    if HAS_TRITON_RUNTIME:
+        params.append(
+            pytest.param(
+                ("triton", lambda: make_triton_backend(
+                    fmt_up="csr",
+                    fmt_down="csc",
+                    k_hint=1,
+                    scratch_up="none",
+                    scratch_down="none",
+                    log_level=log_level,
+                    instrumentation=instrumentation,
+                )),
+                id="triton-csr-csc-k1",
+                marks=[pytest.mark.gpu, pytest.mark.triton],
+            )
+        )
+    return params
 
 def _has_mkl_runtime() -> bool:
     try:
@@ -266,11 +307,24 @@ def _has_mkl_runtime() -> bool:
 HAS_MKL_RUNTIME = _has_mkl_runtime()
 
 
+def _has_triton_runtime() -> bool:
+    try:
+        import torch  # noqa: F401
+        import triton  # noqa: F401
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+HAS_TRITON_RUNTIME = _has_triton_runtime()
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--backend",
         default="all",
-        choices=["mkl", "cusparse", "all"],
+        choices=["mkl", "cusparse", "triton", "all"],
         help="Which backend(s) to test",
     )
     parser.addoption(
@@ -306,14 +360,25 @@ def pytest_collection_modifyitems(config, items):
         case "cusparse":
             skip_mkl = pytest.mark.skip(reason="--backend=cusparse")
             for item in items:
-                if "mkl" in item.keywords:
+                if "mkl" in item.keywords or "triton" in item.keywords:
                     item.add_marker(skip_mkl)
+        case "triton":
+            skip_other = pytest.mark.skip(reason="--backend=triton")
+            for item in items:
+                if "mkl" in item.keywords or "cusparse" in item.keywords:
+                    item.add_marker(skip_other)
 
     if not HAS_MKL_RUNTIME:
         skip_no_mkl = pytest.mark.skip(reason="MKL runtime unavailable (libmkl_rt.so not found)")
         for item in items:
             if "mkl" in item.keywords:
                 item.add_marker(skip_no_mkl)
+
+    if not HAS_TRITON_RUNTIME:
+        skip_no_triton = pytest.mark.skip(reason="Triton runtime unavailable (torch+triton CUDA not found)")
+        for item in items:
+            if "triton" in item.keywords:
+                item.add_marker(skip_no_triton)
 
     if smoke:
         keep: list[pytest.Item] = []
@@ -328,21 +393,6 @@ def pytest_collection_modifyitems(config, items):
             items[:] = keep
 
 
-def make_fmt_algo_params(*, transpose_bool: bool = False):
-    """Build pytest.param list for all (fmt, algo) combos for one transpose mode."""
-    from pygrgl_spmv.backends.cusparse import is_valid_combo
-
-    params = []
-    for fmt in _ALL_FMTS:
-        for algo in _ALL_ALGOS:
-            pid = f"{fmt}-t{int(bool(transpose_bool))}-{algo}"
-            if is_valid_combo(fmt, transpose_bool, algo):
-                params.append(pytest.param(fmt, algo, id=pid))
-            else:
-                params.append(pytest.param(fmt, algo, id=pid, marks=pytest.mark.xfail(raises=ValueError, strict=True)))
-    return params
-
-
 def valid_fmt_algo_params(*, transpose_bool: bool = False):
     """Build pytest.param list for valid (fmt, algo) combos only for one transpose mode."""
     from pygrgl_spmv.backends.cusparse import is_valid_combo
@@ -353,6 +403,40 @@ def valid_fmt_algo_params(*, transpose_bool: bool = False):
             if is_valid_combo(fmt, transpose_bool, algo):
                 params.append(pytest.param(fmt, algo, id=f"{fmt}-t{int(bool(transpose_bool))}-{algo}"))
     return params
+
+
+def invalid_fmt_algo_params(*, transpose_bool: bool = False):
+    """Build pytest.param list for invalid (fmt, algo) combos only for one transpose mode."""
+    from pygrgl_spmv.backends.cusparse import is_valid_combo
+
+    params = []
+    for fmt in _ALL_FMTS:
+        for algo in _ALL_ALGOS:
+            if not is_valid_combo(fmt, transpose_bool, algo):
+                params.append(pytest.param(fmt, algo, id=f"{fmt}-t{int(bool(transpose_bool))}-{algo}"))
+    return params
+
+
+def matmul_expect_k_hint_warning(op, input_matrix, direction, /, **kwargs):
+    """Run ``op.matmul`` and expect a k_hint warning only when runtime-k mismatches the plan hint."""
+    import pygrgl
+
+    arr = np.asarray(input_matrix)
+    if arr.ndim != 2:
+        raise ValueError(f"matmul_expect_k_hint_warning requires a 2D input, got shape {arr.shape}")
+
+    if direction == pygrgl.TraversalDirection.UP or str(direction).lower() == "up":
+        plan = op._backend._plan_up
+    elif direction == pygrgl.TraversalDirection.DOWN or str(direction).lower() == "down":
+        plan = op._backend._plan_down
+    else:
+        raise ValueError(f"Unsupported direction {direction!r}")
+
+    backend_type = str(getattr(op._backend, "__class__", type(op._backend)).__module__).lower()
+    hint = None if plan is None else getattr(plan, "k_hint", None)
+    expect_warning = "cusparse" in backend_type and hint is not None and int(arr.shape[0]) != int(hint)
+    with pytest.warns(RuntimeWarning, match="k_hint") if expect_warning else nullcontext():
+        return op.matmul(input_matrix, direction, **kwargs)
 
 
 def binary_pm1(rng, shape, dtype):

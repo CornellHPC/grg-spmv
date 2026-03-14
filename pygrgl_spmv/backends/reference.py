@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Mapping
 
 import numpy as np
 import scipy.sparse as sp
@@ -39,23 +39,12 @@ class ReferencePlan:
         object.__setattr__(self, "k_hint", _parse_optional_k_hint(self.k_hint))
 
     @classmethod
-    def from_any(cls, value):
-        if isinstance(value, cls):
-            return value
-        if hasattr(value, "store") and hasattr(value, "fmt"):
-            k_hint = getattr(value, "k_hint", None)
-            return cls(
-                store=parse_store(getattr(value, "store")),
-                fmt=parse_sparse_format(getattr(value, "fmt")),
-                k_hint=_parse_optional_k_hint(k_hint),
-            )
-        if isinstance(value, dict):
-            return cls(
-                store=parse_store(value["store"]),
-                fmt=parse_sparse_format(value["fmt"]),
-                k_hint=_parse_optional_k_hint(value.get("k_hint")),
-            )
-        raise TypeError(f"Cannot construct ReferencePlan from {type(value).__name__}")
+    def from_dict(cls, value: Mapping[str, object]) -> "ReferencePlan":
+        return cls(
+            store=parse_store(value["store"]),
+            fmt=parse_sparse_format(value["fmt"]),
+            k_hint=_parse_optional_k_hint(value.get("k_hint")),
+        )
 
     def can_share_storage_with(self, other: "ReferencePlan") -> bool:
         if self.store == other.store:
@@ -79,16 +68,27 @@ class ReferenceBackend(BackendBase):
             k_hint=_parse_optional_k_hint(k_hint),
         )
 
+    @staticmethod
+    def pair(
+        *,
+        plan_up: ReferencePlan | None,
+        plan_down: ReferencePlan | None,
+    ) -> "ReferencePlanPair":
+        return ReferencePlanPair(plan_up=plan_up, plan_down=plan_down)
+
     def __init__(
         self,
         *,
-        plan_up,
-        plan_down,
+        pair: "ReferencePlanPair",
         log_level: str = "WARNING",
+        instrumentation: bool = False,
     ) -> None:
-        up = None if plan_up is None else ReferencePlan.from_any(plan_up)
-        down = None if plan_down is None else ReferencePlan.from_any(plan_down)
-        super().__init__(plan_up=up, plan_down=down, log_level=log_level)
+        super().__init__(
+            plan_up=pair.plan_up,
+            plan_down=pair.plan_down,
+            log_level=log_level,
+            instrumentation=instrumentation,
+        )
 
     def setup(self, setup: BackendSetup) -> None:
         self._apply_setup_state(setup)
@@ -150,26 +150,26 @@ class ReferenceBackend(BackendBase):
         X = np.asarray(primary, dtype=self._dtype, order="C")
         if X.ndim != 2:
             raise ValueError(f"primary input must be 2D, got shape {X.shape}")
-        if X.shape[0] != self._n:
-            raise ValueError(f"UP primary input must have {self._n} rows, got {X.shape[0]}")
+        if X.shape[0] != self._num_samples:
+            raise ValueError(f"UP primary input must have {self._num_samples} rows, got {X.shape[0]}")
         k = int(X.shape[1])
 
         mode = parse_init_mode(init_mode)
         payload = self._validate_init(mode, init, k)
 
-        node_values = np.zeros((self._K, k), dtype=self._dtype)
+        node_values = np.zeros((self._num_nodes, k), dtype=self._dtype)
         self._apply_init_inplace(node_values, mode, payload)
-        np.add(node_values[: self._n], X[self._sample_perm], out=node_values[: self._n])
+        np.add(node_values[: self._num_samples], X[self._sample_perm], out=node_values[: self._num_samples])
         self._propagate_up_inplace(node_values)
 
         if self._sel_mut.nnz == 0:
-            out_mut = np.zeros((self._m, k), dtype=self._dtype)
+            out_mut = np.zeros((self._num_mutations, k), dtype=self._dtype)
         else:
             out_mut = np.asarray(self._sel_mut @ node_values, dtype=self._dtype)
         out_miss = None
         if need_miss_output:
             if self._sel_miss.nnz == 0:
-                out_miss = np.zeros((self._m, k), dtype=self._dtype)
+                out_miss = np.zeros((self._num_mutations, k), dtype=self._dtype)
             else:
                 out_miss = np.asarray(self._sel_miss @ node_values, dtype=self._dtype)
         self.mem_usage.record(
@@ -197,20 +197,20 @@ class ReferenceBackend(BackendBase):
         X = np.asarray(primary, dtype=self._dtype, order="C")
         if X.ndim != 2:
             raise ValueError(f"primary input must be 2D, got shape {X.shape}")
-        if X.shape[0] != self._m:
-            raise ValueError(f"DOWN primary input must have {self._m} rows, got {X.shape[0]}")
+        if X.shape[0] != self._num_mutations:
+            raise ValueError(f"DOWN primary input must have {self._num_mutations} rows, got {X.shape[0]}")
         k = int(X.shape[1])
 
         miss_arr = None
         if miss is not None:
             miss_arr = np.asarray(miss, dtype=self._dtype, order="C")
-            if miss_arr.shape != (self._m, k):
-                raise ValueError(f"miss input must have shape ({self._m}, {k}), got {miss_arr.shape}")
+            if miss_arr.shape != (self._num_mutations, k):
+                raise ValueError(f"miss input must have shape ({self._num_mutations}, {k}), got {miss_arr.shape}")
 
         mode = parse_init_mode(init_mode)
         payload = self._validate_init(mode, init, k)
 
-        node_values = np.zeros((self._K, k), dtype=self._dtype)
+        node_values = np.zeros((self._num_nodes, k), dtype=self._dtype)
         self._apply_init_inplace(node_values, mode, payload)
         if self._sel_mut.nnz > 0:
             node_values += self._sel_mut.T @ X
@@ -231,5 +231,60 @@ class ReferenceBackend(BackendBase):
         )
         return out
 
+    def run_up_nodes(
+        self,
+        primary: np.ndarray,
+        *,
+        init_mode: InitMode,
+        init: np.ndarray | None = None,
+    ) -> np.ndarray:
+        self._require_plan(Direction.UP)
+        X = np.asarray(primary, dtype=self._dtype, order="C")
+        if X.ndim != 2:
+            raise ValueError(f"primary input must be 2D, got shape {X.shape}")
+        if X.shape[0] != self._num_samples:
+            raise ValueError(f"UP primary input must have {self._num_samples} rows, got {X.shape[0]}")
+        k = int(X.shape[1])
+        mode = parse_init_mode(init_mode)
+        payload = self._validate_init(mode, init, k)
+        node_values = np.zeros((self._num_nodes, k), dtype=self._dtype)
+        self._apply_init_inplace(node_values, mode, payload)
+        np.add(node_values[: self._num_samples], X[self._sample_perm], out=node_values[: self._num_samples])
+        self._propagate_up_inplace(node_values)
+        return node_values
 
-__all__ = ["ReferenceBackend", "ReferencePlan"]
+    def run_down_nodes(
+        self,
+        primary: np.ndarray,
+        *,
+        init_mode: InitMode,
+        init: np.ndarray | None = None,
+    ) -> np.ndarray:
+        self._require_plan(Direction.DOWN)
+        X = np.asarray(primary, dtype=self._dtype, order="C")
+        if X.ndim != 2:
+            raise ValueError(f"primary input must be 2D, got shape {X.shape}")
+        if X.shape[0] != self._num_mutations:
+            raise ValueError(f"DOWN primary input must have {self._num_mutations} rows, got {X.shape[0]}")
+        k = int(X.shape[1])
+        mode = parse_init_mode(init_mode)
+        payload = self._validate_init(mode, init, k)
+        node_values = np.zeros((self._num_nodes, k), dtype=self._dtype)
+        self._apply_init_inplace(node_values, mode, payload)
+        if self._sel_mut.nnz > 0:
+            node_values += self._sel_mut.T @ X
+        self._propagate_down_inplace(node_values)
+        return node_values
+
+
+@dataclass(frozen=True)
+class ReferencePlanPair:
+    plan_up: ReferencePlan | None
+    plan_down: ReferencePlan | None
+
+    def __post_init__(self) -> None:
+        if self.plan_up is None and self.plan_down is None:
+            raise ValueError("At least one of plan_up/plan_down must be provided")
+
+
+__all__ = ["ReferenceBackend", "ReferencePlan", "ReferencePlanPair"]

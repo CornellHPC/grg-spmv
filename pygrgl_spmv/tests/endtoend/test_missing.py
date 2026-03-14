@@ -9,6 +9,7 @@ import pygrgl
 import pytest
 
 from .conftest import allele_frequencies, grg_to_matrix, samples_below_node
+from pygrgl_spmv.tests.conftest import matmul_expect_k_hint_warning
 
 
 MISSING_INDIVS = 21
@@ -55,7 +56,8 @@ def test_missing_matmul_semantics(backend_config, missing_grg, missing_grg_path,
         miss=miss_ref,
     )
     miss_op = np.zeros((rows, missing_grg.num_mutations), dtype=np.float64)
-    got_up = op.matmul(
+    got_up = matmul_expect_k_hint_warning(
+        op,
         rv_up,
         pygrgl.TraversalDirection.UP,
         by_individual=True,
@@ -78,7 +80,8 @@ def test_missing_matmul_semantics(backend_config, missing_grg, missing_grg_path,
         by_individual=True,
         miss=miss_in.copy(),
     )
-    got_down = op.matmul(
+    got_down = matmul_expect_k_hint_warning(
+        op,
         rv_down,
         pygrgl.TraversalDirection.DOWN,
         by_individual=True,
@@ -124,7 +127,8 @@ def test_shared_site_missingness_affects_all_variants(
         miss=miss_ref,
     )
     miss_op = np.zeros((rows, missing_grg.num_mutations), dtype=np.float64)
-    _ = op.matmul(
+    _ = matmul_expect_k_hint_warning(
+        op,
         rv,
         pygrgl.TraversalDirection.UP,
         by_individual=True,

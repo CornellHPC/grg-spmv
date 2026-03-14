@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import gc
-import shutil
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from time import perf_counter
 
 import numpy as np
+import pygrgl
 
 from scripts.bench.cases import build_case, build_inputs_by_k, configured_direction_names
 from scripts.bench.cli import progress
@@ -72,7 +70,7 @@ class _IntraDiagnostics:
 
 @dataclass(frozen=True)
 class _RunResult:
-    output_path: Path
+    output: np.ndarray
     mean_ms: float
     std_ms: float
     host_bytes: int
@@ -85,12 +83,9 @@ class _RunResult:
     abs_err_max: float | None
     rel_err_avg: float | None
     rel_err_max: float | None
-
-
-def _slug_token(value: str) -> str:
-    token = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value).strip("_")
-    return token or "value"
-
+    ref_error: int
+    ref_abs_err_max: float | None
+    ref_rel_err_max: float | None
 
 def _validate_and_extract_runtime_memory(
     *,
@@ -186,10 +181,9 @@ def _run_case(
     kwargs_factory,
     n_trials: int,
     n_warmup: int,
-    output_dir: Path,
-    output_index: int,
     output_atol: float,
     output_rtol: float,
+    reference_output: np.ndarray,
 ) -> _RunResult:
     progress(f"{label}: scenario={scenario} direction={direction} k={k} start")
 
@@ -222,15 +216,16 @@ def _run_case(
     mean_ms = float(np.mean(ms))
     std_ms = float(np.std(ms))
     abs_err_avg, abs_err_max, rel_err_avg, rel_err_max = diagnostics.summary()
-
-    config_token = _slug_token(label)
-    scenario_token = _slug_token(scenario)
-    direction_token = _slug_token(direction)
-    output_path = output_dir / f"{output_index:06d}_{config_token}_{scenario_token}_{direction_token}_k{int(k)}.npy"
-    np.save(output_path, diagnostics.ref_output, allow_pickle=False)
+    ref_ok, ref_shape_ok, ref_abs_err_max, ref_rel_err_max = compare_outputs(
+        reference_output,
+        diagnostics.ref_output,
+        atol=output_atol,
+        rtol=output_rtol,
+    )
+    ref_error = 0 if ref_ok and ref_shape_ok else 1
 
     return _RunResult(
-        output_path=output_path,
+        output=np.array(diagnostics.ref_output, copy=True),
         mean_ms=mean_ms,
         std_ms=std_ms,
         host_bytes=host_bytes,
@@ -243,24 +238,65 @@ def _run_case(
         abs_err_max=abs_err_max,
         rel_err_avg=rel_err_avg,
         rel_err_max=rel_err_max,
+        ref_error=ref_error,
+        ref_abs_err_max=ref_abs_err_max,
+        ref_rel_err_max=ref_rel_err_max,
     )
+
+
+def _clone_kwargs(kwargs: dict[str, object]) -> dict[str, object]:
+    cloned: dict[str, object] = {}
+    for key, value in kwargs.items():
+        cloned[key] = value.copy() if isinstance(value, np.ndarray) else value
+    return cloned
+
+
+def _reference_output(
+    *,
+    grg_ref,
+    matrix: np.ndarray,
+    direction: str,
+    kwargs: dict[str, object],
+) -> np.ndarray:
+    traversal = pygrgl.TraversalDirection.UP if direction == "up" else pygrgl.TraversalDirection.DOWN
+    return np.asarray(pygrgl.matmul(grg_ref, matrix, traversal, **kwargs))
+
+
+def _summarize_reference_diagnostics(rows: list[dict[str, object]]) -> tuple[int, int, float | None, float | None]:
+    errors = 0
+    checked = 0
+    abs_max: float | None = None
+    rel_max: float | None = None
+    for row in rows:
+        if row.get("scenario") in {"static", "static_est"} or "skip" in row:
+            continue
+        checked += 1
+        errors += int(row.get("ref_error", 0))
+        row_abs = row.get("ref_abs_err_max")
+        row_rel = row.get("ref_rel_err_max")
+        if row_abs is not None:
+            row_abs = float(row_abs)
+            abs_max = row_abs if abs_max is None else max(abs_max, row_abs)
+        if row_rel is not None:
+            row_rel = float(row_rel)
+            rel_max = row_rel if rel_max is None else max(rel_max, row_rel)
+    return errors, checked, abs_max, rel_max
 
 
 def benchmark_config(
     *,
     op,
+    grg_ref,
     label: str,
     ks: list[int],
     options: list[str],
     n_trials: int,
     n_warmup: int,
     seed_base: int,
-    output_dir: Path,
     dtype: np.dtype,
     output_atol: float,
     output_rtol: float,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    output_dir.mkdir(parents=True, exist_ok=True)
     inputs_by_k = build_inputs_by_k(op=op, ks=ks, seed_base=seed_base, dtype=dtype)
     summary_rows: list[dict[str, object]] = []
     output_rows: list[dict[str, object]] = []
@@ -287,6 +323,13 @@ def benchmark_config(
                 if direction not in {"up", "down"}:
                     raise ValueError(f"Unknown direction {direction!r}")
                 assert isinstance(case.matrix, np.ndarray)
+                kwargs = _clone_kwargs(case.kwargs_factory())
+                reference_output = _reference_output(
+                    grg_ref=grg_ref,
+                    matrix=case.matrix,
+                    direction=direction,
+                    kwargs=_clone_kwargs(kwargs),
+                )
                 result = _run_case(
                     op=op,
                     label=label,
@@ -294,13 +337,12 @@ def benchmark_config(
                     direction=direction,
                     k=int(k),
                     matrix=case.matrix,
-                    kwargs_factory=case.kwargs_factory,
+                    kwargs_factory=lambda kwargs=kwargs: _clone_kwargs(kwargs),
                     n_trials=n_trials,
                     n_warmup=n_warmup,
-                    output_dir=output_dir,
-                    output_index=len(output_rows),
                     output_atol=output_atol,
                     output_rtol=output_rtol,
+                    reference_output=reference_output,
                 )
                 summary_rows.append(
                     {
@@ -308,7 +350,6 @@ def benchmark_config(
                         "scenario": scenario,
                         "direction": direction,
                         "k": int(k),
-                        "path": str(result.output_path),
                         "call_ms_mean": result.mean_ms,
                         "call_ms_std": result.std_ms,
                         "host_gib": bytes_to_gib(result.host_bytes),
@@ -321,6 +362,9 @@ def benchmark_config(
                         "abs_err_max": result.abs_err_max,
                         "rel_err_avg": result.rel_err_avg,
                         "rel_err_max": result.rel_err_max,
+                        "ref_error": result.ref_error,
+                        "ref_abs_err_max": result.ref_abs_err_max,
+                        "ref_rel_err_max": result.ref_rel_err_max,
                     }
                 )
                 output_rows.append(
@@ -329,7 +373,7 @@ def benchmark_config(
                         "scenario": scenario,
                         "direction": direction,
                         "k": int(k),
-                        "path": str(result.output_path),
+                        "output": result.output,
                     }
                 )
 
@@ -356,70 +400,66 @@ def run_benchmark_suite(
     progress(f"GRG file: {grg_path}")
     all_summary_rows: list[dict[str, object]] = []
     all_outputs: list[dict[str, object]] = []
-    output_dir = Path(tempfile.mkdtemp(prefix="pygrgl_spmv_bench_refs_"))
-    keep_output_dir = False
-    try:
-        for entry in configs:
-            label = entry.label
-            cfg = entry.config
+    grg_ref = pygrgl.load_immutable_grg(grg_path)
+    for entry in configs:
+        label = entry.label
 
-            progress(f"{'=' * 72}")
-            progress(f"loading operator {label}")
-            t_load = perf_counter()
-            op = SpmvGRG(grg_path, cfg, dtype, index_dtype)
-            progress(f"{label}: operator ready in {(perf_counter() - t_load) * 1000.0:.2f} ms")
+        progress(f"{'=' * 72}")
+        progress(f"loading operator {label}")
+        t_load = perf_counter()
+        op = SpmvGRG(grg_path, entry.build_backend(), dtype, index_dtype)
+        progress(f"{label}: operator ready in {(perf_counter() - t_load) * 1000.0:.2f} ms")
 
-            cfg_rows, cfg_outputs = benchmark_config(
-                op=op,
-                label=label,
-                ks=ks,
-                options=options,
-                n_trials=n_trials,
-                n_warmup=n_warmup,
-                seed_base=seed_base,
-                output_dir=output_dir,
-                dtype=dtype,
-                output_atol=output_atol,
-                output_rtol=output_rtol,
-            )
-            all_summary_rows.extend(cfg_rows)
-            all_outputs.extend(cfg_outputs)
-            del op
-            gc.collect()
-
-        cross_stats, per_config_cross = evaluate_output_equivalence(all_outputs, atol=output_atol, rtol=output_rtol)
-        intra_errors, intra_trials = summarize_intra_diagnostics(all_summary_rows)
-        print_summary_table(all_summary_rows, skip_note=skip_note)
-        print(
-            "\nCorrectness diagnostics: "
-            f"intra_errors={intra_errors}/{intra_trials}, "
-            f"cross_errors={cross_stats['errors']}/{cross_stats['comparisons']}"
+        cfg_rows, cfg_outputs = benchmark_config(
+            op=op,
+            grg_ref=grg_ref,
+            label=label,
+            ks=ks,
+            options=options,
+            n_trials=n_trials,
+            n_warmup=n_warmup,
+            seed_base=seed_base,
+            dtype=dtype,
+            output_atol=output_atol,
+            output_rtol=output_rtol,
         )
-        config_order: dict[str, int] = {}
-        for idx, entry in enumerate(configs):
-            if entry.label not in config_order:
-                config_order[entry.label] = idx
-        print("Cross failures by config:")
-        ordered_cfgs = sorted(
-            config_order.keys(),
-            key=lambda cfg: (-int(per_config_cross.get(cfg, {}).get("failures", 0)), config_order[cfg]),
-        )
-        for cfg in ordered_cfgs:
-            stats = per_config_cross.get(cfg, {"failures": 0, "trials": 0})
-            failures = int(stats.get("failures", 0))
-            trials = int(stats.get("trials", 0))
-            rate = 0.0 if trials == 0 else 100.0 * float(failures) / float(trials)
-            print(f"  {cfg}: {failures}/{trials} ({rate:.1f}%)")
-    except Exception:
-        keep_output_dir = True
-        print(f"\nSaved benchmark reference outputs to: {output_dir}")
-        raise
-    finally:
-        if not keep_output_dir:
-            shutil.rmtree(output_dir, ignore_errors=True)
+        all_summary_rows.extend(cfg_rows)
+        all_outputs.extend(cfg_outputs)
+        del op
+        gc.collect()
+
+    cross_stats, per_config_cross = evaluate_output_equivalence(all_outputs, atol=output_atol, rtol=output_rtol)
+    intra_errors, intra_trials = summarize_intra_diagnostics(all_summary_rows)
+    ref_errors, ref_checked, ref_abs_max, ref_rel_max = _summarize_reference_diagnostics(all_summary_rows)
+    print_summary_table(all_summary_rows, skip_note=skip_note)
+    print(
+        "\nCorrectness diagnostics: "
+        f"intra_errors={intra_errors}/{intra_trials}, "
+        f"cross_errors={cross_stats['errors']}/{cross_stats['comparisons']}, "
+        f"ref_errors={ref_errors}/{ref_checked}, "
+        f"ref_abs_err_max={'n/a' if ref_abs_max is None else f'{ref_abs_max:.3e}'}, "
+        f"ref_rel_err_max={'n/a' if ref_rel_max is None else f'{ref_rel_max:.3e}'}"
+    )
+    config_order: dict[str, int] = {}
+    for idx, entry in enumerate(configs):
+        if entry.label not in config_order:
+            config_order[entry.label] = idx
+    print("Cross failures by config:")
+    ordered_cfgs = sorted(
+        config_order.keys(),
+        key=lambda cfg: (-int(per_config_cross.get(cfg, {}).get("failures", 0)), config_order[cfg]),
+    )
+    for cfg in ordered_cfgs:
+        stats = per_config_cross.get(cfg, {"failures": 0, "trials": 0})
+        failures = int(stats.get("failures", 0))
+        trials = int(stats.get("trials", 0))
+        rate = 0.0 if trials == 0 else 100.0 * float(failures) / float(trials)
+        print(f"  {cfg}: {failures}/{trials} ({rate:.1f}%)")
 
 
 __all__ = [
+    "_reference_output",
+    "_summarize_reference_diagnostics",
     "_validate_and_extract_runtime_memory",
     "benchmark_config",
     "run_benchmark_suite",

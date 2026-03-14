@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from pathlib import Path
-
 import numpy as np
 
 from scripts.bench.cli import OUTPUT_ATOL, OUTPUT_RTOL
@@ -166,27 +164,18 @@ def evaluate_output_equivalence(
         if len(points) < 2:
             continue
         checked_classes += 1
-        arr_cache: dict[str, np.ndarray] = {}
         for i in range(len(points) - 1):
             row_i = points[i]
             cfg_i = str(row_i["config"])
-            path_i = str(row_i["path"])
             if cfg_i not in per_config:
                 per_config[cfg_i] = {"failures": 0, "trials": 0}
-            arr_i = arr_cache.get(path_i)
-            if arr_i is None:
-                arr_i = np.load(Path(path_i), allow_pickle=False)
-                arr_cache[path_i] = arr_i
+            arr_i = np.asarray(row_i["output"])
             for j in range(i + 1, len(points)):
                 row_j = points[j]
                 cfg_j = str(row_j["config"])
-                path_j = str(row_j["path"])
                 if cfg_j not in per_config:
                     per_config[cfg_j] = {"failures": 0, "trials": 0}
-                arr_j = arr_cache.get(path_j)
-                if arr_j is None:
-                    arr_j = np.load(Path(path_j), allow_pickle=False)
-                    arr_cache[path_j] = arr_j
+                arr_j = np.asarray(row_j["output"])
                 compared += 1
                 per_config[cfg_i]["trials"] += 1
                 per_config[cfg_j]["trials"] += 1

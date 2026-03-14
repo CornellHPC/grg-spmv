@@ -47,14 +47,14 @@ def build_inputs_by_k(*, op, ks: list[int], seed_base: int, dtype: np.dtype) -> 
     inputs_by_k: dict[int, _BenchInputs] = {}
     for k in ks:
         rng = np.random.default_rng(seed_base + int(k))
-        up_sample = rng.standard_normal((k, op.n), dtype=dtype)
-        down = rng.standard_normal((k, op.m), dtype=dtype)
+        up_sample = rng.standard_normal((k, op.num_samples), dtype=dtype)
+        down = rng.standard_normal((k, op.num_mutations), dtype=dtype)
         init_vec = rng.standard_normal(k, dtype=dtype)
-        init_mat = rng.standard_normal((k, op.K), dtype=dtype)
-        miss_down = rng.standard_normal((k, op.m), dtype=dtype)
-        miss_up = np.zeros((k, op.m), dtype=dtype)
+        init_mat = rng.standard_normal((k, op.num_nodes), dtype=dtype)
+        miss_down = rng.standard_normal((k, op.num_mutations), dtype=dtype)
+        miss_up = np.zeros((k, op.num_mutations), dtype=dtype)
         up_indiv = None
-        if op.num_individuals != op.n:
+        if op.num_individuals != op.num_samples:
             up_indiv = rng.standard_normal((k, op.num_individuals), dtype=dtype)
         inputs_by_k[int(k)] = _BenchInputs(
             up_sample=up_sample,

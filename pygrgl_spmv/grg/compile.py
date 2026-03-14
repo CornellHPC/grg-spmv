@@ -25,12 +25,18 @@ class CompiledOperatorState:
     inv_sample_perm: np.ndarray
     sel_mut: sp.csr_matrix
     sel_miss: sp.csr_matrix
-    n: int
-    m: int
-    K: int
+    num_samples: int
+    num_mutations: int
+    num_nodes: int
     ploidy: int
     num_individuals: int
+    num_edges: int
+    has_missing_data: bool
     sample_to_individual: np.ndarray
+    mutation_positions: np.ndarray
+    mutation_times: np.ndarray
+    mutation_alleles: np.ndarray
+    mutation_ref_alleles: np.ndarray
     coalescence_counts: np.ndarray | None
     init_vector_up_bias: np.ndarray | None = None
     init_vector_down_bias: np.ndarray | None = None
@@ -43,8 +49,9 @@ class CompiledOperatorState:
         return BackendSetup(
             A_blocks=self.A_blocks,
             level_offsets=self.level_offsets,
-            n=self.n,
-            K=self.K,
+            num_samples=self.num_samples,
+            num_mutations=self.num_mutations,
+            num_nodes=self.num_nodes,
             sel_mut=self.sel_mut,
             sel_miss=self.sel_miss,
             sample_perm=self.sample_perm,
@@ -331,11 +338,35 @@ def _build_coalescence_counts(grg, *, node_perm: np.ndarray) -> np.ndarray | Non
     return counts_orig[node_perm]
 
 
+def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    positions: list[float] = []
+    times: list[float] = []
+    alleles: list[str] = []
+    ref_alleles: list[str] = []
+    for mutation_id in range(int(grg.num_mutations)):
+        mutation = grg.get_mutation_by_id(int(mutation_id))
+        positions.append(float(mutation.position))
+        times.append(float(mutation.time))
+        alleles.append(str(mutation.allele))
+        ref_alleles.append(str(mutation.ref_allele))
+
+    allele_width = max((len(value) for value in alleles), default=0)
+    ref_width = max((len(value) for value in ref_alleles), default=0)
+    return (
+        np.asarray(positions, dtype=np.float64),
+        np.asarray(times, dtype=np.float64),
+        np.asarray(alleles, dtype=f"<U{max(allele_width, 1)}"),
+        np.asarray(ref_alleles, dtype=f"<U{max(ref_width, 1)}"),
+    )
+
+
 def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOperatorState:
     """Compile a GRG object into the normalized sparse traversal layout."""
-    n, m, K = grg.num_samples, grg.num_mutations, grg.num_nodes
+    num_samples = int(grg.num_samples)
+    num_mutations = int(grg.num_mutations)
+    num_nodes = int(grg.num_nodes)
 
-    rows, cols, heights = _extract_edges_and_heights(grg, K, index_dtype=index_dtype)
+    rows, cols, heights = _extract_edges_and_heights(grg, num_nodes, index_dtype=index_dtype)
     perm_height, inv_perm_height, level_offsets, node_levels = _build_level_order(
         heights,
         index_dtype=index_dtype,
@@ -365,7 +396,7 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
         dtype=dtype,
     )
 
-    within_perm = np.arange(K, dtype=index_dtype)
+    within_perm = np.arange(num_nodes, dtype=index_dtype)
     for h in range(num_levels):
         lo, hi = int(level_offsets[h]), int(level_offsets[h + 1])
         perm = level_perms[h]
@@ -403,16 +434,17 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
     sel_mut, sel_miss = _build_selectors(
         grg,
         inv_final_perm=inv_final_perm,
-        m=m,
-        K=K,
+        m=num_mutations,
+        K=num_nodes,
         index_dtype=index_dtype,
         dtype=dtype,
     )
 
-    sample_to_individual = np.arange(n, dtype=index_dtype) // max(int(grg.ploidy), 1)
+    sample_to_individual = np.arange(num_samples, dtype=index_dtype) // max(int(grg.ploidy), 1)
     coalescence_counts = _build_coalescence_counts(grg, node_perm=final_perm)
+    mutation_positions, mutation_times, mutation_alleles, mutation_ref_alleles = _build_mutation_table(grg)
 
-    sample_perm = final_perm[:n].copy()
+    sample_perm = final_perm[:num_samples].copy()
     return CompiledOperatorState(
         A_blocks=A_blocks,
         level_offsets=level_offsets,
@@ -422,12 +454,18 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
         inv_sample_perm=_invert_permutation(sample_perm, index_dtype=index_dtype),
         sel_mut=sel_mut,
         sel_miss=sel_miss,
-        n=int(n),
-        m=int(m),
-        K=int(K),
+        num_samples=num_samples,
+        num_mutations=num_mutations,
+        num_nodes=num_nodes,
         ploidy=int(grg.ploidy),
         num_individuals=int(grg.num_individuals),
+        num_edges=int(grg.num_edges),
+        has_missing_data=bool(grg.has_missing_data),
         sample_to_individual=sample_to_individual,
+        mutation_positions=mutation_positions,
+        mutation_times=mutation_times,
+        mutation_alleles=mutation_alleles,
+        mutation_ref_alleles=mutation_ref_alleles,
         coalescence_counts=coalescence_counts,
     )
 

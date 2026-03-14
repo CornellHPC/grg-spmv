@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 from pygrgl_spmv.backends import _parse_optional_k_hint
 from pygrgl_spmv.backends.types import (
+    Direction,
     SparseFormat,
     StoredMatrix,
     parse_sparse_format,
@@ -27,32 +29,17 @@ class MklPlan:
         object.__setattr__(self, "k_hint", _parse_optional_k_hint(self.k_hint))
 
     @classmethod
-    def from_any(cls, value):
-        if value is None:
-            return None
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, dict):
-            allowed_keys = {"store", "fmt", "n_threads", "k_hint"}
-            extra = sorted(set(value) - allowed_keys)
-            if extra:
-                raise ValueError(f"Unknown MklPlan field(s): {extra}")
-            n_threads = int(value.get("n_threads", 0))
-            return cls(
-                store=parse_store(value["store"]),
-                fmt=parse_sparse_format(value["fmt"]),
-                n_threads=n_threads,
-                k_hint=_parse_optional_k_hint(value.get("k_hint")),
-            )
-        if hasattr(value, "store") and hasattr(value, "fmt"):
-            n_threads = int(getattr(value, "n_threads", 0))
-            return cls(
-                store=parse_store(getattr(value, "store")),
-                fmt=parse_sparse_format(getattr(value, "fmt")),
-                n_threads=n_threads,
-                k_hint=_parse_optional_k_hint(getattr(value, "k_hint", None)),
-            )
-        raise TypeError(f"Cannot construct MklPlan from {type(value).__name__}")
+    def from_dict(cls, value: Mapping[str, object]) -> "MklPlan":
+        allowed_keys = {"store", "fmt", "n_threads", "k_hint"}
+        extra = sorted(set(value) - allowed_keys)
+        if extra:
+            raise ValueError(f"Unknown MklPlan field(s): {extra}")
+        return cls(
+            store=parse_store(value["store"]),
+            fmt=parse_sparse_format(value["fmt"]),
+            n_threads=int(value.get("n_threads", 0)),
+            k_hint=_parse_optional_k_hint(value.get("k_hint")),
+        )
 
     def can_share_storage_with(self, other: "MklPlan") -> bool:
         if self.store == other.store:
@@ -68,5 +55,28 @@ class MklPlan:
             "]"
         )
 
+@dataclass(frozen=True)
+class MklPlanPair:
+    plan_up: MklPlan | None
+    plan_down: MklPlan | None
 
-__all__ = ["MklPlan"]
+    def __post_init__(self) -> None:
+        if self.plan_up is None and self.plan_down is None:
+            raise ValueError("At least one of plan_up/plan_down must be provided")
+
+    @classmethod
+    def from_dicts(
+        cls,
+        plan_up: Mapping[str, object] | None,
+        plan_down: Mapping[str, object] | None,
+    ) -> "MklPlanPair":
+        return cls(
+            plan_up=None if plan_up is None else MklPlan.from_dict(plan_up),
+            plan_down=None if plan_down is None else MklPlan.from_dict(plan_down),
+        )
+
+    def direction_enabled(self, direction: Direction) -> bool:
+        return (self.plan_up is not None) if direction == Direction.UP else (self.plan_down is not None)
+
+
+__all__ = ["MklPlan", "MklPlanPair"]

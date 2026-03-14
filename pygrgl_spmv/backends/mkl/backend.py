@@ -15,11 +15,9 @@ from pygrgl_spmv.backends import (
     BackendBase,
     BackendSetup,
     _sparse_host_bytes,
-    build_wavefront_level_stats,
     estimate_common_host_static_bytes,
     estimate_sparse_payload_bytes,
     iter_direction_level_pairs,
-    log_wavefront_profile,
     selector_rows_unique_from_csr_indptr,
     warn_k_hint_mismatch,
 )
@@ -35,7 +33,7 @@ from pygrgl_spmv.backends.types import (
     StoredMatrix,
     parse_init_mode,
 )
-from pygrgl_spmv.backends.mkl.plan import MklPlan
+from pygrgl_spmv.backends.mkl.plan import MklPlan, MklPlanPair
 
 
 @dataclass(frozen=True)
@@ -102,6 +100,46 @@ def _estimate_handle_payload_bytes(handle: MklSparseHandle) -> int:
     )
 
 
+def _level_call_stats(ops_by_level: list[list[object]]) -> tuple[np.ndarray, np.ndarray]:
+    calls = np.fromiter((len(ops) for ops in ops_by_level), dtype=np.int32, count=len(ops_by_level))
+    nnz = np.fromiter(
+        (sum(int(getattr(op, "nnz", 0)) for op in ops) for ops in ops_by_level),
+        dtype=np.int64,
+        count=len(ops_by_level),
+    )
+    return calls, nnz
+
+
+def _log_level_timing(
+    logger: logging.Logger,
+    *,
+    direction: Direction,
+    calls: np.ndarray,
+    nnz: np.ndarray,
+    level_ms: np.ndarray,
+) -> None:
+    records = [
+        (h, float(level_ms[h]), int(calls[h]), int(nnz[h]))
+        for h in range(len(level_ms))
+        if int(calls[h]) > 0
+    ]
+    if not records:
+        return
+
+    total_ms = sum(ms for _, ms, _, _ in records)
+    logger.debug("wavefront[%s] levels=%d total=%.3fms", direction.value, len(records), total_ms)
+    for h, ms, call_count, nnz_count in records:
+        pct = (100.0 * ms / total_ms) if total_ms > 0.0 else 0.0
+        logger.debug(
+            "  level=%2d ms=%.3f (%5.1f%%) calls=%3d nnz=%d",
+            h,
+            ms,
+            pct,
+            call_count,
+            nnz_count,
+        )
+
+
 class MklBackend(BackendBase):
     """
     MKL-accelerated backend using the Inspector-Executor Sparse BLAS API.
@@ -113,16 +151,15 @@ class MklBackend(BackendBase):
     def __init__(
         self,
         *,
-        plan_up: MklPlan,
-        plan_down: MklPlan,
+        pair: MklPlanPair,
         log_level: str = "WARNING",
+        instrumentation: bool = False,
     ):
-        up = None if plan_up is None else MklPlan.from_any(plan_up)
-        down = None if plan_down is None else MklPlan.from_any(plan_down)
         super().__init__(
-            plan_up=up,
-            plan_down=down,
+            plan_up=pair.plan_up,
+            plan_down=pair.plan_down,
             log_level=log_level,
+            instrumentation=instrumentation,
         )
         self._n_threads_up = self._resolve_thread_count(self._plan_up)
         self._n_threads_down = self._resolve_thread_count(self._plan_down)
@@ -280,7 +317,7 @@ class MklBackend(BackendBase):
         self._dtype = np.float64
         self._xtx_init = None
         if self._coalescence_counts is not None:
-            self._xtx_init = (2.0 * self._coalescence_counts.astype(self._dtype, copy=False)).reshape(self._K)
+            self._xtx_init = (2.0 * self._coalescence_counts.astype(self._dtype, copy=False)).reshape(self._num_nodes)
 
         requested_dtype = np.dtype(setup.dtype)
         if requested_dtype != np.float64:
@@ -356,23 +393,13 @@ class MklBackend(BackendBase):
             self._up_ops_owner,
             self._down_ops_owner,
         )
-        if self._logger.isEnabledFor(logging.DEBUG):
-            total_nnz_up = sum(op.nnz for ops in self._ops_up for op in ops)
-            total_nnz_down = sum(op.nnz for ops in self._ops_down for op in ops)
-            self._logger.debug(
-                "levels=%d up_ops_nnz=%d down_ops_nnz=%d",
-                len(self._level_offsets) - 1,
-                total_nnz_up,
-                total_nnz_down,
-            )
+        self._refresh_level_stats()
 
-        self._build_wavefront_level_stats()
+    def _refresh_level_stats(self) -> None:
+        self._ops_up_calls, self._ops_up_nnz = _level_call_stats(self._ops_up)
+        self._ops_down_calls, self._ops_down_nnz = _level_call_stats(self._ops_down)
 
-    def _build_wavefront_level_stats(self) -> None:
-        self._ops_up_calls, self._ops_up_nnz = build_wavefront_level_stats(self._ops_up)
-        self._ops_down_calls, self._ops_down_nnz = build_wavefront_level_stats(self._ops_down)
-
-    def _print_wavefront_profile(self, direction: Direction, level_ms: np.ndarray) -> None:
+    def _log_wavefront_levels(self, direction: Direction, level_ms: np.ndarray) -> None:
         match direction:
             case Direction.UP:
                 calls = self._ops_up_calls
@@ -382,7 +409,7 @@ class MklBackend(BackendBase):
                 nnz = self._ops_down_nnz
             case _:
                 raise ValueError(f"Unknown direction for wavefront profile: {direction!r}")
-        log_wavefront_profile(self._logger, direction=direction, calls=calls, nnz=nnz, level_ms=level_ms)
+        _log_level_timing(self._logger, direction=direction, calls=calls, nnz=nnz, level_ms=level_ms)
 
     def _propagate_direction_inplace(
         self,
@@ -427,7 +454,7 @@ class MklBackend(BackendBase):
         cols = self._selector_cols[selector]
         unique_rows = self._selector_row_unique[selector]
         k = node_values.shape[1]
-        out = np.zeros((self._m, k), dtype=self._dtype)
+        out = np.zeros((self._num_mutations, k), dtype=self._dtype)
         if rows.size == 0:
             return out
         values = node_values[cols]
@@ -453,11 +480,9 @@ class MklBackend(BackendBase):
         init_mode: InitMode,
         init: np.ndarray | None,
         need_miss_output: bool,
+        emit_all_nodes: bool,
     ) -> tuple[np.ndarray, np.ndarray | None] | np.ndarray:
         mkl_set_num_threads(spec.thread_count)
-        total_t0 = perf_counter()
-
-        t0 = perf_counter()
         x, k = self._normalize_primary_input(direction=spec.direction, primary=primary)
         self._warn_if_k_hint_mismatch(
             backend="MKL",
@@ -465,79 +490,58 @@ class MklBackend(BackendBase):
             runtime_k=k,
             k_hint=spec.plan.k_hint,
         )
-        parse_ms = (perf_counter() - t0) * 1000.0
 
         miss_arr = self._normalize_down_miss_input(miss, k=k) if spec.direction == Direction.DOWN else None
 
         mode = parse_init_mode(init_mode)
-        t0 = perf_counter()
         init_payload = self._validate_init(mode, init, k)
-        init_parse_ms = (perf_counter() - t0) * 1000.0
 
-        t0 = perf_counter()
-        node_values = np.zeros((self._K, k), dtype=self._dtype)
-        alloc_ms = (perf_counter() - t0) * 1000.0
-
-        t0 = perf_counter()
+        node_values = np.zeros((self._num_nodes, k), dtype=self._dtype)
         self._apply_init_inplace(node_values, mode, init_payload)
-        init_apply_ms = (perf_counter() - t0) * 1000.0
 
-        seed_ms = 0.0
-        seed_mut_ms = 0.0
-        seed_miss_ms = 0.0
-        t0 = perf_counter()
         if spec.direction == Direction.UP:
-            np.add(node_values[: self._n], x[self._sample_perm], out=node_values[: self._n])
-            seed_ms = (perf_counter() - t0) * 1000.0
+            np.add(node_values[: self._num_samples], x[self._sample_perm], out=node_values[: self._num_samples])
         else:
             self._selector_backward_add(x, "mut", node_values)
-            seed_mut_ms = (perf_counter() - t0) * 1000.0
             if miss_arr is not None:
-                t0 = perf_counter()
                 self._selector_backward_add(miss_arr, "miss", node_values)
-                seed_miss_ms = (perf_counter() - t0) * 1000.0
 
-        t0 = perf_counter()
-        track_wave = self._logger.isEnabledFor(logging.DEBUG)
+        track_wave = self._instrumentation and self._logger.isEnabledFor(logging.DEBUG)
         level_ms = np.zeros(len(self._level_offsets) - 1, dtype=np.float64) if track_wave else None
         self._propagate_direction_inplace(spec, node_values, level_ms=level_ms)
-        wave_ms = (perf_counter() - t0) * 1000.0
+
+        if emit_all_nodes:
+            if track_wave and level_ms is not None:
+                self._log_wavefront_levels(spec.direction, level_ms)
+            self.mem_usage.record(
+                stage=spec.stage_name,
+                runtime_k=k,
+                host_runtime=RuntimeBytes(
+                    level_buffers=int(node_values.nbytes),
+                    inputs=int(x.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
+                    outputs=int(node_values.nbytes),
+                    aux=int(
+                        (0 if init_payload is None else init_payload.nbytes)
+                        + (0 if level_ms is None else level_ms.nbytes)
+                    ),
+                ),
+                meta={
+                    "direction": spec.direction.value,
+                    "emit_all_nodes": True,
+                    "mode": "instrumented" if self._instrumentation else "n/a",
+                },
+            )
+            return node_values
 
         if spec.direction == Direction.UP:
-            t0 = perf_counter()
             out_mut = self._selector_forward(node_values, "mut")
-            select_mut_ms = (perf_counter() - t0) * 1000.0
 
             out_miss = None
-            select_miss_ms = 0.0
             if need_miss_output:
-                t0 = perf_counter()
                 out_miss = self._selector_forward(node_values, "miss")
-                select_miss_ms = (perf_counter() - t0) * 1000.0
 
-            if self._logger.isEnabledFor(logging.INFO):
-                total_ms = (perf_counter() - total_t0) * 1000.0
-                self._logger.info(
-                    (
-                        "mkl.run_up k=%d init=%s miss_out=%s: parse=%.3fms init_parse=%.3fms "
-                        "alloc=%.3fms init_apply=%.3fms seed=%.3fms wavefront=%.3fms "
-                        "select_mut=%.3fms select_miss=%.3fms total=%.3fms"
-                    ),
-                    k,
-                    mode.value,
-                    need_miss_output,
-                    parse_ms,
-                    init_parse_ms,
-                    alloc_ms,
-                    init_apply_ms,
-                    seed_ms,
-                    wave_ms,
-                    select_mut_ms,
-                    select_miss_ms,
-                    total_ms,
-                )
-                if track_wave and level_ms is not None:
-                    self._print_wavefront_profile(spec.direction, level_ms)
+            if track_wave and level_ms is not None:
+                self._log_wavefront_levels(spec.direction, level_ms)
             self.mem_usage.record(
                 stage=spec.stage_name,
                 runtime_k=k,
@@ -553,37 +557,15 @@ class MklBackend(BackendBase):
                 meta={
                     "direction": spec.direction.value,
                     "need_miss_output": bool(need_miss_output),
+                    "mode": "instrumented" if self._instrumentation else "n/a",
                 },
             )
             return out_mut, out_miss
 
-        t0 = perf_counter()
         out = node_values[self._inv_sample_perm]
-        gather_ms = (perf_counter() - t0) * 1000.0
 
-        if self._logger.isEnabledFor(logging.INFO):
-            total_ms = (perf_counter() - total_t0) * 1000.0
-            self._logger.info(
-                (
-                    "mkl.run_down k=%d init=%s miss_in=%s: parse=%.3fms init_parse=%.3fms "
-                    "alloc=%.3fms init_apply=%.3fms seed_mut=%.3fms seed_miss=%.3fms "
-                    "wavefront=%.3fms gather=%.3fms total=%.3fms"
-                ),
-                k,
-                mode.value,
-                miss_arr is not None,
-                parse_ms,
-                init_parse_ms,
-                alloc_ms,
-                init_apply_ms,
-                seed_mut_ms,
-                seed_miss_ms,
-                wave_ms,
-                gather_ms,
-                total_ms,
-            )
-            if track_wave and level_ms is not None:
-                self._print_wavefront_profile(spec.direction, level_ms)
+        if track_wave and level_ms is not None:
+            self._log_wavefront_levels(spec.direction, level_ms)
         self.mem_usage.record(
             stage=spec.stage_name,
             runtime_k=k,
@@ -599,6 +581,7 @@ class MklBackend(BackendBase):
             meta={
                 "direction": spec.direction.value,
                 "has_miss_input": bool(miss_arr is not None),
+                "mode": "instrumented" if self._instrumentation else "n/a",
             },
         )
         return out
@@ -619,6 +602,7 @@ class MklBackend(BackendBase):
             init_mode=init_mode,
             init=init,
             need_miss_output=need_miss_output,
+            emit_all_nodes=False,
         )
         return out_mut, out_miss
 
@@ -638,6 +622,45 @@ class MklBackend(BackendBase):
             init_mode=init_mode,
             init=init,
             need_miss_output=False,
+            emit_all_nodes=False,
+        )
+        return out
+
+    def run_up_nodes(
+        self,
+        primary: np.ndarray,
+        *,
+        init_mode: InitMode,
+        init: np.ndarray | None = None,
+    ) -> np.ndarray:
+        spec = self._require_direction_spec(Direction.UP)
+        out = self._run_direction(
+            spec,
+            primary,
+            miss=None,
+            init_mode=init_mode,
+            init=init,
+            need_miss_output=False,
+            emit_all_nodes=True,
+        )
+        return out
+
+    def run_down_nodes(
+        self,
+        primary: np.ndarray,
+        *,
+        init_mode: InitMode,
+        init: np.ndarray | None = None,
+    ) -> np.ndarray:
+        spec = self._require_direction_spec(Direction.DOWN)
+        out = self._run_direction(
+            spec,
+            primary,
+            miss=None,
+            init_mode=init_mode,
+            init=init,
+            need_miss_output=False,
+            emit_all_nodes=True,
         )
         return out
 

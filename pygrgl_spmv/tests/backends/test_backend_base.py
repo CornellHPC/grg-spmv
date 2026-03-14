@@ -6,7 +6,7 @@ import numpy as np
 import scipy.sparse as sp
 import pytest
 
-from pygrgl_spmv.backends import BackendSetup, ReferenceBackend
+from pygrgl_spmv.backends import BackendSetup, ReferenceBackend, ReferencePlanPair
 from pygrgl_spmv.backends.types import InitMode
 
 
@@ -39,15 +39,18 @@ def _make_toy_backend(coalescence_counts: np.ndarray | None = None) -> Reference
     inv_sample_perm = np.array([0, 1], dtype=np.int64)
 
     backend = ReferenceBackend(
-        plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
-        plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+        pair=ReferencePlanPair(
+            plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
+            plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+        ),
     )
     backend.setup(
         BackendSetup(
             A_blocks=A_blocks,
             level_offsets=level_offsets,
-            n=2,
-            K=4,
+            num_samples=2,
+            num_mutations=2,
+            num_nodes=4,
             sel_mut=sel_mut,
             sel_miss=sel_miss,
             sample_perm=sample_perm,
