@@ -315,9 +315,9 @@ class MklBackend(BackendBase):
         mkl_set_num_threads(self._n_threads_setup)
         self._apply_setup_state(setup)
         self._dtype = np.float64
-        self._xtx_init = None
+        self._xtx_host = None
         if self._coalescence_counts is not None:
-            self._xtx_init = (2.0 * self._coalescence_counts.astype(self._dtype, copy=False)).reshape(self._num_nodes)
+            self._xtx_host = (2.0 * self._coalescence_counts.astype(self._dtype, copy=False)).reshape(self._num_nodes)
 
         requested_dtype = np.dtype(setup.dtype)
         if requested_dtype != np.float64:
@@ -358,7 +358,7 @@ class MklBackend(BackendBase):
             sample_perm=self._sample_perm,
             inv_sample_perm=self._inv_sample_perm,
             coalescence_counts=self._coalescence_counts,
-            xtx_init=self._xtx_init,
+            xtx_init=self._xtx_host,
         )
         self.mem_usage.host_static.level_offsets = common_host.level_offsets
         self.mem_usage.host_static.sample_perm = common_host.sample_perm
@@ -484,12 +484,13 @@ class MklBackend(BackendBase):
     ) -> tuple[np.ndarray, np.ndarray | None] | np.ndarray:
         mkl_set_num_threads(spec.thread_count)
         x, k = self._normalize_primary_input(direction=spec.direction, primary=primary)
-        self._warn_if_k_hint_mismatch(
-            backend="MKL",
-            direction=spec.direction,
-            runtime_k=k,
-            k_hint=spec.plan.k_hint,
-        )
+        if spec.plan.k_hint is not None and int(k) != int(spec.plan.k_hint):
+            warn_k_hint_mismatch(
+                backend="MKL",
+                direction=spec.direction,
+                runtime_k=k,
+                k_hint=int(spec.plan.k_hint),
+            )
 
         miss_arr = self._normalize_down_miss_input(miss, k=k) if spec.direction == Direction.DOWN else None
 
@@ -670,7 +671,7 @@ class MklBackend(BackendBase):
             sample_perm=self._sample_perm,
             inv_sample_perm=self._inv_sample_perm,
             coalescence_counts=self._coalescence_counts,
-            xtx_init=self._xtx_init,
+            xtx_init=self._xtx_host,
         )
         device = StaticBytes()
 

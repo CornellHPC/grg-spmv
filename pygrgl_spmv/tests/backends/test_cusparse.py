@@ -12,6 +12,7 @@ import pytest
 
 from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlan, CusparsePlanPair, is_valid_combo
+from pygrgl_spmv.backends.types import Direction
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
     INDEX_DTYPE,
@@ -39,6 +40,8 @@ def _make_op(
     k_hint=None,
     algo_up="default",
     algo_down="default",
+    scratch_up="none",
+    scratch_down="none",
     log_level="WARNING",
     instrumentation=False,
     dtype=DATA_DTYPE,
@@ -52,6 +55,8 @@ def _make_op(
             k_hint=k_hint,
             algo_up=algo_up,
             algo_down=algo_down,
+            scratch_up=scratch_up,
+            scratch_down=scratch_down,
             log_level=log_level,
             instrumentation=instrumentation,
         ),
@@ -295,13 +300,44 @@ def test_hint_none_keeps_graphs_disabled(primary_grg_path, gt_small):
     op = _make_op(primary_grg_path, fmt_up="csr", k_hint=None)
     X, _ = gt_small.get("forward", 4, seed=5000, dtype=DATA_DTYPE)
     _ = _run_up(op, X)
-    ws = op._backend._workspaces.dynamic
+    ws = op._backend._workspaces.dynamic_up
     assert ws is not None
     assert op._backend._workspaces.graph_up is None
     assert op._backend._workspaces.graph_down is None
     assert ws.k == 4
-    assert ws.up.graph is None
-    assert ws.down.graph is None
+    assert ws.graph is None
+    assert op._backend._workspaces.dynamic_down is None
+
+
+def test_graph_workspaces_built_during_setup(primary_grg_path):
+    op = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=4)
+    backend = op._backend
+    assert backend._workspaces.graph_up is not None
+    assert backend._workspaces.graph_down is not None
+    assert backend._workspaces.graph_up.graph is not None
+    assert backend._workspaces.graph_down.graph is not None
+    assert backend._workspaces.dynamic_up is None
+    assert backend._workspaces.dynamic_down is None
+    assert backend.mem_usage.device_static.workspace > 0
+
+
+def test_graph_workspace_keeps_optional_buffers_lazy(primary_grg_path):
+    op = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=1)
+    backend = op._backend
+    ws_up = backend._workspaces.graph_up
+    ws_down = backend._workspaces.graph_down
+    assert ws_up is not None and ws_down is not None
+    before_up = id(ws_up)
+    before_down = id(ws_down)
+    assert backend._staging_up_by_k == {}
+
+    X = np.ones((op.num_samples, 1), dtype=DATA_DTYPE)
+    _ = op.matmul(X.T, "up", emit_all_nodes=True, init="xtx").T
+
+    assert 1 in backend._staging_up_by_k
+    assert backend._staging_up_by_k[1].xtx_bias is not None
+    assert id(backend._workspaces.graph_up) == before_up
+    assert id(backend._workspaces.graph_down) == before_down
 
 
 def test_dynamic_workspace_reused_for_same_k(primary_grg_path, gt_small):
@@ -309,10 +345,10 @@ def test_dynamic_workspace_reused_for_same_k(primary_grg_path, gt_small):
     X1, _ = gt_small.get("forward", 1, seed=5006, dtype=DATA_DTYPE)
     with pytest.warns(RuntimeWarning, match="k_hint"):
         _ = _run_up(op, X1)
-    ws1 = op._backend._workspaces.dynamic
+    ws1 = op._backend._workspaces.dynamic_up
     with pytest.warns(RuntimeWarning, match="k_hint"):
         _ = _run_up(op, X1)
-    ws2 = op._backend._workspaces.dynamic
+    ws2 = op._backend._workspaces.dynamic_up
     assert ws1 is ws2
     assert ws2 is not None
     assert ws2.k == 1
@@ -324,10 +360,10 @@ def test_dynamic_workspace_recreated_when_k_changes(primary_grg_path, gt_small):
     X2, _ = gt_small.get("forward", 2, seed=5008, dtype=DATA_DTYPE)
     with pytest.warns(RuntimeWarning, match="k_hint"):
         _ = _run_up(op, X1)
-    ws1 = op._backend._workspaces.dynamic
+    ws1 = op._backend._workspaces.dynamic_up
     with pytest.warns(RuntimeWarning, match="k_hint"):
         _ = _run_up(op, X2)
-    ws2 = op._backend._workspaces.dynamic
+    ws2 = op._backend._workspaces.dynamic_up
     assert ws1 is not ws2
     assert ws2 is not None
     assert ws2.k == 2
@@ -342,7 +378,7 @@ def test_graph_fallback_preserves_static_graph(primary_grg_path, gt_small):
         np.testing.assert_allclose(_run_down(op, X1), Y1_exp, atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(_run_down(op, X4), Y4_exp, atol=1e-5, rtol=1e-5)
     assert op._backend._workspaces.graph_down is not None
-    assert op._backend._workspaces.graph_down.down.graph is not None
+    assert op._backend._workspaces.graph_down.graph is not None
 
 
 def test_debug_log_level_keeps_graph_mode(primary_grg_path, gt_small):
@@ -355,8 +391,17 @@ def test_debug_log_level_keeps_graph_mode(primary_grg_path, gt_small):
     assert op._backend.mem_usage.calls[-1].meta["mode"] == "graph"
     assert op._backend._workspaces.graph_up is not None
     assert op._backend._workspaces.graph_down is not None
-    assert op._backend._workspaces.graph_up.up.graph is not None
-    assert op._backend._workspaces.graph_down.down.graph is not None
+    assert op._backend._workspaces.graph_up.graph is not None
+    assert op._backend._workspaces.graph_down.graph is not None
+
+
+def test_debug_log_level_reports_block_memory(primary_grg_path, caplog):
+    with caplog.at_level(logging.DEBUG):
+        op = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=1, log_level="DEBUG")
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("cuSPARSE blocks_up" in msg and "rows=" in msg and "nnz=" in msg and "indices_bytes=" in msg for msg in messages)
+    assert any("cuSPARSE block dir=up" in msg and "cols=" in msg and "nnz=" in msg for msg in messages)
+    del op
 
 
 def test_instrumentation_disables_graph_mode(primary_grg_path, gt_small):
@@ -365,8 +410,10 @@ def test_instrumentation_disables_graph_mode(primary_grg_path, gt_small):
     x_up, y_up = gt_small.get("forward", 4, seed=5005, dtype=DATA_DTYPE)
     np.testing.assert_allclose(_run_up(op, x_up), y_up, atol=1e-5, rtol=1e-5)
     assert op._backend.mem_usage.calls[-1].meta["mode"] == "instrumented"
+    assert op._backend._workspaces.dynamic_up is not None
     assert op._backend._workspaces.graph_up is None
     assert op._backend._workspaces.graph_down is None
+    assert op._backend.mem_usage.device_static.workspace == 0
 
 
 def test_transpose_compatible_storage_aliases_payload_but_not_descriptors(primary_grg_path):
@@ -406,11 +453,188 @@ def test_transpose_compatible_storage_aliases_payload_but_not_descriptors(primar
             src_level = row_index + dst_level + 1
             up_block = backend._blocks_up[src_level][dst_level]
             assert up_block is not None
-            assert tuple(buf.data.ptr for buf in down_block.buffers) == tuple(buf.data.ptr for buf in up_block.buffers)
+            assert tuple(buf.data.ptr for buf in down_block.index_buffers) == tuple(buf.data.ptr for buf in up_block.index_buffers)
+            assert down_block.data_ptr == up_block.data_ptr
             assert down_block.graph_desc.value != up_block.graph_desc.value
             assert down_block.dynamic_desc.value != up_block.dynamic_desc.value
             return
     raise AssertionError("expected at least one shared cuSPARSE block alias")
+
+
+def test_cusparse_csr_csc_blocks_share_one_shared_ones_pointer(primary_grg_path):
+    op = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=None)
+    backend = op._backend
+    shared = backend._shared_ones
+    assert shared is not None
+    data_ptrs = {
+        int(block.data_ptr)
+        for grid in (backend._blocks_up, backend._blocks_down)
+        for row in grid
+        for block in row
+        if block is not None
+    }
+    assert data_ptrs == {int(shared.ptr)}
+
+
+def test_cusparse_coo_blocks_share_one_shared_ones_pointer(primary_grg_path):
+    op = _make_op(primary_grg_path, fmt_up="coo", fmt_down="coo", k_hint=None, algo_up="coo_alg1", algo_down="coo_alg2")
+    backend = op._backend
+    shared = backend._shared_ones
+    assert shared is not None
+    data_ptrs = {
+        int(block.data_ptr)
+        for grid in (backend._blocks_up, backend._blocks_down)
+        for row in grid
+        for block in row
+        if block is not None
+    }
+    assert data_ptrs == {int(shared.ptr)}
+
+
+def test_cusparse_shared_ones_use_materialized_array_when_vmm_unsupported(primary_grg_path, monkeypatch, caplog):
+    import pygrgl_spmv.backends.cusparse.backend as cusparse_backend_mod
+
+    monkeypatch.setattr(cusparse_backend_mod.CudaVmmDriver, "current_context", lambda self: 1)
+    monkeypatch.setattr(cusparse_backend_mod.CudaVmmDriver, "vmm_supported", lambda self, device_id: False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with caplog.at_level(logging.INFO):
+            op = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=None, log_level="INFO")
+    backend = op._backend
+    shared = backend._shared_ones
+    assert shared is not None
+    assert shared.vmm is False
+    assert shared.physical_nbytes == shared.logical_nbytes
+    assert caught == []
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("cuSPARSE shared ones: mode=materialized reason=vmm-unsupported" in msg for msg in messages)
+    data_ptrs = {
+        int(block.data_ptr)
+        for grid in (backend._blocks_up, backend._blocks_down)
+        for row in grid
+        for block in row
+        if block is not None
+    }
+    assert data_ptrs == {int(shared.ptr)}
+
+
+def test_cusparse_shared_ones_log_materialized_when_vmm_saves_no_memory(primary_grg_path, monkeypatch, caplog):
+    import pygrgl_spmv.backends.cusparse.backend as cusparse_backend_mod
+
+    monkeypatch.setattr(cusparse_backend_mod.CudaVmmDriver, "current_context", lambda self: 1)
+    monkeypatch.setattr(cusparse_backend_mod.CudaVmmDriver, "vmm_supported", lambda self, device_id: True)
+    monkeypatch.setattr(
+        cusparse_backend_mod.CudaVmmDriver,
+        "allocation_granularity",
+        lambda self, device_id, *, recommended: 1 << 30 if not recommended else 1 << 31,
+    )
+    monkeypatch.setattr(
+        cusparse_backend_mod.CusparseBackend,
+        "_build_vmm_shared_ones",
+        lambda self, **kwargs: (_ for _ in ()).throw(AssertionError("VMM path should not be used")),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with caplog.at_level(logging.INFO):
+            op = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=None, log_level="INFO")
+    shared = op._backend._shared_ones
+    assert shared is not None
+    assert shared.vmm is False
+    assert caught == []
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("cuSPARSE shared ones: mode=materialized reason=no-memory-savings" in msg for msg in messages)
+
+
+def test_cusparse_shared_ones_log_vmm_when_physical_bytes_drop(primary_grg_path, monkeypatch, caplog):
+    import pygrgl_spmv.backends.cusparse.backend as cusparse_backend_mod
+
+    original_max_block_nnz = cusparse_backend_mod.CusparseBackend._max_block_nnz
+
+    def fake_build_vmm_shared_ones(self, *, driver, device_id, logical_nbytes, tile_nbytes):
+        arr = self._cp.ones((logical_nbytes // int(self._dtype.itemsize),), dtype=self._dtype)
+        return cusparse_backend_mod._SharedOnes(
+            ptr=int(arr.data.ptr),
+            logical_nbytes=logical_nbytes,
+            physical_nbytes=tile_nbytes,
+            vmm=True,
+            _materialized=arr,
+            _reserved_nbytes=cusparse_backend_mod._round_up(logical_nbytes, tile_nbytes),
+        )
+
+    monkeypatch.setattr(cusparse_backend_mod.CusparseBackend, "_max_block_nnz", lambda self: max(original_max_block_nnz(self), 16))
+    monkeypatch.setattr(cusparse_backend_mod.CudaVmmDriver, "current_context", lambda self: 1)
+    monkeypatch.setattr(cusparse_backend_mod.CudaVmmDriver, "vmm_supported", lambda self, device_id: True)
+    monkeypatch.setattr(
+        cusparse_backend_mod.CudaVmmDriver,
+        "allocation_granularity",
+        lambda self, device_id, *, recommended: 64 if not recommended else 128,
+    )
+    monkeypatch.setattr(cusparse_backend_mod.CusparseBackend, "_build_vmm_shared_ones", fake_build_vmm_shared_ones)
+    with caplog.at_level(logging.INFO):
+        op = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=None, log_level="INFO")
+    shared = op._backend._shared_ones
+    assert shared is not None
+    assert shared.vmm is True
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any(
+        "cuSPARSE shared ones: mode=vmm reason=physical-bytes-reduced" in msg and "reserve_alignment=64" in msg
+        for msg in messages
+    )
+
+
+def test_cusparse_shared_ones_warn_when_vmm_build_fails(primary_grg_path, monkeypatch, caplog):
+    import pygrgl_spmv.backends.cusparse.backend as cusparse_backend_mod
+
+    original_max_block_nnz = cusparse_backend_mod.CusparseBackend._max_block_nnz
+
+    monkeypatch.setattr(cusparse_backend_mod.CusparseBackend, "_max_block_nnz", lambda self: max(original_max_block_nnz(self), 16))
+    monkeypatch.setattr(cusparse_backend_mod.CudaVmmDriver, "current_context", lambda self: 1)
+    monkeypatch.setattr(cusparse_backend_mod.CudaVmmDriver, "vmm_supported", lambda self, device_id: True)
+    monkeypatch.setattr(
+        cusparse_backend_mod.CudaVmmDriver,
+        "allocation_granularity",
+        lambda self, device_id, *, recommended: 64 if not recommended else 128,
+    )
+    monkeypatch.setattr(
+        cusparse_backend_mod.CusparseBackend,
+        "_build_vmm_shared_ones",
+        lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    with caplog.at_level(logging.INFO):
+        with pytest.warns(RuntimeWarning, match="cuSPARSE shared ones falling back to one materialized all-ones array: boom"):
+            op = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=None, log_level="INFO")
+    shared = op._backend._shared_ones
+    assert shared is not None
+    assert shared.vmm is False
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("cuSPARSE shared ones: mode=materialized reason=vmm-build-failed" in msg for msg in messages)
+
+
+def test_cusparse_vmm_driver_forwards_reserve_alignment(monkeypatch):
+    import ctypes
+
+    import pygrgl_spmv.backends.cusparse.ffi as cusparse_ffi
+
+    class _FakeCudaDriverLib:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def cuInit(self, flags):
+            return cusparse_ffi.CUDA_SUCCESS
+
+        def cuMemAddressReserve(self, addr_ptr, size, alignment, addr, flags):
+            self.calls.append((int(size.value), int(alignment.value)))
+            ctypes.cast(addr_ptr, ctypes.POINTER(ctypes.c_ulonglong))[0] = 0x1234000
+            return cusparse_ffi.CUDA_SUCCESS
+
+    fake = _FakeCudaDriverLib()
+    monkeypatch.setattr(cusparse_ffi, "_load_cuda_driver_library", lambda: fake)
+
+    driver = cusparse_ffi.CudaVmmDriver()
+    addr = driver.address_reserve(4096, alignment_bytes=2097152)
+
+    assert addr == 0x1234000
+    assert fake.calls == [(4096, 2097152)]
 
 
 def test_setup_releases_host_sparse_payloads(primary_grg_path):
@@ -451,6 +675,83 @@ def test_instrumented_cusparse_emits_nvtx_markers(primary_grg_path, gt_small):
     assert "event.record_ready" in names
     assert "join_ready" in names
     assert "collect_outputs" in names
+
+
+def test_cusparse_scratch_buffers_allocated_for_enabled_levels(primary_grg_path):
+    op = _make_op(
+        primary_grg_path,
+        fmt_up="csr",
+        fmt_down="csc",
+        k_hint=4,
+        scratch_up="1",
+        scratch_down="0",
+    )
+    backend = op._backend
+    ws_up = backend._workspaces.graph_up
+    ws_down = backend._workspaces.graph_down
+    assert ws_up is not None and ws_down is not None
+    assert len(ws_up.scratch_views_by_level[1]) == len(backend._ops_up[1]) > 0
+    assert len(ws_up.scratch_dst_descs_by_level[1]) == len(backend._ops_up[1])
+    assert len(ws_up.scratch_done_events_by_level[1]) == len(backend._ops_up[1])
+    assert ws_up.scratch_views_by_level[0] == []
+    assert len(ws_down.scratch_views_by_level[0]) == len(backend._ops_down[0]) > 0
+    assert ws_down.scratch_views_by_level[1] == []
+
+
+def test_instrumented_cusparse_scratch_emits_reduction_markers(primary_grg_path, gt_small):
+    op = _make_op(
+        primary_grg_path,
+        fmt_up="csr",
+        fmt_down=None,
+        k_hint=None,
+        scratch_up="1",
+        instrumentation=True,
+    )
+    recorder = _NvtxRecorder()
+    op._backend._nvtx = recorder
+    x_up, _ = gt_small.get("forward", 2, seed=5010, dtype=DATA_DTYPE)
+    _ = _run_up(op, x_up)
+    names = [name for _, name, _ in recorder.events]
+    assert "helper_launch" in names
+    assert "event.record_scratch_done" in names
+    assert "wait_scratch_done" in names
+    assert "reduce_add" in names
+
+
+def test_cusparse_scratch_enabled_up_matches_reference(primary_grg_path, gt_small):
+    op = _make_op(
+        primary_grg_path,
+        fmt_up="csr",
+        fmt_down=None,
+        k_hint=None,
+        scratch_up="1",
+    )
+    X, Y_expected = gt_small.get("forward", 4, seed=5011, dtype=DATA_DTYPE)
+    atol, rtol = tol(DATA_DTYPE)
+    np.testing.assert_allclose(_run_up(op, X), Y_expected, atol=atol, rtol=rtol)
+
+
+def test_cusparse_scratch_enabled_down_matches_reference(primary_grg_path, gt_small):
+    op = _make_op(
+        primary_grg_path,
+        fmt_up=None,
+        fmt_down="csc",
+        k_hint=None,
+        scratch_down="0",
+    )
+    X, Y_expected = gt_small.get("backward", 4, seed=5012, dtype=DATA_DTYPE)
+    atol, rtol = tol(DATA_DTYPE)
+    np.testing.assert_allclose(_run_down(op, X), Y_expected, atol=atol, rtol=rtol)
+
+
+def test_cusparse_graph_vs_dynamic_with_scratch(primary_grg_path):
+    op_graph = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=4, scratch_up="1", scratch_down="0")
+    op_dynamic = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=None, scratch_up="1", scratch_down="0")
+    rng = np.random.default_rng(7010)
+    V = rng.standard_normal((op_graph.num_samples, 4), dtype=DATA_DTYPE)
+    W = rng.standard_normal((op_graph.num_mutations, 4), dtype=DATA_DTYPE)
+    np.testing.assert_allclose(op_graph.matmul(V.T, "up").T, op_dynamic.matmul(V.T, "up").T, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(op_graph.matmul(W.T, "down").T, op_dynamic.matmul(W.T, "down").T, atol=1e-5, rtol=1e-5)
 
 
 def test_graph_vs_dynamic(primary_grg_path):
@@ -561,6 +862,35 @@ def test_runtime_logging_skips_warning_for_doc_cuda(caplog, monkeypatch):
         assert not any("CusparsePlan semantics are grounded in the CUDA 12.9.0" in msg for msg in messages)
     finally:
         del backend
+
+
+def test_cusparse_buffer_size_warning_on_plan_disagreement(primary_grg_path, monkeypatch, caplog):
+    op = _make_op(primary_grg_path, fmt_up="csr", fmt_down=None, k_hint=None)
+    backend = op._backend
+    monkeypatch.setattr(type(backend._plan_up), "need_buffer", property(lambda self: False))
+    monkeypatch.setattr(backend._cslib, "spmm_buffer_size", lambda *args: 8)
+    monkeypatch.setattr(backend._cslib, "spmm_preprocess", lambda *args: None)
+    with caplog.at_level(logging.WARNING):
+        ws = backend._build_direction_workspace(Direction.UP, 1, use_graph_descs=False)
+    try:
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any("bufferSize disagrees with plan.need_buffer" in msg for msg in messages)
+    finally:
+        ws.destroy(cslib=backend._cslib)
+
+
+def test_cusparse_skips_preprocess_when_plan_disables_it(primary_grg_path, monkeypatch):
+    op = _make_op(primary_grg_path, fmt_up="csr", fmt_down=None, k_hint=None)
+    backend = op._backend
+    monkeypatch.setattr(type(backend._plan_up), "need_preprocess", property(lambda self: False))
+    monkeypatch.setattr(backend._cslib, "spmm_buffer_size", lambda *args: 8)
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(backend._cslib, "spmm_preprocess", lambda *args: calls.append(args))
+    ws = backend._build_direction_workspace(Direction.UP, 1, use_graph_descs=False)
+    try:
+        assert calls == []
+    finally:
+        ws.destroy(cslib=backend._cslib)
 
 
 def test_cusparse_runtime_loads_after_torch_import():

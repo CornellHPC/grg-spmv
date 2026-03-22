@@ -185,8 +185,9 @@ def _expand_triton_side(spec: PlanSpec | None, *, want_up: bool):
     missing = sorted(required_keys - set(spec))
     if missing:
         raise ValueError(f"Missing Triton plan field(s): {missing}")
-    if str(spec["k_hint"]).strip() != "1":
-        raise ValueError(f"Triton benchmark plans require k_hint=1, got {spec['k_hint']!r}")
+    k_hint_token = str(spec["k_hint"]).strip().lower()
+    if k_hint_token not in {"1", "none"}:
+        raise ValueError(f"Triton benchmark plans require k_hint=none or 1, got {spec['k_hint']!r}")
     scratch = str(spec.get("scratch", "none")).strip()
     if scratch == "*" or scratch.startswith("!"):
         raise ValueError(f"Triton benchmark scratch does not support wildcard/negation, got {scratch!r}")
@@ -195,7 +196,7 @@ def _expand_triton_side(spec: PlanSpec | None, *, want_up: bool):
     stores = _expand_triton_candidates(spec["store"], list(StoredMatrix), parse_store, field_name="store")
     fmts = _expand_triton_candidates(spec["fmt"], [SparseFormat.CSR, SparseFormat.CSC], parse_sparse_format, field_name="fmt")
     plans = [
-        TritonPlan.from_dict({"k_hint": 1, "store": store.value, "fmt": fmt.value, "scratch": scratch})
+        TritonPlan.from_dict({"k_hint": None if k_hint_token == "none" else 1, "store": store.value, "fmt": fmt.value, "scratch": scratch})
         for store in stores
         if store == required_store
         for fmt in fmts

@@ -24,16 +24,14 @@ import pandas as pd
 import statsmodels.formula.api as smf
 
 
-_SUMMARY_HEADER = "BENCHMARK SUMMARY (time + memory + correctness diagnostics)"
+_SUMMARY_HEADER = "BENCHMARK RUNTIME SUMMARY (time + correctness diagnostics)"
 _SUMMARY_END = "Correctness diagnostics:"
 _RUNTIME_ROW_RE = re.compile(
     r"^(?P<config>.+?)\s+baseline\s+(?P<direction>up|down)\s+(?P<k>\d+)\s+"
     r"(?P<mean_ms>[0-9.]+)\+/-[0-9.]+\s+"
     r"(?P<err_trials>\d+/\d+)\s+"
     r"(?P<abs_err>\S+)\s+"
-    r"(?P<rel_err>\S+)\s+"
-    r"(?P<host_gib>\S+)\s+"
-    r"(?P<device_gib>\S+)"
+    r"(?P<rel_err>\S+)"
     r"(?:\s+(?P<note>.*))?$"
 )
 _LABELED_PLAN_RE = re.compile(r"(?:^|-)(up|down)=(\[[^\]]+\]|<unspecified>)")
@@ -60,7 +58,6 @@ class ParsedRow:
     k: int
     mean_ms: float
     err_trials: str
-    device_gib: float
     note: str
     plan_fields: dict[str, str]
 
@@ -148,7 +145,6 @@ def parse_full_log(path: Path, *, expected_direction: str) -> pd.DataFrame:
                 k=int(match.group("k")),
                 mean_ms=float(match.group("mean_ms")),
                 err_trials=match.group("err_trials"),
-                device_gib=float(match.group("device_gib")),
                 note=(match.group("note") or "").strip(),
                 plan_fields=_parse_plan_literal(_extract_plan_literal(match.group("config"), direction)),
             )
@@ -164,7 +160,6 @@ def parse_full_log(path: Path, *, expected_direction: str) -> pd.DataFrame:
                 "k": row.k,
                 "mean_ms": row.mean_ms,
                 "err_trials": row.err_trials,
-                "device_gib": row.device_gib,
                 "note": row.note,
                 **row.plan_fields,
             }
@@ -225,7 +220,6 @@ def summarize_model(model) -> pd.DataFrame:
 def top_configs(df: pd.DataFrame, *, limit: int) -> pd.DataFrame:
     cols = [
         "mean_ms",
-        "device_gib",
         "store",
         "fmt",
         "opA",

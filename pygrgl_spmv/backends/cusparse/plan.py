@@ -2,9 +2,9 @@
 
 The planner is intentionally pure and small: it parses explicit plan literals,
 normalizes enum values, and exposes doc-driven properties such as support,
-determinism, and storage sharing. Runtime execution still allocates buffers and
-runs preprocess unconditionally for now; ``need_buffer`` and
-``need_preprocess`` are future-optimization metadata.
+determinism, and storage sharing. Runtime execution consumes ``need_buffer`` and
+``need_preprocess`` directly, while still auditing ``need_buffer`` against the
+queried ``cusparseSpMM_bufferSize`` result.
 
 The rules in this module are grounded on the CUDA 12.9.0 cuSPARSE SpMM docs:
 https://docs.nvidia.com/cuda/archive/12.9.0/cusparse/index.html#cusparsespmm
@@ -40,6 +40,7 @@ from pygrgl_spmv.backends.types import SparseFormat, StoredMatrix, parse_sparse_
 
 _LITERAL_RE = re.compile(r"^\[(.*)\]$")
 _REQUIRED_KEYS = ("k_hint", "store", "fmt", "opA", "opB", "orderB", "orderC", "algo")
+_OPTIONAL_KEYS = ("scratch",)
 _DOC_CUDA_VERSION = (12, 9, 0)
 _SUPPORTED_CUDA_MAJOR = 12
 
@@ -168,6 +169,30 @@ def _expand_candidates(raw: str, all_values, parser, *, field_name: str):
     return [parser(token)]
 
 
+def _normalize_scratch(value: object) -> str:
+    token = "none" if value is None else str(value).strip().lower()
+    if token in {"", "none"}:
+        return "none"
+    if token == "all":
+        return "all"
+    if token == "*" or token.startswith("!"):
+        raise ValueError(f"cuSPARSE scratch does not support wildcard/negation, got {value!r}")
+    parts = token.split("|")
+    if any(part == "" for part in parts):
+        raise ValueError(f"Invalid cuSPARSE scratch specification: {value!r}")
+    levels: list[int] = []
+    seen: set[int] = set()
+    for part in parts:
+        level = int(part)
+        if level < 0:
+            raise ValueError(f"cuSPARSE scratch levels must be non-negative, got {value!r}")
+        if level in seen:
+            raise ValueError(f"Duplicate cuSPARSE scratch level {level} in {value!r}")
+        seen.add(level)
+        levels.append(level)
+    return "|".join(str(level) for level in sorted(levels))
+
+
 
 
 @dataclass(frozen=True)
@@ -182,9 +207,11 @@ class CusparsePlan:
     order_b: DenseOrder
     order_c: DenseOrder
     algo: SpMMAlgorithm
+    scratch: str = "none"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "k_hint", _parse_k_hint(self.k_hint))
+        object.__setattr__(self, "scratch", _normalize_scratch(self.scratch))
 
     @property
     def cuda_version(self) -> tuple[int, int, int]:
@@ -192,7 +219,8 @@ class CusparsePlan:
 
     @classmethod
     def from_dict(cls, mapping: Mapping[str, object]) -> "CusparsePlan":
-        extra = sorted(set(mapping) - set(_REQUIRED_KEYS))
+        allowed_keys = set(_REQUIRED_KEYS) | set(_OPTIONAL_KEYS)
+        extra = sorted(set(mapping) - allowed_keys)
         if extra:
             raise ValueError(f"Unknown CusparsePlan field(s): {extra}")
         missing = [key for key in _REQUIRED_KEYS if key not in mapping]
@@ -207,6 +235,7 @@ class CusparsePlan:
             order_b=_parse_dense_order(mapping["orderB"]),
             order_c=_parse_dense_order(mapping["orderC"]),
             algo=_parse_algo(mapping["algo"]),
+            scratch=mapping.get("scratch", "none"),
         )
 
     @classmethod
@@ -221,6 +250,7 @@ class CusparsePlan:
         mapping = parse_plan_literal(raw)
         if mapping["k_hint"] == "*":
             raise ValueError("k_hint must not be '*' in plan literals")
+        scratch = _normalize_scratch(mapping.get("scratch", "none"))
         candidates = {
             "k_hint": [_parse_k_hint(mapping["k_hint"])],
             "store": _expand_candidates(mapping["store"], list(StoredMatrix), parse_store, field_name="store"),
@@ -250,6 +280,7 @@ class CusparsePlan:
                 order_b=order_b,
                 order_c=order_c,
                 algo=algo,
+                scratch=scratch,
             )
             if plan.supported:
                 plans.append(plan)
@@ -312,7 +343,8 @@ class CusparsePlan:
             f"opB={self.op_b.name},"
             f"orderB={self.order_b.name},"
             f"orderC={self.order_c.name},"
-            f"algo={self.algo.name}"
+            f"algo={self.algo.name},"
+            f"scratch={self.scratch}"
             "]"
         )
 
@@ -326,6 +358,7 @@ class CusparsePlan:
             int(self.order_b),
             int(self.order_c),
             int(self.algo),
+            self.scratch,
         )
 
 
@@ -386,7 +419,7 @@ def parse_plan_literal(raw: str) -> dict[str, str]:
     missing = [key for key in _REQUIRED_KEYS if key not in mapping]
     if missing:
         raise ValueError(f"Missing plan field(s) {missing} in {raw!r}")
-    extra = sorted(set(mapping) - set(_REQUIRED_KEYS))
+    extra = sorted(set(mapping) - (set(_REQUIRED_KEYS) | set(_OPTIONAL_KEYS)))
     if extra:
         raise ValueError(f"Unknown plan field(s) {extra} in {raw!r}")
     return mapping

@@ -74,6 +74,7 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
+testpaths = ["pygrgl_spmv/tests"]
 markers = [
     "smoke: core fast tests selected by --smoke",
     "gpu: tests requiring a GPU (CuPy + cuSPARSE)",

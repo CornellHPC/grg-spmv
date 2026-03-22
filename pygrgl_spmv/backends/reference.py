@@ -15,6 +15,7 @@ from pygrgl_spmv.backends.base import (
     _sparse_host_bytes,
     estimate_common_host_static_bytes,
 )
+from pygrgl_spmv.backends.memory import RuntimeBytes
 from pygrgl_spmv.backends.types import (
     Direction,
     InitMode,
@@ -99,7 +100,7 @@ class ReferenceBackend(BackendBase):
             sample_perm=self._sample_perm,
             inv_sample_perm=self._inv_sample_perm,
             coalescence_counts=self._coalescence_counts,
-            xtx_init=self._xtx_init,
+            xtx_init=self._xtx_host,
         )
         self.mem_usage.host_static.level_offsets = common_host.level_offsets
         self.mem_usage.host_static.sample_perm = common_host.sample_perm
@@ -175,12 +176,12 @@ class ReferenceBackend(BackendBase):
         self.mem_usage.record(
             stage="run_up",
             runtime_k=k,
-            host_runtime={
-                "level_buffers": int(node_values.nbytes),
-                "inputs": int(X.nbytes),
-                "outputs": int(out_mut.nbytes + (0 if out_miss is None else out_miss.nbytes)),
-                "aux": 0 if payload is None else int(payload.nbytes),
-            },
+            host_runtime=RuntimeBytes(
+                level_buffers=int(node_values.nbytes),
+                inputs=int(X.nbytes),
+                outputs=int(out_mut.nbytes + (0 if out_miss is None else out_miss.nbytes)),
+                aux=0 if payload is None else int(payload.nbytes),
+            ),
             meta={"direction": "up", "need_miss_output": bool(need_miss_output)},
         )
         return out_mut, out_miss
@@ -221,12 +222,12 @@ class ReferenceBackend(BackendBase):
         self.mem_usage.record(
             stage="run_down",
             runtime_k=k,
-            host_runtime={
-                "level_buffers": int(node_values.nbytes),
-                "inputs": int(X.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
-                "outputs": int(out.nbytes),
-                "aux": 0 if payload is None else int(payload.nbytes),
-            },
+            host_runtime=RuntimeBytes(
+                level_buffers=int(node_values.nbytes),
+                inputs=int(X.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
+                outputs=int(out.nbytes),
+                aux=0 if payload is None else int(payload.nbytes),
+            ),
             meta={"direction": "down", "has_miss_input": bool(miss_arr is not None)},
         )
         return out

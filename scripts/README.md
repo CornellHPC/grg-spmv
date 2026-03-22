@@ -7,7 +7,7 @@ Backend-specific entrypoints:
 - `python -m scripts.bench.triton`
 
 Each script expands explicit backend plan pairs, runs the requested scenarios,
-then prints one unified summary table.
+then prints separate runtime and memory summary tables.
 
 Both entrypoints call the same shared benchmark runner and therefore execute
 the same stress/correctness workflow (intra-case + cross-config diagnostics).
@@ -20,7 +20,7 @@ Internal layout:
 - `scripts/bench/run.py`: benchmark execution and runtime diagnostics
 - `scripts/bench/report.py`: summary rendering and output-equivalence checks
 
-## Summary table
+## Runtime table
 
 Columns:
 
@@ -32,21 +32,39 @@ Columns:
 - `Err/Trials`
 - `Abs Err (avg/max)`
 - `Rel Err (avg/max)`
+- `Note`
+
+Row semantics:
+
+- one row per timed runtime case
+- the runner performs one untimed preflight call first, so timed rows reflect steady-state behavior even when `--warmup=0`
+- `Err/Trials = intra_errors/intra_trials` over warmup+timed outputs relative to the preflight output
+- directions with no configured plan are omitted entirely
+- skip rows show `Call ms=SKIP (...)`
+
+## Memory table
+
+Columns:
+
+- `Config`
+- `Scenario`
+- `Direction`
+- `k`
+- `Kind`
 - `Host GiB`
 - `Device GiB`
 - `Note`
 
 Row semantics:
 
-- `static`: measured static memory (`grg._backend.mem_usage.host_static/device_static`)
-- `static_est`: estimated static memory (`backend.estimate_static_bytes()`)
-- runtime rows: per-scenario timed calls and runtime memory
-- runtime rows also include correctness diagnostics:
-  - `Err/Trials = intra_errors/intra_trials` (intra-case only)
-  - `Abs Err (avg/max)`: average/max absolute error over intra comparisons
-  - `Rel Err (avg/max)`: average/max relative error over intra comparisons
-- directions with no configured plan are omitted entirely
-- skip rows: `Call ms=SKIP (...)`, memory columns `SKIP`
+- each executed runtime case expands into four rows:
+  - `Total GiB`
+  - `Static WS GiB`
+  - `Dynamic WS GiB`
+  - `Staging GiB`
+- `Total GiB` comes from the recorded runtime totals
+- the three `* GiB` residency rows report retained workspace/staging bytes
+- skip cases emit four memory rows with `Host GiB=SKIP` / `Device GiB=SKIP`
 
 ## Output equivalence checks
 
@@ -85,8 +103,8 @@ for slower observability/profiling behavior:
 `--plan-up-down` uses two adjacent bracketed plan literals:
 
 ```text
-[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]
-[k_hint=none,store=T,fmt=CSC,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]
+[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]
+[k_hint=none,store=T,fmt=CSC,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]
 ```
 
 Pass them as one argument with no delimiter between the two bracket groups:
@@ -95,10 +113,11 @@ Pass them as one argument with no delimiter between the two bracket groups:
 --plan-up-down="[...][...]"
 ```
 
-For cuSPARSE, `*` is allowed for every field except `k_hint`. Negation is also supported for enum-like fields, for example `fmt=!COO` or `fmt=!CSR!CSC`. Empty sides are allowed: `[][PLAN]` means benchmark DOWN only, `[PLAN][]` means benchmark UP only. The current executor now supports the broader docs-valid dense-side plan space, including `opB=T` and column-major `orderB/orderC`. Unsupported combinations such as `CSC + CSR_ALG3` are rejected directly by `CusparsePlan.supported`.
+For cuSPARSE, `*` is allowed for every field except `k_hint`. Negation is also supported for enum-like fields, for example `fmt=!COO` or `fmt=!CSR!CSC`. `scratch` is a concrete execution-policy field and accepts `none`, `all`, or an explicit level list such as `1|2`; wildcard and negation are not supported for `scratch`. Empty sides are allowed: `[][PLAN]` means benchmark DOWN only, `[PLAN][]` means benchmark UP only. The current executor now supports the broader docs-valid dense-side plan space, including `opB=T` and column-major `orderB/orderC`. Unsupported combinations such as `CSC + CSR_ALG3` are rejected directly by `CusparsePlan.supported`.
 
 For Triton, benchmark plans currently expose only `k_hint`, `store`, and `fmt`.
-`k_hint` must be `1`. Wildcards and negation are supported for `store` and `fmt`.
+`k_hint` must be either `none` or `1`. Wildcards and negation are supported
+for `store` and `fmt`, but not for `k_hint`.
 One-sided dry-run examples:
 
 ```bash

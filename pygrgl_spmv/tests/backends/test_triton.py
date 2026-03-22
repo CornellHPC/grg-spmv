@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import logging
 import numpy as np
 import pytest
 
@@ -28,6 +29,7 @@ def _make_op(
     cache_dir,
     fmt_up="csr",
     fmt_down="csc",
+    k_hint=1,
     scratch_up="none",
     scratch_down="none",
     log_level="WARNING",
@@ -39,7 +41,7 @@ def _make_op(
         make_triton_backend(
             fmt_up=fmt_up,
             fmt_down=fmt_down,
-            k_hint=1,
+            k_hint=k_hint,
             scratch_up=scratch_up,
             scratch_down=scratch_down,
             log_level=log_level,
@@ -72,13 +74,46 @@ def test_triton_graphs_created_after_setup(primary_grg_path, spmv_cache_dir):
 
 @pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
 def test_triton_instrumentation_skips_graph_setup(primary_grg_path, spmv_cache_dir):
-    with pytest.warns(RuntimeWarning, match="instrumentation=True"):
+    with pytest.warns(RuntimeWarning, match="ignores k_hint"):
         op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, instrumentation=True)
     backend = op._backend
-    assert backend._workspaces.dynamic_up is not None
-    assert backend._workspaces.dynamic_down is not None
+    assert backend._workspaces.dynamic_up is None
+    assert backend._workspaces.dynamic_down is None
     assert backend._workspaces.graph_up is None
     assert backend._workspaces.graph_down is None
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_graph_workspace_keeps_optional_buffers_lazy(primary_grg_path, spmv_cache_dir):
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, fmt_up="csr", fmt_down="csc")
+    backend = op._backend
+    ws_up = backend._workspaces.graph_up
+    ws_down = backend._workspaces.graph_down
+    assert ws_up is not None and ws_down is not None
+    before_up = id(ws_up)
+    before_down = id(ws_down)
+    assert backend._staging_up is None
+    assert backend._staging_down is None
+
+    x_up = np.ones((1, op.num_samples), dtype=DATA_DTYPE)
+    _ = op.matmul(x_up, "up", emit_all_nodes=True, init="xtx")
+
+    assert backend._staging_up is not None
+    assert backend._staging_up.xtx_bias is not None
+    assert id(backend._workspaces.graph_up) == before_up
+    assert id(backend._workspaces.graph_down) == before_down
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_hint_none_uses_dynamic_mode(primary_grg_path, spmv_cache_dir):
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, k_hint=None)
+    backend = op._backend
+    assert backend._workspaces.graph_up is None
+    assert backend._workspaces.graph_down is None
+    x_up = np.ones((1, op.num_samples), dtype=DATA_DTYPE)
+    _ = op.matmul(x_up, "up")
+    assert backend.mem_usage.calls[-1].meta["mode"] == "dynamic"
+    assert backend._workspaces.dynamic_up is not None
 
 
 @pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
@@ -185,8 +220,8 @@ def test_triton_scratch_buffers_allocated_for_enabled_levels(primary_grg_path, s
         scratch_down="0",
     )
     backend = op._backend
-    ws_up = backend._workspaces.dynamic_up
-    ws_down = backend._workspaces.dynamic_down
+    ws_up = backend._workspaces.graph_up
+    ws_down = backend._workspaces.graph_down
     assert ws_up is not None and ws_down is not None
     assert len(ws_up.scratch_views_by_level[1]) == len(backend._ops_up[1]) > 0
     assert len(ws_up.scratch_streams_by_level[1]) == len(backend._ops_up[1])
@@ -209,6 +244,16 @@ def test_triton_debug_log_level_keeps_graph_mode(primary_grg_path, gt_small, spm
     assert op._backend._workspaces.graph_up.graph is not None
     assert op._backend._workspaces.graph_down is not None
     assert op._backend._workspaces.graph_down.graph is not None
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_debug_log_level_reports_block_memory(primary_grg_path, spmv_cache_dir, caplog):
+    with caplog.at_level(logging.DEBUG):
+        op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, log_level="DEBUG")
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("Triton blocks_up" in msg and "rows=" in msg and "nnz=" in msg and "indices_bytes=" in msg for msg in messages)
+    assert any("Triton block dir=up" in msg and "cols=" in msg and "nnz=" in msg for msg in messages)
+    del op
 
 
 @pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")

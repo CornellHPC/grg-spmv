@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping
 
 
 @dataclass
@@ -50,11 +49,23 @@ class RuntimeBytes:
 
 
 @dataclass
+class ResidencyBytes:
+    """Retained residency for one reporting bucket."""
+
+    host_bytes: int = 0
+    device_bytes: int = 0
+    note: str = ""
+
+
+@dataclass
 class MemoryRecord:
     stage: str
     runtime_k: int | None
     host: RuntimeBytes = field(default_factory=RuntimeBytes)
     device: RuntimeBytes = field(default_factory=RuntimeBytes)
+    static_ws: ResidencyBytes = field(default_factory=ResidencyBytes)
+    dynamic_ws: ResidencyBytes = field(default_factory=ResidencyBytes)
+    staging: ResidencyBytes = field(default_factory=ResidencyBytes)
     meta: dict[str, object] = field(default_factory=dict)
 
 
@@ -76,44 +87,53 @@ class MemoryUsage:
         *,
         stage: str,
         runtime_k: int | None,
-        host_runtime: RuntimeBytes | Mapping[str, int] | None = None,
-        device_runtime: RuntimeBytes | Mapping[str, int] | None = None,
-        meta: Mapping[str, object] | None = None,
+        host_runtime: RuntimeBytes | None = None,
+        device_runtime: RuntimeBytes | None = None,
+        static_ws: ResidencyBytes | None = None,
+        dynamic_ws: ResidencyBytes | None = None,
+        staging: ResidencyBytes | None = None,
+        meta: dict[str, object] | None = None,
     ) -> None:
-        host = _normalize_runtime(host_runtime)
-        device = _normalize_runtime(device_runtime)
         self.calls.append(
             MemoryRecord(
                 stage=str(stage),
                 runtime_k=None if runtime_k is None else int(runtime_k),
-                host=host,
-                device=device,
+                host=RuntimeBytes() if host_runtime is None else RuntimeBytes(
+                    level_buffers=int(host_runtime.level_buffers),
+                    inputs=int(host_runtime.inputs),
+                    outputs=int(host_runtime.outputs),
+                    aux=int(host_runtime.aux),
+                ),
+                device=RuntimeBytes() if device_runtime is None else RuntimeBytes(
+                    level_buffers=int(device_runtime.level_buffers),
+                    inputs=int(device_runtime.inputs),
+                    outputs=int(device_runtime.outputs),
+                    aux=int(device_runtime.aux),
+                ),
+                static_ws=ResidencyBytes() if static_ws is None else ResidencyBytes(
+                    host_bytes=int(static_ws.host_bytes),
+                    device_bytes=int(static_ws.device_bytes),
+                    note=str(static_ws.note),
+                ),
+                dynamic_ws=ResidencyBytes() if dynamic_ws is None else ResidencyBytes(
+                    host_bytes=int(dynamic_ws.host_bytes),
+                    device_bytes=int(dynamic_ws.device_bytes),
+                    note=str(dynamic_ws.note),
+                ),
+                staging=ResidencyBytes() if staging is None else ResidencyBytes(
+                    host_bytes=int(staging.host_bytes),
+                    device_bytes=int(staging.device_bytes),
+                    note=str(staging.note),
+                ),
                 meta=dict(meta) if meta else {},
             )
         )
 
 
-def _normalize_runtime(values: RuntimeBytes | Mapping[str, int] | None) -> RuntimeBytes:
-    if values is None:
-        return RuntimeBytes()
-    if isinstance(values, RuntimeBytes):
-        return RuntimeBytes(
-            level_buffers=int(values.level_buffers),
-            inputs=int(values.inputs),
-            outputs=int(values.outputs),
-            aux=int(values.aux),
-        )
-    runtime = RuntimeBytes()
-    for key, value in values.items():
-        if not hasattr(runtime, key):
-            raise KeyError(f"Unknown runtime memory attribute: {key!r}")
-        setattr(runtime, key, int(value))
-    return runtime
-
-
 __all__ = [
     "MemoryRecord",
     "MemoryUsage",
+    "ResidencyBytes",
     "RuntimeBytes",
     "StaticBytes",
 ]

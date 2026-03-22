@@ -8,7 +8,19 @@ high-level cuSPARSE calls.
 import ctypes
 import logging
 import os
-from ctypes import c_int, c_int64, c_size_t, c_void_p, byref, POINTER
+from ctypes import (
+    POINTER,
+    byref,
+    c_char_p,
+    c_int,
+    c_int64,
+    c_size_t,
+    c_uint,
+    c_ulonglong,
+    c_ubyte,
+    c_ushort,
+    c_void_p,
+)
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +57,15 @@ CUSPARSE_SPMM_CSR_ALG1 = 4
 CUSPARSE_SPMM_CSR_ALG2 = 6
 CUSPARSE_SPMM_CSR_ALG3 = 12
 
+# CUDA Driver API constants used by the VMM-backed shared ones source.
+CUDA_SUCCESS = 0
+CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = 102
+CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
+CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = 1
+CU_MEM_ALLOCATION_TYPE_PINNED = 1
+CU_MEM_LOCATION_TYPE_DEVICE = 1
+CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,6 +75,18 @@ def _check_status(status, func_name):
     """Raise RuntimeError on cuSPARSE error."""
     if status != CUSPARSE_STATUS_SUCCESS:
         raise RuntimeError(f"cuSPARSE {func_name} failed with status {status}")
+
+
+def _check_driver_status(lib, status, func_name):
+    """Raise RuntimeError on CUDA Driver API error."""
+    if status != CUDA_SUCCESS:
+        err_str = c_char_p()
+        try:
+            lib.cuGetErrorString(status, byref(err_str))
+        except Exception:
+            pass
+        message = None if err_str.value is None else err_str.value.decode("utf-8", errors="replace")
+        raise RuntimeError(f"CUDA driver {func_name} failed with status {status}: {message or '<unknown>'}")
 
 
 def cuda_dtype(np_dtype):
@@ -133,6 +166,39 @@ def _resolve_library_path(name: str, dirs: list[Path]) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+class CUmemLocation(ctypes.Structure):
+    _fields_ = [
+        ("type", c_int),
+        ("id", c_int),
+    ]
+
+
+class _CUmemAllocationPropFlags(ctypes.Structure):
+    _fields_ = [
+        ("compressionType", c_ubyte),
+        ("gpuDirectRDMACapable", c_ubyte),
+        ("usage", c_ushort),
+        ("reserved", c_ubyte * 4),
+    ]
+
+
+class CUmemAllocationProp(ctypes.Structure):
+    _fields_ = [
+        ("type", c_int),
+        ("requestedHandleTypes", c_int),
+        ("location", CUmemLocation),
+        ("win32HandleMetaData", c_void_p),
+        ("allocFlags", _CUmemAllocationPropFlags),
+    ]
+
+
+class CUmemAccessDesc(ctypes.Structure):
+    _fields_ = [
+        ("location", CUmemLocation),
+        ("flags", c_ulonglong),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +289,49 @@ def _setup_cusparse_signatures(lib):
     lib.cusparseSpMM.restype = c_int
 
 
+def _setup_cuda_driver_signatures(lib):
+    """Set argtypes/restype on the CUDA Driver API functions used for VMM."""
+
+    lib.cuInit.argtypes = [c_uint]
+    lib.cuInit.restype = c_int
+
+    lib.cuGetErrorString.argtypes = [c_int, POINTER(c_char_p)]
+    lib.cuGetErrorString.restype = c_int
+
+    lib.cuDeviceGet.argtypes = [POINTER(c_int), c_int]
+    lib.cuDeviceGet.restype = c_int
+
+    lib.cuDeviceGetAttribute.argtypes = [POINTER(c_int), c_int, c_int]
+    lib.cuDeviceGetAttribute.restype = c_int
+
+    lib.cuCtxGetCurrent.argtypes = [POINTER(c_void_p)]
+    lib.cuCtxGetCurrent.restype = c_int
+
+    lib.cuMemGetAllocationGranularity.argtypes = [POINTER(c_size_t), POINTER(CUmemAllocationProp), c_int]
+    lib.cuMemGetAllocationGranularity.restype = c_int
+
+    lib.cuMemCreate.argtypes = [POINTER(c_ulonglong), c_size_t, POINTER(CUmemAllocationProp), c_ulonglong]
+    lib.cuMemCreate.restype = c_int
+
+    lib.cuMemAddressReserve.argtypes = [POINTER(c_ulonglong), c_size_t, c_size_t, c_ulonglong, c_ulonglong]
+    lib.cuMemAddressReserve.restype = c_int
+
+    lib.cuMemMap.argtypes = [c_ulonglong, c_size_t, c_size_t, c_ulonglong, c_ulonglong]
+    lib.cuMemMap.restype = c_int
+
+    lib.cuMemSetAccess.argtypes = [c_ulonglong, c_size_t, POINTER(CUmemAccessDesc), c_size_t]
+    lib.cuMemSetAccess.restype = c_int
+
+    lib.cuMemUnmap.argtypes = [c_ulonglong, c_size_t]
+    lib.cuMemUnmap.restype = c_int
+
+    lib.cuMemRelease.argtypes = [c_ulonglong]
+    lib.cuMemRelease.restype = c_int
+
+    lib.cuMemAddressFree.argtypes = [c_ulonglong, c_size_t]
+    lib.cuMemAddressFree.restype = c_int
+
+
 def _load_cusparse_library():
     """Load libcusparse.so and configure all ctypes signatures."""
     nvjit_path = _resolve_library_path("libnvJitLink.so.12", _candidate_library_dirs(for_cusparse=False))
@@ -246,6 +355,19 @@ def _load_cusparse_library():
         "<default>" if nvjit_path is None else str(nvjit_path),
         cusparse_ref,
     )
+    return lib
+
+
+def _load_cuda_driver_library():
+    """Load libcuda.so.1 and configure the Driver API signatures needed for VMM."""
+    driver_path = _resolve_library_path("libcuda.so.1", _candidate_library_dirs(for_cusparse=False))
+    driver_ref = "libcuda.so.1" if driver_path is None else str(driver_path)
+    driver_mode = _RTLD_GLOBAL | _RTLD_NOW
+    if _RTLD_DEEPBIND:
+        driver_mode |= _RTLD_DEEPBIND
+    lib = ctypes.CDLL(driver_ref, mode=driver_mode)
+    _setup_cuda_driver_signatures(lib)
+    _LOGGER.debug("Loaded CUDA driver runtime libcuda=%s", driver_ref)
     return lib
 
 
@@ -341,9 +463,9 @@ class CuSparseLib:
 
     # --- SpMM operations ----------------------------------------------------
 
-    def spmm_buffer_size(self, cp, algo, op_a, op_b,
+    def spmm_buffer_size(self, algo, op_a, op_b,
                          alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc, cdt):
-        """Query SpMM buffer size and allocate workspace. Returns cupy array."""
+        """Query SpMM workspace size in bytes."""
         buf_size = c_size_t(0)
         _check_status(self._lib.cusparseSpMM_bufferSize(
             self._handle, c_int(op_a), c_int(op_b),
@@ -351,7 +473,7 @@ class CuSparseLib:
             c_void_p(beta_ptr), C_desc,
             c_int(cdt), c_int(algo), byref(buf_size),
         ), 'cusparseSpMM_bufferSize')
-        return cp.zeros(max(buf_size.value, 4), dtype=cp.uint8)
+        return int(buf_size.value)
 
     def spmm_preprocess(self, algo, op_a, op_b,
                         alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc,
@@ -393,3 +515,127 @@ class CuSparseLib:
         )
         v = ver.value
         return f"{v // 10000}.{(v % 10000) // 100}.{v % 100}"
+
+
+class CudaVmmDriver:
+    """Small CUDA Driver API wrapper for VMM-backed shared ones."""
+
+    def __init__(self):
+        self._lib = _load_cuda_driver_library()
+        _check_driver_status(self._lib, self._lib.cuInit(0), "cuInit")
+
+    def current_context(self) -> int | None:
+        ctx = c_void_p()
+        _check_driver_status(self._lib, self._lib.cuCtxGetCurrent(byref(ctx)), "cuCtxGetCurrent")
+        return None if ctx.value is None else int(ctx.value)
+
+    def device_handle(self, device_id: int) -> int:
+        handle = c_int()
+        _check_driver_status(self._lib, self._lib.cuDeviceGet(byref(handle), c_int(int(device_id))), "cuDeviceGet")
+        return int(handle.value)
+
+    def vmm_supported(self, device_id: int) -> bool:
+        value = c_int()
+        _check_driver_status(
+            self._lib,
+            self._lib.cuDeviceGetAttribute(
+                byref(value),
+                c_int(CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED),
+                c_int(self.device_handle(device_id)),
+            ),
+            "cuDeviceGetAttribute",
+        )
+        return bool(value.value)
+
+    def allocation_granularity(self, device_id: int, *, recommended: bool) -> int:
+        prop = CUmemAllocationProp()
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.requestedHandleTypes = 0
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location.id = int(self.device_handle(device_id))
+        granularity = c_size_t()
+        _check_driver_status(
+            self._lib,
+            self._lib.cuMemGetAllocationGranularity(
+                byref(granularity),
+                byref(prop),
+                c_int(CU_MEM_ALLOC_GRANULARITY_RECOMMENDED if recommended else CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+            ),
+            "cuMemGetAllocationGranularity",
+        )
+        return int(granularity.value)
+
+    def mem_create(self, device_id: int, size_bytes: int) -> int:
+        prop = CUmemAllocationProp()
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.requestedHandleTypes = 0
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location.id = int(self.device_handle(device_id))
+        handle = c_ulonglong()
+        _check_driver_status(
+            self._lib,
+            self._lib.cuMemCreate(byref(handle), c_size_t(int(size_bytes)), byref(prop), c_ulonglong(0)),
+            "cuMemCreate",
+        )
+        return int(handle.value)
+
+    def address_reserve(self, size_bytes: int, *, alignment_bytes: int = 0) -> int:
+        addr = c_ulonglong()
+        _check_driver_status(
+            self._lib,
+            self._lib.cuMemAddressReserve(
+                byref(addr),
+                c_size_t(int(size_bytes)),
+                c_size_t(int(alignment_bytes)),
+                c_ulonglong(0),
+                c_ulonglong(0),
+            ),
+            "cuMemAddressReserve",
+        )
+        return int(addr.value)
+
+    def mem_map(self, addr: int, size_bytes: int, handle: int) -> None:
+        _check_driver_status(
+            self._lib,
+            self._lib.cuMemMap(
+                c_ulonglong(int(addr)),
+                c_size_t(int(size_bytes)),
+                c_size_t(0),
+                c_ulonglong(int(handle)),
+                c_ulonglong(0),
+            ),
+            "cuMemMap",
+        )
+
+    def mem_set_access(self, addr: int, size_bytes: int, device_id: int) -> None:
+        access = CUmemAccessDesc()
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE
+        access.location.id = int(self.device_handle(device_id))
+        access.flags = c_ulonglong(CU_MEM_ACCESS_FLAGS_PROT_READWRITE)
+        _check_driver_status(
+            self._lib,
+            self._lib.cuMemSetAccess(
+                c_ulonglong(int(addr)),
+                c_size_t(int(size_bytes)),
+                byref(access),
+                c_size_t(1),
+            ),
+            "cuMemSetAccess",
+        )
+
+    def mem_unmap(self, addr: int, size_bytes: int) -> None:
+        _check_driver_status(
+            self._lib,
+            self._lib.cuMemUnmap(c_ulonglong(int(addr)), c_size_t(int(size_bytes))),
+            "cuMemUnmap",
+        )
+
+    def mem_release(self, handle: int) -> None:
+        _check_driver_status(self._lib, self._lib.cuMemRelease(c_ulonglong(int(handle))), "cuMemRelease")
+
+    def address_free(self, addr: int, size_bytes: int) -> None:
+        _check_driver_status(
+            self._lib,
+            self._lib.cuMemAddressFree(c_ulonglong(int(addr)), c_size_t(int(size_bytes))),
+            "cuMemAddressFree",
+        )

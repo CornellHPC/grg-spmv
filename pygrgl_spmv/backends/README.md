@@ -11,6 +11,12 @@ This document describes how memory usage is tracked for all backends through
 2. `device_static: StaticBytes`
 3. `calls: list[MemoryRecord]`
 
+Each runtime `MemoryRecord` now also carries retained residency buckets:
+
+- `static_ws`
+- `dynamic_ws`
+- `staging`
+
 ### Static memory (`StaticBytes`) keys
 
 - `level_offsets`
@@ -24,12 +30,32 @@ This document describes how memory usage is tracked for all backends through
 - `selector_miss`
 - `workspace`
 
+For the GPU backends, `workspace` means setup-retained execution workspaces
+only. GPU XTX bias is no longer backend-owned static state, so `xtx_init`
+remains zero for GPU static accounting.
+
 ### Runtime memory (`RuntimeBytes`) keys
 
 - `level_buffers`
 - `inputs`
 - `outputs`
 - `aux`
+
+GPU runtime accounting reports the active runtime footprint in `RuntimeBytes`.
+Retained workspace/staging bytes are reported separately through the residency
+buckets. `aux` includes retained inactive bytes that are not part of the
+current `level_buffers` / `inputs` / `outputs` slices.
+
+### Residency buckets
+
+- `static_ws`: setup-retained static workspaces
+- `dynamic_ws`: lazily created dynamic workspaces
+- `staging`: miss/output/init/XTX state
+
+For the GPU backends, the intended ownership split is:
+
+- workspaces hold execution state only
+- staging holds optional miss/output/init/XTX state
 
 ### Actual vs Estimated static memory
 
@@ -51,8 +77,9 @@ Backends are constructed from explicit backend-specific plan-pair objects.
 - `MklPlan` carries MKL-specific storage/runtime hints (`store`, `fmt`,
   `n_threads`, `k_hint`)
 - `CusparsePlan` carries explicit cuSPARSE SpMM choices (`store`, `fmt`,
-  `opA`, `opB`, `orderB`, `orderC`, `algo`, and `k_hint`); the current CUDA
-  runtime version remains available as an environment-derived property
+  `opA`, `opB`, `orderB`, `orderC`, `algo`, `scratch`, and `k_hint`); the
+  current CUDA runtime version remains available as an environment-derived
+  property
 - each backend exposes a backend-specific `*PlanPair` type that validates
   its `plan_up` / `plan_down` pair before backend construction
 
@@ -84,15 +111,43 @@ verbosity and must not change execution mode by itself.
   the other unless both traversals truly share the same handle and transpose
   mode
 
+## Triton backend details
+
+- sparse blocks are structure-only device CSR/CSC payloads
+- graph and dynamic workspaces are kept as separate concepts even though the
+  current kernels only support singleton-vector execution
+- public `k_hint` accepts only `none` or `1`
+- `instrumentation=True` ignores configured `k_hint` and uses the effective
+  `k_hint=none` path
+- optional miss/output/init/XTX buffers live in per-direction staging
+- `device_static.workspace` counts only retained graph workspaces
+
 ## cuSPARSE backend details
 
 - sparse blocks are device payloads with separate sparse descriptors for graph
   and dynamic preprocess state
+- CSR/CSC/COO block values are binary ones; the backend uses one shared ones
+  source across all sparse blocks instead of one `data` allocation per block
+- when CUDA VMM is supported and one minimum-granularity VMM tile is smaller
+  than a materialized ones array, that shared ones source is virtually aliased
+  from one physical allocation tile using the CUDA Driver API
+- the VMM tile size, reservation alignment, and physical byte accounting all
+  use the allocation minimum granularity; the recommended granularity is logged
+  as a performance hint only
+- when VMM is unsupported, unavailable in the current context, or offers no
+  memory savings, the backend uses one shared materialized all-ones array
+- warnings are reserved for VMM query/build failures; normal materialized-path
+  selection is INFO-only
 - selector row/col index buffers are stored on device
-- optional `xtx_init` vectors are stored on device when coalescence counts are
-  available
-- runtime memory tracks dense level buffers, input/output staging buffers, and
-  external cuSPARSE work buffers
+- `instrumentation=True` ignores configured `k_hint` and retains no static
+  workspace for that hint
+- setup-retained workspaces contain only the buffers needed for the minimal
+  node-output matvec for that execution path
+- optional miss/output/init/XTX buffers live in per-direction-per-`k` staging
+- runtime memory tracks dense level buffers, active staging buffers, eager
+  scratch/ext buffers, and retained inactive staging/dynamic state in `aux`
+- static block memory accounting reflects the physical shared ones allocation,
+  not the reserved virtual alias range
 
 ### cuSPARSE package layout
 
@@ -115,10 +170,17 @@ It exposes doc-driven properties such as:
 - `need_preprocess`
 - `can_share_storage_with(...)`
 
-`need_buffer` and `need_preprocess` are currently metadata only: the executor
-still allocates work buffers and runs preprocess unconditionally. This keeps
-runtime control flow simple while preserving the information needed for later
-optimization work.
+The executor now consumes `need_buffer` and `need_preprocess` directly, while
+still auditing `need_buffer` against the runtime `cusparseSpMM_bufferSize`
+result and warning when the plan expectation disagrees with the queried buffer
+size.
+
+The `scratch` field controls which destination levels use the multi-stream
+scratch scheduler. Accepted values are:
+
+- `none`
+- `all`
+- a `|`-separated list of destination levels such as `0|2|3`
 
 ### Dense layout execution
 
@@ -135,3 +197,22 @@ view in one of three ways:
 
 This keeps the wavefront level-oriented: if repacking is needed, it happens once
 per completed destination level, not once per block SpMM call.
+
+### Scratch scheduling and workspace lifecycle
+
+For scratch-enabled levels, cuSPARSE now mirrors Triton's helper-stream
+scheduler shape:
+
+- each op for the destination level gets its own scratch buffer
+- helper streams launch `SpMM` into scratch buffers with `beta=0`
+- the destination level stream reduces scratch buffers back into the canonical
+  level buffer in a deterministic order
+- source repack/publication happens only after the reduction finishes
+
+Workspace allocation follows the backend memory model:
+
+- setup-retained workspaces are whichever hinted graph workspaces are actually
+  built in `setup()` for the effective mode
+- other dynamic workspaces are allocated lazily on first use
+- output staging, miss staging, init staging, and XTX bias live in staging
+- `device_static.workspace` counts only the setup-retained workspaces

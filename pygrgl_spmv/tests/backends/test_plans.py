@@ -107,6 +107,14 @@ def test_triton_plan_parse_and_storage_sharing():
     assert up.can_share_storage_with(down)
 
 
+def test_triton_plan_accepts_none_hint():
+    from pygrgl_spmv.backends.triton import TritonPlan
+
+    plan = TritonPlan.from_dict({"k_hint": None, "store": "N", "fmt": "CSR"})
+    assert plan.k_hint is None
+    assert str(plan) == "[k_hint=none,store=N,fmt=CSR,scratch=none]"
+
+
 def test_triton_plan_scratch_normalization():
     from pygrgl_spmv.backends.triton import TritonPlan
 
@@ -119,8 +127,7 @@ def test_triton_plan_scratch_normalization():
 @pytest.mark.parametrize(
     ("raw", "match"),
     [
-        pytest.param({"k_hint": None, "store": "N", "fmt": "CSR"}, "k_hint=1", id="none-hint"),
-        pytest.param({"k_hint": 4, "store": "N", "fmt": "CSR"}, "k_hint=1", id="wrong-hint"),
+        pytest.param({"k_hint": 4, "store": "N", "fmt": "CSR"}, "k_hint=none or 1", id="wrong-hint"),
         pytest.param({"k_hint": 1, "store": "N", "fmt": "COO"}, "CSR/CSC", id="coo-format"),
         pytest.param({"k_hint": 1, "store": "N", "fmt": "CSR", "algo": "naive"}, "Unknown TritonPlan field", id="unknown-field"),
         pytest.param({"k_hint": 1, "store": "N", "fmt": "CSR", "scratch": "1||2"}, "Invalid Triton scratch", id="bad-scratch-empty"),
@@ -153,7 +160,7 @@ def test_triton_plan_pair_validates_store_direction():
 def test_cusparse_plan_parse_and_properties():
     from pygrgl_spmv.backends.cusparse import CusparsePlan, DenseOrder, Operation, SpMMAlgorithm
 
-    literal = "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+    literal = "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
     plan = CusparsePlan.from_literal(literal)
     assert str(plan) == literal
     assert plan.k_hint is None
@@ -168,19 +175,78 @@ def test_cusparse_plan_parse_and_properties():
     assert not plan.deterministic
     assert plan.need_buffer
     assert plan.need_preprocess
+    assert plan.scratch == "none"
+
+
+def test_cusparse_plan_scratch_normalization():
+    from pygrgl_spmv.backends.cusparse import CusparsePlan
+
+    plan = CusparsePlan.from_dict(
+        {
+            "k_hint": 4,
+            "store": "N",
+            "fmt": "CSR",
+            "opA": "N",
+            "opB": "N",
+            "orderB": "ROW",
+            "orderC": "ROW",
+            "algo": "DEFAULT",
+            "scratch": "3|1|2",
+        }
+    )
+    assert plan.scratch == "1|2|3"
+    assert str(plan) == "[k_hint=4,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=1|2|3]"
+
+
+def test_cusparse_plan_scratch_all_round_trip():
+    from pygrgl_spmv.backends.cusparse import CusparsePlan
+
+    literal = "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=all]"
+    plan = CusparsePlan.from_literal(literal)
+    assert str(plan) == literal
+    assert plan.scratch == "all"
+
+
+@pytest.mark.parametrize(
+    ("scratch", "match"),
+    [
+        pytest.param("1||2", "Invalid cuSPARSE scratch", id="empty-piece"),
+        pytest.param("1|1", "Duplicate cuSPARSE scratch level", id="duplicate"),
+        pytest.param("-1", "must be non-negative", id="negative"),
+        pytest.param("*", "does not support wildcard/negation", id="wildcard"),
+        pytest.param("!1", "does not support wildcard/negation", id="negation"),
+    ],
+)
+def test_cusparse_plan_rejects_invalid_scratch(scratch, match):
+    from pygrgl_spmv.backends.cusparse import CusparsePlan
+
+    with pytest.raises(ValueError, match=match):
+        CusparsePlan.from_dict(
+            {
+                "k_hint": None,
+                "store": "N",
+                "fmt": "CSR",
+                "opA": "N",
+                "opB": "N",
+                "orderB": "ROW",
+                "orderC": "ROW",
+                "algo": "DEFAULT",
+                "scratch": scratch,
+            }
+        )
 
 
 def test_cusparse_plan_string_round_trip_rejects_cuda_field():
     from pygrgl_spmv.backends.cusparse import CusparsePlan
 
-    literal = "[k_hint=2,store=T,fmt=CSC,opA=N,opB=T,orderB=COL,orderC=ROW,algo=DEFAULT]"
+    literal = "[k_hint=2,store=T,fmt=CSC,opA=N,opB=T,orderB=COL,orderC=ROW,algo=DEFAULT,scratch=none]"
     plan = CusparsePlan.from_literal(literal)
     assert str(plan) == literal
     assert CusparsePlan.from_literal(str(plan)) == plan
 
     with pytest.raises(ValueError, match="Unknown plan field"):
         CusparsePlan.from_literal(
-            "[cuda=12.9.0,k_hint=2,store=T,fmt=CSC,opA=N,opB=T,orderB=COL,orderC=ROW,algo=DEFAULT]"
+            "[cuda=12.9.0,k_hint=2,store=T,fmt=CSC,opA=N,opB=T,orderB=COL,orderC=ROW,algo=DEFAULT,scratch=none]"
         )
 
 
@@ -194,10 +260,10 @@ def test_cusparse_plan_construction_is_runtime_pure(monkeypatch):
     monkeypatch.setattr(cusparse_plan, "_runtime_cuda_version", fail_runtime_probe)
 
     plan = CusparsePlan.from_literal(
-        "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+        "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
     )
     plans = CusparsePlan.expand_literal(
-        "[k_hint=1,store=*,fmt=CSR,opA=*,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+        "[k_hint=1,store=*,fmt=CSR,opA=*,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
     )
 
     assert plan.supported
@@ -210,20 +276,20 @@ def test_cusparse_plan_expand_literal_and_storage_sharing():
     from pygrgl_spmv.backends.cusparse import CusparsePlan
 
     plans = CusparsePlan.expand_literal(
-        "[k_hint=1,store=*,fmt=CSR,opA=*,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+        "[k_hint=1,store=*,fmt=CSR,opA=*,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
     )
     assert plans
 
     up = CusparsePlan.from_literal(
-        "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+        "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
     )
     down = CusparsePlan.from_literal(
-        "[k_hint=none,store=N,fmt=CSR,opA=T,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+        "[k_hint=none,store=N,fmt=CSR,opA=T,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
     )
     assert up.can_share_storage_with(down)
 
     transpose_down = CusparsePlan.from_literal(
-        "[k_hint=none,store=T,fmt=CSC,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+        "[k_hint=none,store=T,fmt=CSC,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
     )
     assert up.can_share_storage_with(transpose_down)
 
@@ -232,10 +298,10 @@ def test_cusparse_plan_coo_transpose_storage_does_not_share():
     from pygrgl_spmv.backends.cusparse import CusparsePlan
 
     up = CusparsePlan.from_literal(
-        "[k_hint=none,store=N,fmt=COO,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+        "[k_hint=none,store=N,fmt=COO,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
     )
     down = CusparsePlan.from_literal(
-        "[k_hint=none,store=T,fmt=COO,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+        "[k_hint=none,store=T,fmt=COO,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
     )
     assert not up.can_share_storage_with(down)
 
@@ -244,13 +310,13 @@ def test_cusparse_plan_negation_expansion():
     from pygrgl_spmv.backends.cusparse import CusparsePlan, SparseFormat
 
     plans = CusparsePlan.expand_literal(
-        "[k_hint=1,store=*,fmt=!COO,opA=*,opB=N,orderB=ROW,orderC=ROW,algo=*]"
+        "[k_hint=1,store=*,fmt=!COO,opA=*,opB=N,orderB=ROW,orderC=ROW,algo=*,scratch=none]"
     )
     assert plans
     assert all(plan.fmt in {SparseFormat.CSR, SparseFormat.CSC} for plan in plans)
 
     plans = CusparsePlan.expand_literal(
-        "[k_hint=1,store=*,fmt=!CSR!CSC,opA=*,opB=N,orderB=ROW,orderC=ROW,algo=*]"
+        "[k_hint=1,store=*,fmt=!CSR!CSC,opA=*,opB=N,orderB=ROW,orderC=ROW,algo=*,scratch=none]"
     )
     assert plans
     assert all(plan.fmt == SparseFormat.COO for plan in plans)
@@ -260,7 +326,7 @@ def test_cusparse_plan_csr_alg3_support_is_rejected_at_plan_layer():
     from pygrgl_spmv.backends.cusparse import CusparsePlan, is_valid_combo
 
     plan = CusparsePlan.from_literal(
-        "[k_hint=none,store=N,fmt=CSC,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=CSR_ALG3]"
+        "[k_hint=none,store=N,fmt=CSC,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=CSR_ALG3,scratch=none]"
     )
     assert not plan.supported
     assert not is_valid_combo("csc", False, "csr_alg3")
@@ -331,7 +397,7 @@ def test_cusparse_plan_accepts_cuda12_non_doc_versions(monkeypatch, runtime_vers
     monkeypatch.setattr(cusparse_plan, "_probe_cuda_version", lambda: runtime_version)
     try:
         plan = CusparsePlan.from_literal(
-            "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+            "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
         )
         assert plan.cuda_version == runtime_version
     finally:
@@ -347,7 +413,7 @@ def test_cusparse_plan_rejects_non_cuda12_runtime(monkeypatch, runtime_version):
     monkeypatch.setattr(cusparse_plan, "_probe_cuda_version", lambda: runtime_version)
     try:
         plan = CusparsePlan.from_literal(
-            "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT]"
+            "[k_hint=none,store=N,fmt=CSR,opA=N,opB=N,orderB=ROW,orderC=ROW,algo=DEFAULT,scratch=none]"
         )
         with pytest.raises(ValueError, match="CUDA 12.x runtime"):
             _ = plan.cuda_version

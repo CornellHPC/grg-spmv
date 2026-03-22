@@ -143,6 +143,21 @@ def warn_k_hint_mismatch(*, backend: str, direction: Direction, runtime_k: int, 
     )
 
 
+def effective_k_hint(*, instrumentation: bool, k_hint: int | None) -> int | None:
+    return None if instrumentation else k_hint
+
+
+def warn_instrumentation_ignores_k_hint(*, backend: str, direction: Direction, k_hint: int) -> None:
+    warnings.warn(
+        (
+            f"{backend} {direction.value} graph capture/replay disabled because instrumentation=True "
+            f"ignores k_hint={k_hint} and uses the effective k_hint=none path."
+        ),
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 class BackendBase:
     """Shared backend state, validation, and memory tracking."""
 
@@ -185,7 +200,7 @@ class BackendBase:
         self._sample_perm = np.empty(0, dtype=np.int64)
         self._inv_sample_perm = np.empty(0, dtype=np.int64)
         self._coalescence_counts = None
-        self._xtx_init = None
+        self._xtx_host = None
         self._dtype = np.float64
         self._num_samples = 0
         self._num_nodes = 0
@@ -221,9 +236,6 @@ class BackendBase:
             directions.append(Direction.DOWN)
         return tuple(directions)
 
-    def _has_xtx_init(self) -> bool:
-        return self._xtx_init is not None
-
     def _apply_setup_state(self, setup: BackendSetup) -> None:
         self._A_blocks = setup.A_blocks
         self._level_offsets = np.asarray(setup.level_offsets)
@@ -240,9 +252,9 @@ class BackendBase:
             else np.asarray(setup.coalescence_counts, dtype=np.int64)
         )
         self._dtype = np.dtype(setup.dtype)
-        self._xtx_init = None
+        self._xtx_host = None
         if self._coalescence_counts is not None:
-            self._xtx_init = (2.0 * self._coalescence_counts).astype(
+            self._xtx_host = (2.0 * self._coalescence_counts).astype(
                 self._dtype,
                 copy=False,
             ).reshape(self._num_nodes)
@@ -256,7 +268,7 @@ class BackendBase:
             case InitMode.XTX:
                 if init is not None:
                     raise ValueError("init payload must be None when init_mode=xtx")
-                if not self._has_xtx_init():
+                if self._coalescence_counts is None:
                     raise ValueError("init_mode=xtx requires GRG coalescence counts")
                 return None
             case InitMode.VECTOR:
@@ -282,9 +294,9 @@ class BackendBase:
             case InitMode.NONE:
                 return
             case InitMode.XTX:
-                if self._xtx_init is None:
+                if self._xtx_host is None:
                     raise ValueError("init_mode=xtx requires GRG coalescence counts")
-                np.add(node_values, self._xtx_init[:, None], out=node_values)
+                np.add(node_values, self._xtx_host[:, None], out=node_values)
             case InitMode.VECTOR:
                 assert init_payload is not None
                 np.add(node_values, init_payload[None, :], out=node_values)
@@ -317,23 +329,6 @@ class BackendBase:
         if miss_arr.shape != (self._num_mutations, k):
             raise ValueError(f"miss input must have shape ({self._num_mutations}, {k}), got {miss_arr.shape}")
         return miss_arr
-
-    def _warn_if_k_hint_mismatch(
-        self,
-        *,
-        backend: str,
-        direction: Direction,
-        runtime_k: int,
-        k_hint: int | None,
-    ) -> None:
-        if k_hint is None or int(runtime_k) == int(k_hint):
-            return
-        warn_k_hint_mismatch(
-            backend=backend,
-            direction=direction,
-            runtime_k=runtime_k,
-            k_hint=int(k_hint),
-        )
 
     def setup(self, setup: BackendSetup) -> None:
         raise NotImplementedError

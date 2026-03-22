@@ -9,23 +9,23 @@ from time import perf_counter
 import numpy as np
 import pygrgl
 
+from pygrgl_spmv.backends.memory import MemoryRecord
 from scripts.bench.cases import build_case, build_inputs_by_k, configured_direction_names
 from scripts.bench.cli import progress
 from scripts.bench.configs import BenchConfig
 from scripts.bench.report import (
     bytes_to_gib,
     compare_outputs,
-    format_static_note,
-    print_summary_table,
-    skip_summary_row,
-    summarize_intra_diagnostics,
     evaluate_output_equivalence,
+    print_memory_table,
+    print_runtime_table,
+    summarize_intra_diagnostics,
 )
 
 
 @dataclass
 class _IntraDiagnostics:
-    ref_output: np.ndarray | None = None
+    steady_output: np.ndarray
     errors: int = 0
     trials: int = 0
     fail_indices: list[str] = field(default_factory=list)
@@ -36,12 +36,9 @@ class _IntraDiagnostics:
     numeric_count: int = 0
 
     def observe(self, candidate: np.ndarray, *, tag: str, atol: float, rtol: float) -> None:
-        if self.ref_output is None:
-            self.ref_output = candidate
-            return
         self.trials += 1
         ok, shape_ok, max_abs, max_rel = compare_outputs(
-            self.ref_output,
+            self.steady_output,
             candidate,
             atol=atol,
             rtol=rtol,
@@ -69,13 +66,11 @@ class _IntraDiagnostics:
 
 
 @dataclass(frozen=True)
-class _RunResult:
+class _CaseResult:
     output: np.ndarray
     mean_ms: float
     std_ms: float
-    host_bytes: int
-    device_bytes: int
-    mode: str
+    memory_record: MemoryRecord
     intra_errors: int
     intra_trials: int
     intra_fail_indices: list[str]
@@ -87,15 +82,27 @@ class _RunResult:
     ref_abs_err_max: float | None
     ref_rel_err_max: float | None
 
+
+def _record_signature(record: MemoryRecord) -> tuple[object, ...]:
+    return (
+        (record.host.level_buffers, record.host.inputs, record.host.outputs, record.host.aux),
+        (record.device.level_buffers, record.device.inputs, record.device.outputs, record.device.aux),
+        (record.static_ws.host_bytes, record.static_ws.device_bytes, record.static_ws.note),
+        (record.dynamic_ws.host_bytes, record.dynamic_ws.device_bytes, record.dynamic_ws.note),
+        (record.staging.host_bytes, record.staging.device_bytes, record.staging.note),
+        tuple(sorted(record.meta.items())),
+    )
+
+
 def _validate_and_extract_runtime_memory(
     *,
-    call_slice,
+    call_slice: list[MemoryRecord],
     direction: str,
     k: int,
     n_warmup: int,
     n_trials: int,
-) -> tuple[int, int, str]:
-    expected = n_warmup + n_trials
+) -> MemoryRecord:
+    expected = 1 + n_warmup + n_trials
     if len(call_slice) != expected:
         raise AssertionError(
             f"Expected {expected} memory records for direction={direction}, k={k}, got {len(call_slice)}"
@@ -117,55 +124,127 @@ def _validate_and_extract_runtime_memory(
                 f"Unexpected direction in memory record {idx}: expected {direction}, got {rec_direction}"
             )
 
-    timed_records = call_slice[n_warmup:]
+    timed_records = call_slice[1 + n_warmup :]
     if len(timed_records) != n_trials:
         raise AssertionError(
             f"Expected {n_trials} timed memory records for direction={direction}, k={k}, got {len(timed_records)}"
         )
 
-    host_values = [int(record.host.total()) for record in timed_records]
-    device_values = [int(record.device.total()) for record in timed_records]
-    modes = [str(record.meta.get("mode", "n/a")) for record in timed_records]
-
-    if len(set(host_values)) != 1 or len(set(device_values)) != 1:
+    signatures = [_record_signature(record) for record in timed_records]
+    if len(set(signatures)) != 1:
         raise AssertionError(
-            f"Memory totals vary across timed trials for direction={direction}, k={k}: "
-            f"host={host_values}, device={device_values}"
+            f"Memory totals vary across timed trials for direction={direction}, k={k}"
         )
-    if len(set(modes)) != 1:
-        raise AssertionError(f"Execution mode varies across timed trials for direction={direction}, k={k}: {modes}")
 
-    return host_values[0], device_values[0], modes[0]
+    return timed_records[0]
 
 
-def _static_rows(*, op, label: str) -> list[dict[str, object]]:
-    host_static = op._backend.mem_usage.host_static
-    device_static = op._backend.mem_usage.device_static
-    est_host, est_device = op._backend.estimate_static_bytes()
+def _clone_kwargs(kwargs: dict[str, object]) -> dict[str, object]:
+    cloned: dict[str, object] = {}
+    for key, value in kwargs.items():
+        cloned[key] = value.copy() if isinstance(value, np.ndarray) else value
+    return cloned
+
+
+def _ground_truth_output(
+    *,
+    grg_ref,
+    matrix: np.ndarray,
+    direction: str,
+    kwargs: dict[str, object],
+) -> np.ndarray:
+    traversal = pygrgl.TraversalDirection.UP if direction == "up" else pygrgl.TraversalDirection.DOWN
+    return np.asarray(pygrgl.matmul(grg_ref, matrix, traversal, **kwargs))
+
+
+def _summarize_reference_diagnostics(rows: list[dict[str, object]]) -> tuple[int, int, float | None, float | None]:
+    errors = 0
+    checked = 0
+    abs_max: float | None = None
+    rel_max: float | None = None
+    for row in rows:
+        if "skip" in row:
+            continue
+        checked += 1
+        errors += int(row.get("ref_error", 0))
+        row_abs = row.get("ref_abs_err_max")
+        row_rel = row.get("ref_rel_err_max")
+        if row_abs is not None:
+            row_abs = float(row_abs)
+            abs_max = row_abs if abs_max is None else max(abs_max, row_abs)
+        if row_rel is not None:
+            row_rel = float(row_rel)
+            rel_max = row_rel if rel_max is None else max(rel_max, row_rel)
+    return errors, checked, abs_max, rel_max
+
+
+def _runtime_skip_row(*, label: str, scenario: str, direction: str, k: int, reason: str) -> dict[str, object]:
+    return {
+        "config": label,
+        "scenario": scenario,
+        "direction": direction,
+        "k": int(k),
+        "skip": reason,
+        "note": f"skip: {reason}",
+    }
+
+
+def _memory_skip_rows(*, label: str, scenario: str, direction: str, k: int, reason: str) -> list[dict[str, object]]:
     return [
         {
             "config": label,
-            "scenario": "static",
-            "direction": "-",
-            "k": None,
-            "call_ms_mean": None,
-            "call_ms_std": None,
-            "host_gib": bytes_to_gib(host_static.total()),
-            "device_gib": bytes_to_gib(device_static.total()),
-            "note": format_static_note("actual_host", host_static)
-            + " | "
-            + format_static_note("actual_device", device_static),
+            "scenario": scenario,
+            "direction": direction,
+            "k": int(k),
+            "kind": kind,
+            "skip": reason,
+            "note": f"skip: {reason}",
+        }
+        for kind in ("Total GiB", "Static WS GiB", "Dynamic WS GiB", "Staging GiB")
+    ]
+
+
+def _memory_rows(*, label: str, scenario: str, direction: str, k: int, record: MemoryRecord) -> list[dict[str, object]]:
+    return [
+        {
+            "config": label,
+            "scenario": scenario,
+            "direction": direction,
+            "k": int(k),
+            "kind": "Total GiB",
+            "host_gib": bytes_to_gib(record.host.total()),
+            "device_gib": bytes_to_gib(record.device.total()),
+            "note": f"mode={record.meta.get('mode', 'n/a')}",
         },
         {
             "config": label,
-            "scenario": "static_est",
-            "direction": "-",
-            "k": None,
-            "call_ms_mean": None,
-            "call_ms_std": None,
-            "host_gib": bytes_to_gib(est_host.total()),
-            "device_gib": bytes_to_gib(est_device.total()),
-            "note": format_static_note("est_host", est_host) + " | " + format_static_note("est_device", est_device),
+            "scenario": scenario,
+            "direction": direction,
+            "k": int(k),
+            "kind": "Static WS GiB",
+            "host_gib": bytes_to_gib(record.static_ws.host_bytes),
+            "device_gib": bytes_to_gib(record.static_ws.device_bytes),
+            "note": record.static_ws.note,
+        },
+        {
+            "config": label,
+            "scenario": scenario,
+            "direction": direction,
+            "k": int(k),
+            "kind": "Dynamic WS GiB",
+            "host_gib": bytes_to_gib(record.dynamic_ws.host_bytes),
+            "device_gib": bytes_to_gib(record.dynamic_ws.device_bytes),
+            "note": record.dynamic_ws.note,
+        },
+        {
+            "config": label,
+            "scenario": scenario,
+            "direction": direction,
+            "k": int(k),
+            "kind": "Staging GiB",
+            "host_gib": bytes_to_gib(record.staging.host_bytes),
+            "device_gib": bytes_to_gib(record.staging.device_bytes),
+            "note": record.staging.note,
         },
     ]
 
@@ -184,12 +263,13 @@ def _run_case(
     output_atol: float,
     output_rtol: float,
     reference_output: np.ndarray,
-) -> _RunResult:
+) -> _CaseResult:
     progress(f"{label}: scenario={scenario} direction={direction} k={k} start")
 
     calls = op._backend.mem_usage.calls
     start_idx = len(calls)
-    diagnostics = _IntraDiagnostics()
+    first = np.asarray(op.matmul(matrix, direction, **kwargs_factory()))
+    diagnostics = _IntraDiagnostics(steady_output=np.array(first, copy=True))
 
     for warm_idx in range(n_warmup):
         warm = np.asarray(op.matmul(matrix, direction, **kwargs_factory()))
@@ -203,7 +283,7 @@ def _run_case(
         diagnostics.observe(result, tag=f"b{trial_idx + 1}", atol=output_atol, rtol=output_rtol)
 
     end_idx = len(calls)
-    host_bytes, device_bytes, mode = _validate_and_extract_runtime_memory(
+    record = _validate_and_extract_runtime_memory(
         call_slice=calls[start_idx:end_idx],
         direction=direction,
         k=int(k),
@@ -211,26 +291,23 @@ def _run_case(
         n_trials=n_trials,
     )
 
-    assert diagnostics.ref_output is not None
     ms = np.asarray(times, dtype=np.float64) * 1000.0
     mean_ms = float(np.mean(ms))
     std_ms = float(np.std(ms))
     abs_err_avg, abs_err_max, rel_err_avg, rel_err_max = diagnostics.summary()
     ref_ok, ref_shape_ok, ref_abs_err_max, ref_rel_err_max = compare_outputs(
         reference_output,
-        diagnostics.ref_output,
+        diagnostics.steady_output,
         atol=output_atol,
         rtol=output_rtol,
     )
     ref_error = 0 if ref_ok and ref_shape_ok else 1
 
-    return _RunResult(
-        output=np.array(diagnostics.ref_output, copy=True),
+    return _CaseResult(
+        output=np.array(diagnostics.steady_output, copy=True),
         mean_ms=mean_ms,
         std_ms=std_ms,
-        host_bytes=host_bytes,
-        device_bytes=device_bytes,
-        mode=mode,
+        memory_record=record,
         intra_errors=int(diagnostics.errors),
         intra_trials=int(diagnostics.trials),
         intra_fail_indices=list(diagnostics.fail_indices),
@@ -242,45 +319,6 @@ def _run_case(
         ref_abs_err_max=ref_abs_err_max,
         ref_rel_err_max=ref_rel_err_max,
     )
-
-
-def _clone_kwargs(kwargs: dict[str, object]) -> dict[str, object]:
-    cloned: dict[str, object] = {}
-    for key, value in kwargs.items():
-        cloned[key] = value.copy() if isinstance(value, np.ndarray) else value
-    return cloned
-
-
-def _reference_output(
-    *,
-    grg_ref,
-    matrix: np.ndarray,
-    direction: str,
-    kwargs: dict[str, object],
-) -> np.ndarray:
-    traversal = pygrgl.TraversalDirection.UP if direction == "up" else pygrgl.TraversalDirection.DOWN
-    return np.asarray(pygrgl.matmul(grg_ref, matrix, traversal, **kwargs))
-
-
-def _summarize_reference_diagnostics(rows: list[dict[str, object]]) -> tuple[int, int, float | None, float | None]:
-    errors = 0
-    checked = 0
-    abs_max: float | None = None
-    rel_max: float | None = None
-    for row in rows:
-        if row.get("scenario") in {"static", "static_est"} or "skip" in row:
-            continue
-        checked += 1
-        errors += int(row.get("ref_error", 0))
-        row_abs = row.get("ref_abs_err_max")
-        row_rel = row.get("ref_rel_err_max")
-        if row_abs is not None:
-            row_abs = float(row_abs)
-            abs_max = row_abs if abs_max is None else max(abs_max, row_abs)
-        if row_rel is not None:
-            row_rel = float(row_rel)
-            rel_max = row_rel if rel_max is None else max(rel_max, row_rel)
-    return errors, checked, abs_max, rel_max
 
 
 def benchmark_config(
@@ -296,11 +334,11 @@ def benchmark_config(
     dtype: np.dtype,
     output_atol: float,
     output_rtol: float,
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     inputs_by_k = build_inputs_by_k(op=op, ks=ks, seed_base=seed_base, dtype=dtype)
-    summary_rows: list[dict[str, object]] = []
+    runtime_rows: list[dict[str, object]] = []
+    memory_rows: list[dict[str, object]] = []
     output_rows: list[dict[str, object]] = []
-    summary_rows.extend(_static_rows(op=op, label=label))
     directions = configured_direction_names(op._backend)
 
     for scenario in options:
@@ -309,8 +347,17 @@ def benchmark_config(
             for k in ks:
                 case = build_case(op=op, scenario=scenario, direction=direction, inputs=inputs_by_k[int(k)])
                 if case.skip_reason is not None:
-                    summary_rows.append(
-                        skip_summary_row(
+                    runtime_rows.append(
+                        _runtime_skip_row(
+                            label=label,
+                            scenario=scenario,
+                            direction=direction,
+                            k=int(k),
+                            reason=case.skip_reason,
+                        )
+                    )
+                    memory_rows.extend(
+                        _memory_skip_rows(
                             label=label,
                             scenario=scenario,
                             direction=direction,
@@ -320,11 +367,9 @@ def benchmark_config(
                     )
                     continue
 
-                if direction not in {"up", "down"}:
-                    raise ValueError(f"Unknown direction {direction!r}")
                 assert isinstance(case.matrix, np.ndarray)
                 kwargs = _clone_kwargs(case.kwargs_factory())
-                reference_output = _reference_output(
+                reference_output = _ground_truth_output(
                     grg_ref=grg_ref,
                     matrix=case.matrix,
                     direction=direction,
@@ -344,7 +389,7 @@ def benchmark_config(
                     output_rtol=output_rtol,
                     reference_output=reference_output,
                 )
-                summary_rows.append(
+                runtime_rows.append(
                     {
                         "config": label,
                         "scenario": scenario,
@@ -352,9 +397,7 @@ def benchmark_config(
                         "k": int(k),
                         "call_ms_mean": result.mean_ms,
                         "call_ms_std": result.std_ms,
-                        "host_gib": bytes_to_gib(result.host_bytes),
-                        "device_gib": bytes_to_gib(result.device_bytes),
-                        "note": f"mode={result.mode}",
+                        "note": f"mode={result.memory_record.meta.get('mode', 'n/a')}",
                         "intra_errors": result.intra_errors,
                         "intra_trials": result.intra_trials,
                         "intra_fail_indices": result.intra_fail_indices,
@@ -367,6 +410,15 @@ def benchmark_config(
                         "ref_rel_err_max": result.ref_rel_err_max,
                     }
                 )
+                memory_rows.extend(
+                    _memory_rows(
+                        label=label,
+                        scenario=scenario,
+                        direction=direction,
+                        k=int(k),
+                        record=result.memory_record,
+                    )
+                )
                 output_rows.append(
                     {
                         "config": label,
@@ -377,7 +429,7 @@ def benchmark_config(
                     }
                 )
 
-    return summary_rows, output_rows
+    return runtime_rows, memory_rows, output_rows
 
 
 def run_benchmark_suite(
@@ -398,7 +450,8 @@ def run_benchmark_suite(
     from pygrgl_spmv import SpmvGRG
 
     progress(f"GRG file: {grg_path}")
-    all_summary_rows: list[dict[str, object]] = []
+    all_runtime_rows: list[dict[str, object]] = []
+    all_memory_rows: list[dict[str, object]] = []
     all_outputs: list[dict[str, object]] = []
     grg_ref = pygrgl.load_immutable_grg(grg_path)
     for entry in configs:
@@ -410,7 +463,7 @@ def run_benchmark_suite(
         op = SpmvGRG(grg_path, entry.build_backend(), dtype, index_dtype)
         progress(f"{label}: operator ready in {(perf_counter() - t_load) * 1000.0:.2f} ms")
 
-        cfg_rows, cfg_outputs = benchmark_config(
+        cfg_runtime_rows, cfg_memory_rows, cfg_outputs = benchmark_config(
             op=op,
             grg_ref=grg_ref,
             label=label,
@@ -423,15 +476,17 @@ def run_benchmark_suite(
             output_atol=output_atol,
             output_rtol=output_rtol,
         )
-        all_summary_rows.extend(cfg_rows)
+        all_runtime_rows.extend(cfg_runtime_rows)
+        all_memory_rows.extend(cfg_memory_rows)
         all_outputs.extend(cfg_outputs)
         del op
         gc.collect()
 
     cross_stats, per_config_cross = evaluate_output_equivalence(all_outputs, atol=output_atol, rtol=output_rtol)
-    intra_errors, intra_trials = summarize_intra_diagnostics(all_summary_rows)
-    ref_errors, ref_checked, ref_abs_max, ref_rel_max = _summarize_reference_diagnostics(all_summary_rows)
-    print_summary_table(all_summary_rows, skip_note=skip_note)
+    intra_errors, intra_trials = summarize_intra_diagnostics(all_runtime_rows)
+    ref_errors, ref_checked, ref_abs_max, ref_rel_max = _summarize_reference_diagnostics(all_runtime_rows)
+    print_runtime_table(all_runtime_rows, skip_note=skip_note)
+    print_memory_table(all_memory_rows, skip_note=skip_note)
     print(
         "\nCorrectness diagnostics: "
         f"intra_errors={intra_errors}/{intra_trials}, "
@@ -458,7 +513,7 @@ def run_benchmark_suite(
 
 
 __all__ = [
-    "_reference_output",
+    "_ground_truth_output",
     "_summarize_reference_diagnostics",
     "_validate_and_extract_runtime_memory",
     "benchmark_config",

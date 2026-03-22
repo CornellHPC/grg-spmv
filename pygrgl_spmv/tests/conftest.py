@@ -34,6 +34,7 @@ def make_cusparse_plan(
     order_b="ROW",
     order_c="ROW",
     algo="DEFAULT",
+    scratch="none",
 ):
     return {
         "k_hint": k_hint,
@@ -44,6 +45,7 @@ def make_cusparse_plan(
         "orderB": order_b,
         "orderC": order_c,
         "algo": algo,
+        "scratch": scratch,
     }
 
 
@@ -117,6 +119,8 @@ def make_cusparse_backend(
     k_hint=None,
     algo_up="default",
     algo_down="default",
+    scratch_up="none",
+    scratch_down="none",
     log_level="WARNING",
     instrumentation=False,
     infer_missing=True,
@@ -141,6 +145,7 @@ def make_cusparse_backend(
             order_b="ROW",
             order_c="ROW",
             algo=algo_up.upper(),
+            scratch=scratch_up,
         )
     elif infer_missing:
         assert fmt_down is not None
@@ -153,6 +158,7 @@ def make_cusparse_backend(
             order_b="ROW",
             order_c="ROW",
             algo=algo_up.upper(),
+            scratch=scratch_up,
         )
 
     plan_down = None
@@ -166,6 +172,7 @@ def make_cusparse_backend(
             order_b="ROW",
             order_c="ROW",
             algo=algo_down.upper(),
+            scratch=scratch_down,
         )
     elif infer_missing:
         assert fmt_up is not None
@@ -178,6 +185,7 @@ def make_cusparse_backend(
             order_b="ROW",
             order_c="ROW",
             algo=algo_down.upper(),
+            scratch=scratch_down,
         )
 
     return CusparseBackend(
@@ -202,22 +210,22 @@ def make_triton_backend(
 
     if fmt_up is None and fmt_down is None:
         raise ValueError("fmt_up/fmt_down")
-    if k_hint != 1:
-        raise ValueError("Triton backend requires k_hint=1")
+    if k_hint not in {None, 1}:
+        raise ValueError("Triton backend requires k_hint=none or 1")
 
     plan_up = None
     if fmt_up is not None:
-        plan_up = make_triton_plan(k_hint=1, store="N", fmt=str(fmt_up).upper(), scratch=scratch_up)
+        plan_up = make_triton_plan(k_hint=k_hint, store="N", fmt=str(fmt_up).upper(), scratch=scratch_up)
     elif infer_missing:
         assert fmt_down is not None
-        plan_up = make_triton_plan(k_hint=1, store="N", fmt=transpose_compatible_fmt(fmt_down), scratch=scratch_up)
+        plan_up = make_triton_plan(k_hint=k_hint, store="N", fmt=transpose_compatible_fmt(fmt_down), scratch=scratch_up)
 
     plan_down = None
     if fmt_down is not None:
-        plan_down = make_triton_plan(k_hint=1, store="T", fmt=str(fmt_down).upper(), scratch=scratch_down)
+        plan_down = make_triton_plan(k_hint=k_hint, store="T", fmt=str(fmt_down).upper(), scratch=scratch_down)
     elif infer_missing:
         assert fmt_up is not None
-        plan_down = make_triton_plan(k_hint=1, store="T", fmt=transpose_compatible_fmt(fmt_up), scratch=scratch_down)
+        plan_down = make_triton_plan(k_hint=k_hint, store="T", fmt=transpose_compatible_fmt(fmt_up), scratch=scratch_down)
 
     return TritonBackend(
         pair=TritonPlanPair.from_dicts(plan_up, plan_down),

@@ -46,16 +46,16 @@ class TritonPlan:
 
     store: StoredMatrix
     fmt: SparseFormat
-    k_hint: int
+    k_hint: int | None
     scratch: str = "none"
 
     def __post_init__(self) -> None:
         parsed_k = _parse_optional_k_hint(self.k_hint)
-        if parsed_k != 1:
-            raise ValueError(f"Triton backend requires k_hint=1, got {self.k_hint!r}")
+        if parsed_k not in {None, 1}:
+            raise ValueError(f"Triton backend requires k_hint=none or 1, got {self.k_hint!r}")
         if self.fmt not in _ALLOWED_FORMATS:
             raise ValueError(f"Triton backend supports only CSR/CSC formats, got {self.fmt.value}")
-        object.__setattr__(self, "k_hint", int(parsed_k))
+        object.__setattr__(self, "k_hint", None if parsed_k is None else int(parsed_k))
         object.__setattr__(self, "scratch", _normalize_scratch(self.scratch))
 
     @classmethod
@@ -77,7 +77,8 @@ class TritonPlan:
         return transpose_compatible_format(self.fmt) == other.fmt
 
     def __str__(self) -> str:
-        return f"[k_hint={self.k_hint},store={self.store.value},fmt={self.fmt.value},scratch={self.scratch}]"
+        k_hint = "none" if self.k_hint is None else str(self.k_hint)
+        return f"[k_hint={k_hint},store={self.store.value},fmt={self.fmt.value},scratch={self.scratch}]"
 
 @dataclass(frozen=True)
 class TritonPlanPair:

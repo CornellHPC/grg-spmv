@@ -260,6 +260,6 @@ text/
 figs/
 *.pygrgl_spmv.npz
 investigation/
-pygrgl_spmv_cache/
+pygrgl_spmv_artifacts/
 # symlink
-pygrgl_spmv_cache
+pygrgl_spmv_artifacts

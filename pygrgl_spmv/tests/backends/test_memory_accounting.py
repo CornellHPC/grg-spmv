@@ -64,6 +64,16 @@ def test_mkl_static_estimate_matches_recorded(primary_grg_path, spmv_cache_dir, 
             id="cusparse-coo-coo",
             marks=pytest.mark.cusparse,
         ),
+        pytest.param(
+            make_cusparse_backend(fmt_up="csr", fmt_down="csc", k_hint=None, scratch_up="1", scratch_down="0"),
+            id="cusparse-scratch-dynamic",
+            marks=pytest.mark.cusparse,
+        ),
+        pytest.param(
+            make_cusparse_backend(fmt_up="csr", fmt_down="csc", k_hint=4, scratch_up="1", scratch_down="0"),
+            id="cusparse-scratch-graph",
+            marks=pytest.mark.cusparse,
+        ),
     ],
 )
 def test_cusparse_static_estimate_matches_recorded(primary_grg_path, spmv_cache_dir, cfg):
@@ -72,6 +82,32 @@ def test_cusparse_static_estimate_matches_recorded(primary_grg_path, spmv_cache_
     est_host, est_device = op._backend.estimate_static_bytes()
     _assert_static_bytes_equal(op._backend.mem_usage.host_static, est_host)
     _assert_static_bytes_equal(op._backend.mem_usage.device_static, est_device)
+
+
+@pytest.mark.gpu
+@pytest.mark.cusparse
+def test_cusparse_xtx_runtime_memory_is_dynamic(primary_grg_path, spmv_cache_dir):
+    pytest.importorskip("cupy")
+    op = SpmvGRG(
+        primary_grg_path,
+        make_cusparse_backend(fmt_up="csr", fmt_down="csc", k_hint=1, algo_up="default", algo_down="default"),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=spmv_cache_dir,
+    )
+    before_host, before_device = op._backend.estimate_static_bytes()
+    x = np.ones((1, op.num_samples), dtype=DATA_DTYPE)
+    _ = op.matmul(x, "up", emit_all_nodes=True, init="xtx")
+    after_host, after_device = op._backend.estimate_static_bytes()
+    _assert_static_bytes_equal(before_host, after_host)
+    _assert_static_bytes_equal(before_device, after_device)
+    _assert_static_bytes_equal(op._backend.mem_usage.host_static, before_host)
+    _assert_static_bytes_equal(op._backend.mem_usage.device_static, before_device)
+    assert int(before_host.xtx_init) == 0
+    assert int(before_device.xtx_init) == 0
+    assert op._backend._staging_up_by_k[1].xtx_bias is not None
+    assert int(op._backend.mem_usage.calls[-1].device.outputs) == 0
+    assert int(op._backend.mem_usage.calls[-1].device.aux) >= int(op._backend._staging_up_by_k[1].xtx_bias.nbytes)
 
 
 @pytest.mark.gpu
@@ -98,3 +134,33 @@ def test_triton_static_estimate_matches_recorded(primary_grg_path, spmv_cache_di
     est_host, est_device = op._backend.estimate_static_bytes()
     _assert_static_bytes_equal(op._backend.mem_usage.host_static, est_host)
     _assert_static_bytes_equal(op._backend.mem_usage.device_static, est_device)
+
+
+@pytest.mark.gpu
+@pytest.mark.triton
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_xtx_runtime_memory_is_dynamic(primary_grg_path, spmv_cache_dir):
+    pytest.importorskip("torch")
+    pytest.importorskip("triton")
+    op = SpmvGRG(
+        primary_grg_path,
+        make_triton_backend(fmt_up="csr", fmt_down="csc", k_hint=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=spmv_cache_dir,
+    )
+    before_host, before_device = op._backend.estimate_static_bytes()
+    x = np.ones((1, op.num_samples), dtype=DATA_DTYPE)
+    _ = op.matmul(x, "up", emit_all_nodes=True, init="xtx")
+    after_host, after_device = op._backend.estimate_static_bytes()
+    _assert_static_bytes_equal(before_host, after_host)
+    _assert_static_bytes_equal(before_device, after_device)
+    _assert_static_bytes_equal(op._backend.mem_usage.host_static, before_host)
+    _assert_static_bytes_equal(op._backend.mem_usage.device_static, before_device)
+    assert int(before_host.xtx_init) == 0
+    assert int(before_device.xtx_init) == 0
+    assert op._backend._staging_up is not None
+    assert op._backend._staging_up.xtx_bias is not None
+    xtx_nbytes = int(op._backend._staging_up.xtx_bias.numel() * op._backend._staging_up.xtx_bias.element_size())
+    assert int(op._backend.mem_usage.calls[-1].device.outputs) == 0
+    assert int(op._backend.mem_usage.calls[-1].device.aux) >= xtx_nbytes
