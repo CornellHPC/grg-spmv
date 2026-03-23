@@ -35,8 +35,8 @@ class CompiledOperatorState:
     sample_to_individual: np.ndarray
     mutation_positions: np.ndarray
     mutation_times: np.ndarray
-    mutation_alleles: np.ndarray
-    mutation_ref_alleles: np.ndarray
+    mutation_alleles: np.ndarray | None
+    mutation_ref_alleles: np.ndarray | None
     coalescence_counts: np.ndarray | None
     init_vector_up_bias: np.ndarray | None = None
     init_vector_down_bias: np.ndarray | None = None
@@ -338,25 +338,19 @@ def _build_coalescence_counts(grg, *, node_perm: np.ndarray) -> np.ndarray | Non
     return counts_orig[node_perm]
 
 
-def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, None, None]:
     positions: list[float] = []
     times: list[float] = []
-    alleles: list[str] = []
-    ref_alleles: list[str] = []
     for mutation_id in range(int(grg.num_mutations)):
         mutation = grg.get_mutation_by_id(int(mutation_id))
         positions.append(float(mutation.position))
         times.append(float(mutation.time))
-        alleles.append(str(mutation.allele))
-        ref_alleles.append(str(mutation.ref_allele))
 
-    allele_width = max((len(value) for value in alleles), default=0)
-    ref_width = max((len(value) for value in ref_alleles), default=0)
     return (
         np.asarray(positions, dtype=np.float64),
         np.asarray(times, dtype=np.float64),
-        np.asarray(alleles, dtype=f"<U{max(allele_width, 1)}"),
-        np.asarray(ref_alleles, dtype=f"<U{max(ref_width, 1)}"),
+        None,
+        None,
     )
 
 

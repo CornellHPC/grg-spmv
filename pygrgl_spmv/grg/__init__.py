@@ -186,15 +186,7 @@ class SpmvGRG:
         return self._state.init_xtx_down_bias
 
     def get_mutation_by_id(self, mutation_id: int):
-        idx = int(mutation_id)
-        if idx < 0 or idx >= self.num_mutations:
-            raise IndexError(f"Mutation id out of range: {mutation_id}")
-        return pygrgl.Mutation(
-            float(self._state.mutation_positions[idx]),
-            str(self._state.mutation_alleles[idx]),
-            str(self._state.mutation_ref_alleles[idx]),
-            float(self._state.mutation_times[idx]),
-        )
+        assert False, "mutation_alleles and mutation_ref_alleles are temporarily disabled"
 
     def _parse_direction(self, direction: str | Direction | pygrgl.TraversalDirection) -> Direction:
         match direction:
