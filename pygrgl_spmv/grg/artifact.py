@@ -80,10 +80,21 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
             save_dict[f"A_blocks_{dst_level}_{src_level}_indptr"] = np.asarray(block.indptr, dtype=index_dtype)
             save_dict[f"A_blocks_{dst_level}_{src_level}_shape"] = np.asarray(block.shape, dtype=index_dtype)
 
+    print("[save_grg_spmv] component sizes:")
+    total_bytes = 0
+    for key, arr in save_dict.items():
+        arr = np.asarray(arr)
+        nbytes = arr.nbytes
+        total_bytes += nbytes
+        if nbytes > 0:
+            print(f"  {key:50s}: {nbytes / 1024**2:10.3f} MB  shape={arr.shape} dtype={arr.dtype}")
+    print(f"  {'TOTAL (uncompressed)':50s}: {total_bytes / 1024**2:10.3f} MB")
+
     path = Path(artifact_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as handle:
         np.savez(handle, **save_dict)
+    print(f"  {'TOTAL (on-disk .npz)':50s}: {path.stat().st_size / 1024**2:10.3f} MB")
 
 
 def _load_archive(artifact_path) -> np.lib.npyio.NpzFile:

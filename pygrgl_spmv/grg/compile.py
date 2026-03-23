@@ -418,6 +418,12 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
         dtype=dtype,
     )
 
+    print(f"[compile_grg] num_levels={num_levels}, num_nodes={num_nodes}, num_samples={num_samples}")
+    for h in range(num_levels):
+        n_nodes = int(level_offsets[h + 1] - level_offsets[h])
+        print(f"  level {h:4d}: {n_nodes:8d} nodes")
+    print(f"[compile_grg] A_blocks nnz (dst_level, src_level) -> nnz:")
+    total_nnz = 0
     for h in range(num_levels):
         if len(A_blocks[h]) != h:
             raise RuntimeError(f"Invalid number of blocks at level {h}: got {len(A_blocks[h])}, expected {h}")
@@ -430,6 +436,10 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
                 raise RuntimeError(
                     f"Invalid block shape for A_blocks[{h}][{j}]: got {blk.shape}, expected {expected_shape}"
                 )
+            if blk.nnz > 0:
+                print(f"  A_blocks[{h}][{j}]: shape={blk.shape}, nnz={blk.nnz}")
+                total_nnz += blk.nnz
+    print(f"[compile_grg] total A_blocks nnz={total_nnz}")
 
     sel_mut, sel_miss = _build_selectors(
         grg,
