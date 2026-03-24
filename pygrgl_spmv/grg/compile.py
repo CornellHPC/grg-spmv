@@ -338,6 +338,20 @@ def _build_coalescence_counts(grg, *, node_perm: np.ndarray) -> np.ndarray | Non
     return counts_orig[node_perm]
 
 
+_ALLELE_ENCODE = {"A": 0b00, "T": 0b01, "C": 0b10, "G": 0b11}
+
+
+def _encode_alleles(alleles: list[str]) -> np.ndarray:
+    """Pack allele strings (ATCG only) into a 2-bit-per-allele uint8 array (4 alleles/byte)."""
+    n = len(alleles)
+    buf = np.zeros((n + 3) // 4, dtype=np.uint8)
+    for i, a in enumerate(alleles):
+        if a not in _ALLELE_ENCODE:
+            assert False, f"Non-ATCG allele encountered at index {i}: {a!r}"
+        buf[i // 4] |= np.uint8(_ALLELE_ENCODE[a] << ((i % 4) * 2))
+    return buf
+
+
 def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     positions: list[float] = []
     times: list[float] = []
@@ -350,13 +364,11 @@ def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.n
         alleles.append(str(mutation.allele))
         ref_alleles.append(str(mutation.ref_allele))
 
-    allele_width = max((len(value) for value in alleles), default=0)
-    ref_width = max((len(value) for value in ref_alleles), default=0)
     return (
         np.asarray(positions, dtype=np.float64),
         np.asarray(times, dtype=np.float64),
-        np.asarray(alleles, dtype=f"<U{max(allele_width, 1)}"),
-        np.asarray(ref_alleles, dtype=f"<U{max(ref_width, 1)}"),
+        _encode_alleles(alleles),
+        _encode_alleles(ref_alleles),
     )
 
 
