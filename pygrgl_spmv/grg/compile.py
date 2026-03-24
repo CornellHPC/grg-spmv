@@ -35,8 +35,10 @@ class CompiledOperatorState:
     sample_to_individual: np.ndarray
     mutation_positions: np.ndarray
     mutation_times: np.ndarray
-    mutation_alleles: np.ndarray
+    mutation_alleles: np.ndarray        # uint8 packed-bit data buffer
+    mutation_allele_offsets: np.ndarray  # uint32 CSR offsets (nucleotide indices)
     mutation_ref_alleles: np.ndarray
+    mutation_ref_allele_offsets: np.ndarray
     coalescence_counts: np.ndarray | None
     init_vector_up_bias: np.ndarray | None = None
     init_vector_down_bias: np.ndarray | None = None
@@ -339,41 +341,48 @@ def _build_coalescence_counts(grg, *, node_perm: np.ndarray) -> np.ndarray | Non
 
 
 _NUCLEOTIDE_ENCODE = {"A": 0b00, "T": 0b01, "C": 0b10, "G": 0b11}
-# Per-allele uint8 layout: bits[1:0]=1st char, bits[3:2]=2nd char, bits[5:4]=3rd char, bits[7:6]=length (0-3)
-_ALLELE_EMPTY = np.uint8(0)
+# Data buffer: 2 bits per nucleotide, packed 4 per byte (nucleotide j → byte j//4, bits (j%4)*2).
+# Offsets array: dtype[num_alleles+1], offsets[i] is the cumulative nucleotide count up to allele i.
+# Empty/invalid alleles have offsets[i] == offsets[i+1] (zero length).
 
 
-def _encode_alleles(alleles: list[str]) -> np.ndarray:
-    """Encode alleles into a uint8 array (one byte per allele, max 3 ATCG chars).
+def _encode_alleles(alleles: list[str], offset_dtype: np.dtype = np.dtype(np.uint32)) -> tuple[np.ndarray, np.ndarray]:
+    """CSR-style 2-bit encoding of allele strings (ATCG only, variable length).
 
-    Invalid alleles (non-ATCG chars or length > 3) are printed and stored as empty (0).
+    Returns (data, offsets) where data is a uint8 packed-bit buffer and offsets has dtype offset_dtype.
+    Invalid alleles (non-ATCG chars) or alleles that would overflow offset_dtype's max are stored as empty.
     """
-    buf = np.zeros(len(alleles), dtype=np.uint8)
+    n = len(alleles)
+    dtype_max = int(np.iinfo(offset_dtype).max)
+    offsets = np.zeros(n + 1, dtype=offset_dtype)
+    nucleotide_codes: list[int] = []
+
     for i, a in enumerate(alleles):
-        if len(a) == 0:
-            buf[i] = _ALLELE_EMPTY
-            continue
-        if len(a) > 3:
-            print(f"[encode_alleles] allele at index {i} has length {len(a)} > 3: {a!r}; storing as empty")
-            buf[i] = _ALLELE_EMPTY
-            continue
-        encoded = np.uint8(0)
-        valid = True
-        for j, ch in enumerate(a):
+        valid_codes: list[int] = []
+        for ch in a:
             if ch not in _NUCLEOTIDE_ENCODE:
                 print(f"[encode_alleles] non-ATCG character {ch!r} in allele at index {i}: {a!r}; storing as empty")
-                valid = False
+                valid_codes = []
                 break
-            encoded |= np.uint8(_NUCLEOTIDE_ENCODE[ch] << (j * 2))
-        if valid:
-            encoded |= np.uint8(len(a) << 6)
-            buf[i] = encoded
-        else:
-            buf[i] = _ALLELE_EMPTY
-    return buf
+            valid_codes.append(_NUCLEOTIDE_ENCODE[ch])
+        new_total = int(offsets[i]) + len(valid_codes)
+        if new_total > dtype_max:
+            print(
+                f"[encode_alleles] cumulative nucleotide count {new_total} would overflow "
+                f"{offset_dtype} (max {dtype_max}) at allele index {i}: {a!r}; storing as empty"
+            )
+            valid_codes = []
+        offsets[i + 1] = int(offsets[i]) + len(valid_codes)
+        nucleotide_codes.extend(valid_codes)
+
+    total = len(nucleotide_codes)
+    data = np.zeros((total + 3) // 4, dtype=np.uint8)
+    for j, code in enumerate(nucleotide_codes):
+        data[j // 4] |= np.uint8(code << ((j % 4) * 2))
+    return data, offsets
 
 
-def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     positions: list[float] = []
     times: list[float] = []
     alleles: list[str] = []
@@ -385,11 +394,15 @@ def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.n
         alleles.append(str(mutation.allele))
         ref_alleles.append(str(mutation.ref_allele))
 
+    allele_data, allele_offsets = _encode_alleles(alleles)
+    ref_allele_data, ref_allele_offsets = _encode_alleles(ref_alleles)
     return (
         np.asarray(positions, dtype=np.float64),
         np.asarray(times, dtype=np.float64),
-        _encode_alleles(alleles),
-        _encode_alleles(ref_alleles),
+        allele_data,
+        allele_offsets,
+        ref_allele_data,
+        ref_allele_offsets,
     )
 
 
@@ -475,7 +488,7 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
 
     sample_to_individual = np.arange(num_samples, dtype=index_dtype) // max(int(grg.ploidy), 1)
     coalescence_counts = _build_coalescence_counts(grg, node_perm=final_perm)
-    mutation_positions, mutation_times, mutation_alleles, mutation_ref_alleles = _build_mutation_table(grg)
+    mutation_positions, mutation_times, mutation_alleles, mutation_allele_offsets, mutation_ref_alleles, mutation_ref_allele_offsets = _build_mutation_table(grg)
 
     sample_perm = final_perm[:num_samples].copy()
     return CompiledOperatorState(
@@ -498,7 +511,9 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
         mutation_positions=mutation_positions,
         mutation_times=mutation_times,
         mutation_alleles=mutation_alleles,
+        mutation_allele_offsets=mutation_allele_offsets,
         mutation_ref_alleles=mutation_ref_alleles,
+        mutation_ref_allele_offsets=mutation_ref_allele_offsets,
         coalescence_counts=coalescence_counts,
     )
 
