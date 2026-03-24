@@ -338,17 +338,38 @@ def _build_coalescence_counts(grg, *, node_perm: np.ndarray) -> np.ndarray | Non
     return counts_orig[node_perm]
 
 
-_ALLELE_ENCODE = {"A": 0b00, "T": 0b01, "C": 0b10, "G": 0b11}
+_NUCLEOTIDE_ENCODE = {"A": 0b00, "T": 0b01, "C": 0b10, "G": 0b11}
+# Per-allele uint8 layout: bits[1:0]=1st char, bits[3:2]=2nd char, bits[5:4]=3rd char, bits[7:6]=length (0-3)
+_ALLELE_EMPTY = np.uint8(0)
 
 
 def _encode_alleles(alleles: list[str]) -> np.ndarray:
-    """Pack allele strings (ATCG only) into a 2-bit-per-allele uint8 array (4 alleles/byte)."""
-    n = len(alleles)
-    buf = np.zeros((n + 3) // 4, dtype=np.uint8)
+    """Encode alleles into a uint8 array (one byte per allele, max 3 ATCG chars).
+
+    Invalid alleles (non-ATCG chars or length > 3) are printed and stored as empty (0).
+    """
+    buf = np.zeros(len(alleles), dtype=np.uint8)
     for i, a in enumerate(alleles):
-        if a not in _ALLELE_ENCODE:
-            assert False, f"Non-ATCG allele encountered at index {i}: {a!r}"
-        buf[i // 4] |= np.uint8(_ALLELE_ENCODE[a] << ((i % 4) * 2))
+        if len(a) == 0:
+            buf[i] = _ALLELE_EMPTY
+            continue
+        if len(a) > 3:
+            print(f"[encode_alleles] allele at index {i} has length {len(a)} > 3: {a!r}; storing as empty")
+            buf[i] = _ALLELE_EMPTY
+            continue
+        encoded = np.uint8(0)
+        valid = True
+        for j, ch in enumerate(a):
+            if ch not in _NUCLEOTIDE_ENCODE:
+                print(f"[encode_alleles] non-ATCG character {ch!r} in allele at index {i}: {a!r}; storing as empty")
+                valid = False
+                break
+            encoded |= np.uint8(_NUCLEOTIDE_ENCODE[ch] << (j * 2))
+        if valid:
+            encoded |= np.uint8(len(a) << 6)
+            buf[i] = encoded
+        else:
+            buf[i] = _ALLELE_EMPTY
     return buf
 
 

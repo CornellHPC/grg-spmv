@@ -13,12 +13,13 @@ from pygrgl_spmv.backends.types import Direction, InitMode, parse_direction
 from pygrgl_spmv.grg.artifact import artifact_path_for_grg, load_grg_spmv, save_grg_spmv
 from pygrgl_spmv.grg.compile import CompiledOperatorState, compile_grg
 
-_ALLELE_DECODE = {0b00: "A", 0b01: "T", 0b10: "C", 0b11: "G"}
+_NUCLEOTIDE_DECODE = {0b00: "A", 0b01: "T", 0b10: "C", 0b11: "G"}
 
 
 def _decode_allele(buf: np.ndarray, idx: int) -> str:
-    code = (int(buf[idx // 4]) >> ((idx % 4) * 2)) & 0b11
-    return _ALLELE_DECODE[code]
+    byte = int(buf[idx])
+    length = (byte >> 6) & 0b11
+    return "".join(_NUCLEOTIDE_DECODE[(byte >> (j * 2)) & 0b11] for j in range(length))
 
 
 class SpmvGRG:
