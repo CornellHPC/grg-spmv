@@ -10,7 +10,7 @@ from pygrgl_spmv.grg.compile import CompiledOperatorState, _invert_permutation
 from pygrgl_spmv.grg.sparse import binary_csr_from_csr_parts
 
 GRG_SPMV_FORMAT_MAGIC = "grg_spmv"
-GRG_SPMV_FORMAT_VERSION = 1
+GRG_SPMV_FORMAT_VERSION = 2
 _FORMAT_MAGIC_KEY = "grg_spmv_magic"
 _FORMAT_VERSION_KEY = "grg_spmv_format_version"
 
@@ -55,7 +55,9 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         "mutation_positions": np.asarray(state.mutation_positions, dtype=np.float64),
         "mutation_times": np.asarray(state.mutation_times, dtype=np.float64),
         "mutation_alleles": np.asarray(state.mutation_alleles),
+        "mutation_allele_offsets": np.asarray(state.mutation_allele_offsets),
         "mutation_ref_alleles": np.asarray(state.mutation_ref_alleles),
+        "mutation_ref_allele_offsets": np.asarray(state.mutation_ref_allele_offsets),
         "has_individual_coals": np.asarray(state.coalescence_counts is not None, dtype=bool),
         "init_vector_up_bias": np.asarray(state.init_vector_up_bias),
         "init_vector_down_bias": np.asarray(state.init_vector_down_bias),
@@ -223,7 +225,9 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
         mutation_positions=np.asarray(data["mutation_positions"], dtype=np.float64),
         mutation_times=np.asarray(data["mutation_times"], dtype=np.float64),
         mutation_alleles=np.asarray(data["mutation_alleles"]),
+        mutation_allele_offsets=np.asarray(data["mutation_allele_offsets"]),
         mutation_ref_alleles=np.asarray(data["mutation_ref_alleles"]),
+        mutation_ref_allele_offsets=np.asarray(data["mutation_ref_allele_offsets"]),
         coalescence_counts=coalescence_counts,
         init_vector_up_bias=init_vector_up_bias,
         init_vector_down_bias=init_vector_down_bias,

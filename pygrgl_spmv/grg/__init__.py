@@ -13,12 +13,16 @@ from pygrgl_spmv.backends.types import Direction, InitMode, parse_direction
 from pygrgl_spmv.grg.artifact import artifact_path_for_grg, load_grg_spmv, save_grg_spmv
 from pygrgl_spmv.grg.compile import CompiledOperatorState, compile_grg
 
-_ALLELE_DECODE = {0b00: "A", 0b01: "T", 0b10: "C", 0b11: "G"}
+_NUCLEOTIDE_DECODE = {0b00: "A", 0b01: "T", 0b10: "C", 0b11: "G"}
 
 
-def _decode_allele(buf: np.ndarray, idx: int) -> str:
-    code = (int(buf[idx // 4]) >> ((idx % 4) * 2)) & 0b11
-    return _ALLELE_DECODE[code]
+def _decode_allele(data: np.ndarray, offsets: np.ndarray, idx: int) -> str:
+    start = int(offsets[idx])
+    end = int(offsets[idx + 1])
+    return "".join(
+        _NUCLEOTIDE_DECODE[(int(data[j // 4]) >> ((j % 4) * 2)) & 0b11]
+        for j in range(start, end)
+    )
 
 
 class SpmvGRG:
@@ -198,8 +202,8 @@ class SpmvGRG:
             raise IndexError(f"Mutation id out of range: {mutation_id}")
         return pygrgl.Mutation(
             float(self._state.mutation_positions[idx]),
-            _decode_allele(self._state.mutation_alleles, idx),
-            _decode_allele(self._state.mutation_ref_alleles, idx),
+            _decode_allele(self._state.mutation_alleles, self._state.mutation_allele_offsets, idx),
+            _decode_allele(self._state.mutation_ref_alleles, self._state.mutation_ref_allele_offsets, idx),
             float(self._state.mutation_times[idx]),
         )
 
