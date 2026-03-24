@@ -500,6 +500,19 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
     coalescence_counts = _build_coalescence_counts(grg, node_perm=final_perm)
     mutation_positions, mutation_times, mutation_alleles, mutation_allele_offsets, mutation_ref_alleles, mutation_ref_allele_offsets = _build_mutation_table(grg)
 
+    print(f"[compile_grg] sel_mut nnz={sel_mut.nnz}, sel_miss nnz={sel_miss.nnz}")
+    print(f"[compile_grg] coalescence_counts: {'present' if coalescence_counts is not None else 'absent'}")
+    print(f"[compile_grg] mutation table (num_mutations={num_mutations}):")
+    for name, arr in [
+        ("mutation_positions",         mutation_positions),
+        ("mutation_times",             mutation_times),
+        ("mutation_alleles",           mutation_alleles),
+        ("mutation_allele_offsets",    mutation_allele_offsets),
+        ("mutation_ref_alleles",       mutation_ref_alleles),
+        ("mutation_ref_allele_offsets",mutation_ref_allele_offsets),
+    ]:
+        print(f"  {name:30s}: {arr.nbytes / 1024**2:8.3f} MB  shape={arr.shape} dtype={arr.dtype}")
+
     sample_perm = final_perm[:num_samples].copy()
     return CompiledOperatorState(
         A_blocks=A_blocks,
