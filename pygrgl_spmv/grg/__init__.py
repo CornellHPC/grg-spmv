@@ -32,7 +32,9 @@ class OperatorRetainedMem:
     mutation_positions: np.ndarray = alloc_field(label="mutation_positions", kind="tables", owner="operator", retention="persistent", activity="always")
     mutation_times: np.ndarray = alloc_field(label="mutation_times", kind="tables", owner="operator", retention="persistent", activity="always")
     mutation_alleles: np.ndarray = alloc_field(label="mutation_alleles", kind="tables", owner="operator", retention="persistent", activity="always")
+    mutation_allele_offsets: np.ndarray = alloc_field(label="mutation_allele_offsets", kind="tables", owner="operator", retention="persistent", activity="always")
     mutation_ref_alleles: np.ndarray = alloc_field(label="mutation_ref_alleles", kind="tables", owner="operator", retention="persistent", activity="always")
+    mutation_ref_allele_offsets: np.ndarray = alloc_field(label="mutation_ref_allele_offsets", kind="tables", owner="operator", retention="persistent", activity="always")
     sel_mut: sp.spmatrix = alloc_field(label="sel_mut", kind="selector", owner="operator", retention="persistent", activity="always")
     sel_miss: sp.spmatrix = alloc_field(label="sel_miss", kind="selector", owner="operator", retention="persistent", activity="always")
     coalescence_counts: np.ndarray | None = alloc_field(label="coalescence_counts", kind="coalescence", owner="operator", retention="persistent", activity="always", default=None)
@@ -56,12 +58,16 @@ class OperatorCallMem:
     backend_init_payload: np.ndarray | None = alloc_field(label="backend_init_payload", kind="init", owner="operator", retention="call", activity="yes", default=None)
     input_by_individual: np.ndarray | None = alloc_field(label="input_by_individual", kind="temporary", owner="operator", retention="call", activity="yes", default=None)
 
-_ALLELE_DECODE = {0b00: "A", 0b01: "T", 0b10: "C", 0b11: "G"}
+_NUCLEOTIDE_DECODE = ["A", "T", "C", "G"]
 
 
-def _decode_allele(buf: np.ndarray, idx: int) -> str:
-    code = (int(buf[idx // 4]) >> ((idx % 4) * 2)) & 0b11
-    return _ALLELE_DECODE[code]
+def _decode_allele(data: np.ndarray, offsets: np.ndarray, idx: int) -> str:
+    start = int(offsets[idx])
+    end = int(offsets[idx + 1])
+    return "".join(
+        _NUCLEOTIDE_DECODE[(int(data[j // 4]) >> ((j % 4) * 2)) & 0b11]
+        for j in range(start, end)
+    )
 
 
 class SpmvGRG:
@@ -162,7 +168,9 @@ class SpmvGRG:
             mutation_positions=self._compiled.mutation_positions,
             mutation_times=self._compiled.mutation_times,
             mutation_alleles=self._compiled.mutation_alleles,
+            mutation_allele_offsets=self._compiled.mutation_allele_offsets,
             mutation_ref_alleles=self._compiled.mutation_ref_alleles,
+            mutation_ref_allele_offsets=self._compiled.mutation_ref_allele_offsets,
             coalescence_counts=self._compiled.coalescence_counts,
             init_vector_up_bias=self._compiled.init_vector_up_bias,
             init_vector_down_bias=self._compiled.init_vector_down_bias,
@@ -292,8 +300,8 @@ class SpmvGRG:
             raise IndexError(f"Mutation id out of range: {mutation_id}")
         return pygrgl.Mutation(
             float(self._compiled.mutation_positions[idx]),
-            _decode_allele(self._compiled.mutation_alleles, idx),
-            _decode_allele(self._compiled.mutation_ref_alleles, idx),
+            _decode_allele(self._compiled.mutation_alleles, self._compiled.mutation_allele_offsets, idx),
+            _decode_allele(self._compiled.mutation_ref_alleles, self._compiled.mutation_ref_allele_offsets, idx),
             float(self._compiled.mutation_times[idx]),
         )
 

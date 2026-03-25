@@ -36,7 +36,9 @@ class CompiledOperatorState:
     mutation_positions: np.ndarray
     mutation_times: np.ndarray
     mutation_alleles: np.ndarray
+    mutation_allele_offsets: np.ndarray
     mutation_ref_alleles: np.ndarray
+    mutation_ref_allele_offsets: np.ndarray
     coalescence_counts: np.ndarray | None
     init_vector_up_bias: np.ndarray | None = None
     init_vector_down_bias: np.ndarray | None = None
@@ -338,21 +340,42 @@ def _build_coalescence_counts(grg, *, node_perm: np.ndarray) -> np.ndarray | Non
     return counts_orig[node_perm]
 
 
-_ALLELE_ENCODE = {"A": 0b00, "T": 0b01, "C": 0b10, "G": 0b11}
+_NUCLEOTIDE_ENCODE = {"A": 0b00, "T": 0b01, "C": 0b10, "G": 0b11}
 
 
-def _encode_alleles(alleles: list[str]) -> np.ndarray:
-    """Pack allele strings (ATCG only) into a 2-bit-per-allele uint8 array (4 alleles/byte)."""
+def _encode_alleles(alleles: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Pack variable-length allele strings into a 2-bit-per-nucleotide uint8 buffer with CSR offsets.
+
+    Returns (data, offsets) where offsets[i]:offsets[i+1] gives the nucleotide
+    range for allele i within the packed data buffer.
+    """
     n = len(alleles)
-    buf = np.zeros((n + 3) // 4, dtype=np.uint8)
-    for i, a in enumerate(alleles):
-        if a not in _ALLELE_ENCODE:
-            assert False, f"Non-ATCG allele encountered at index {i}: {a!r}"
-        buf[i // 4] |= np.uint8(_ALLELE_ENCODE[a] << ((i % 4) * 2))
-    return buf
+    offsets = np.empty(n + 1, dtype=np.uint32)
+    offsets[0] = 0
+
+    # First pass: validate and compute offsets
+    total = 0
+    for i, allele_str in enumerate(alleles):
+        for ch in allele_str:
+            if ch not in _NUCLEOTIDE_ENCODE:
+                raise ValueError(f"Non-ATCG character {ch!r} in allele at index {i}: {allele_str!r}")
+        total += len(allele_str)
+        if total > np.iinfo(np.uint32).max:
+            raise ValueError(f"Allele offset overflow at index {i}: total nucleotide count {total} exceeds uint32 max")
+        offsets[i + 1] = total
+
+    # Second pass: pack 2-bit codes
+    buf = np.zeros((total + 3) // 4, dtype=np.uint8)
+    pos = 0
+    for allele_str in alleles:
+        for ch in allele_str:
+            buf[pos // 4] |= np.uint8(_NUCLEOTIDE_ENCODE[ch] << ((pos % 4) * 2))
+            pos += 1
+
+    return buf, offsets
 
 
-def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     positions: list[float] = []
     times: list[float] = []
     alleles: list[str] = []
@@ -364,11 +387,15 @@ def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.n
         alleles.append(str(mutation.allele))
         ref_alleles.append(str(mutation.ref_allele))
 
+    allele_data, allele_offsets = _encode_alleles(alleles)
+    ref_data, ref_offsets = _encode_alleles(ref_alleles)
     return (
         np.asarray(positions, dtype=np.float64),
         np.asarray(times, dtype=np.float64),
-        _encode_alleles(alleles),
-        _encode_alleles(ref_alleles),
+        allele_data,
+        allele_offsets,
+        ref_data,
+        ref_offsets,
     )
 
 
@@ -454,7 +481,7 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
 
     sample_to_individual = np.arange(num_samples, dtype=index_dtype) // max(int(grg.ploidy), 1)
     coalescence_counts = _build_coalescence_counts(grg, node_perm=final_perm)
-    mutation_positions, mutation_times, mutation_alleles, mutation_ref_alleles = _build_mutation_table(grg)
+    mutation_positions, mutation_times, mutation_alleles, mutation_allele_offsets, mutation_ref_alleles, mutation_ref_allele_offsets = _build_mutation_table(grg)
 
     sample_perm = final_perm[:num_samples].copy()
     return CompiledOperatorState(
@@ -477,7 +504,9 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
         mutation_positions=mutation_positions,
         mutation_times=mutation_times,
         mutation_alleles=mutation_alleles,
+        mutation_allele_offsets=mutation_allele_offsets,
         mutation_ref_alleles=mutation_ref_alleles,
+        mutation_ref_allele_offsets=mutation_ref_allele_offsets,
         coalescence_counts=coalescence_counts,
     )
 
