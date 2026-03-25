@@ -9,7 +9,7 @@ from time import perf_counter
 import numpy as np
 import pygrgl
 
-from pygrgl_spmv.backends.memory import MemoryRecord
+from pygrgl_spmv.memory import MemoryAllocation, MemorySnapshot, live_snapshot, tree_rows
 from scripts.bench.cases import build_case, build_inputs_by_k, configured_direction_names
 from scripts.bench.cli import progress
 from scripts.bench.configs import BenchConfig
@@ -17,8 +17,10 @@ from scripts.bench.report import (
     bytes_to_gib,
     compare_outputs,
     evaluate_output_equivalence,
+    print_common_config,
     print_memory_table,
     print_runtime_table,
+    summarize_config_display,
     summarize_intra_diagnostics,
 )
 
@@ -70,7 +72,7 @@ class _CaseResult:
     output: np.ndarray
     mean_ms: float
     std_ms: float
-    memory_record: MemoryRecord
+    memory_snapshot: MemorySnapshot
     intra_errors: int
     intra_trials: int
     intra_fail_indices: list[str]
@@ -83,34 +85,53 @@ class _CaseResult:
     ref_rel_err_max: float | None
 
 
-def _record_signature(record: MemoryRecord) -> tuple[object, ...]:
+def _row_signature(row: MemoryAllocation) -> tuple[object, ...]:
+    # Timed benchmark validation checks stable memory shape, not allocator address reuse.
     return (
-        (record.host.level_buffers, record.host.inputs, record.host.outputs, record.host.aux),
-        (record.device.level_buffers, record.device.inputs, record.device.outputs, record.device.aux),
-        (record.static_ws.host_bytes, record.static_ws.device_bytes, record.static_ws.note),
-        (record.dynamic_ws.host_bytes, record.dynamic_ws.device_bytes, record.dynamic_ws.note),
-        (record.staging.host_bytes, record.staging.device_bytes, record.staging.note),
-        tuple(sorted(record.meta.items())),
+        int(row.nbytes),
+        row.storage,
+        tuple(sorted(row.owners)),
+        tuple(sorted(row.activities)),
+        tuple(sorted(row.retentions)),
+        tuple(sorted(row.directions)),
+        tuple(sorted(int(value) for value in row.slot_ks)),
+        tuple(sorted(row.labels)),
+        tuple(sorted(row.kinds)),
+    )
+
+
+def _snapshot_signature(snapshot: MemorySnapshot) -> tuple[object, ...]:
+    return (
+        str(snapshot.stage),
+        None if snapshot.runtime_k is None else int(snapshot.runtime_k),
+        snapshot.direction,
+        tuple(_row_signature(row) for row in snapshot.allocations),
+        tuple(sorted(snapshot.meta.items())),
     )
 
 
 def _validate_and_extract_runtime_memory(
     *,
-    call_slice: list[MemoryRecord],
+    call_slice: list[MemorySnapshot],
+    retained_slice: list[MemorySnapshot | None],
     direction: str,
     k: int,
     n_warmup: int,
     n_trials: int,
-) -> MemoryRecord:
+) -> MemorySnapshot:
     expected = 1 + n_warmup + n_trials
     if len(call_slice) != expected:
         raise AssertionError(
             f"Expected {expected} memory records for direction={direction}, k={k}, got {len(call_slice)}"
         )
+    if len(retained_slice) != expected:
+        raise AssertionError(
+            f"Expected {expected} retained memory records for direction={direction}, k={k}, got {len(retained_slice)}"
+        )
 
     expected_stage = "run_up" if direction == "up" else "run_down"
     for idx, record in enumerate(call_slice):
-        if record.stage != expected_stage:
+        if str(record.stage) != expected_stage:
             raise AssertionError(
                 f"Unexpected stage in memory record {idx}: expected {expected_stage}, got {record.stage}"
             )
@@ -118,25 +139,37 @@ def _validate_and_extract_runtime_memory(
             raise AssertionError(
                 f"Unexpected runtime_k in memory record {idx}: expected {k}, got {record.runtime_k}"
             )
-        rec_direction = str(record.meta.get("direction", ""))
-        if rec_direction != direction:
+        if record.direction != direction:
             raise AssertionError(
-                f"Unexpected direction in memory record {idx}: expected {direction}, got {rec_direction}"
+                f"Unexpected direction in memory record {idx}: expected {direction}, got {record.direction}"
             )
 
     timed_records = call_slice[1 + n_warmup :]
+    timed_retained = retained_slice[1 + n_warmup :]
     if len(timed_records) != n_trials:
         raise AssertionError(
             f"Expected {n_trials} timed memory records for direction={direction}, k={k}, got {len(timed_records)}"
         )
-
-    signatures = [_record_signature(record) for record in timed_records]
-    if len(set(signatures)) != 1:
+    if len(timed_retained) != n_trials:
         raise AssertionError(
-            f"Memory totals vary across timed trials for direction={direction}, k={k}"
+            f"Expected {n_trials} timed retained memory records for direction={direction}, k={k}, got {len(timed_retained)}"
         )
 
-    return timed_records[0]
+    signatures = [_snapshot_signature(record) for record in timed_records]
+    if len(set(signatures)) != 1:
+        raise AssertionError(
+            f"Call memory shape varies across timed trials for direction={direction}, k={k}"
+        )
+    retained_signatures = [
+        None if record is None else _snapshot_signature(record)
+        for record in timed_retained
+    ]
+    if len(set(retained_signatures)) != 1:
+        raise AssertionError(
+            f"Retained memory shape varies across timed trials for direction={direction}, k={k}"
+        )
+
+    return live_snapshot(timed_retained[0], timed_records[0])
 
 
 def _clone_kwargs(kwargs: dict[str, object]) -> dict[str, object]:
@@ -188,65 +221,80 @@ def _runtime_skip_row(*, label: str, scenario: str, direction: str, k: int, reas
         "note": f"skip: {reason}",
     }
 
-
 def _memory_skip_rows(*, label: str, scenario: str, direction: str, k: int, reason: str) -> list[dict[str, object]]:
     return [
         {
             "config": label,
             "scenario": scenario,
-            "direction": direction,
-            "k": int(k),
-            "kind": kind,
+            "case_direction": direction,
+            "case_k": int(k),
+            "level": 0,
+            "node": node,
+            "parent": "-",
             "skip": reason,
             "note": f"skip: {reason}",
         }
-        for kind in ("Total GiB", "Static WS GiB", "Dynamic WS GiB", "Staging GiB")
+        for node in ("cuda_live", "cpu_live")
     ]
 
 
-def _memory_rows(*, label: str, scenario: str, direction: str, k: int, record: MemoryRecord) -> list[dict[str, object]]:
-    return [
-        {
+def _memory_rows(*, label: str, scenario: str, direction: str, k: int, snapshot: MemorySnapshot) -> list[dict[str, object]]:
+    note = str(snapshot.meta.get("mode", ""))
+    rows: list[dict[str, object]] = []
+    last_leaf_key: tuple[object, ...] | None = None
+    last_leaf_row: dict[str, object] | None = None
+    for tree_row in tree_rows(snapshot):
+        path = tree_row.path
+        level = len(path) - 1
+        parent = tree_row.parent()
+        space = path[0].removesuffix("_live")
+        base_row = {
             "config": label,
             "scenario": scenario,
-            "direction": direction,
-            "k": int(k),
-            "kind": "Total GiB",
-            "host_gib": bytes_to_gib(record.host.total()),
-            "device_gib": bytes_to_gib(record.device.total()),
-            "note": f"mode={record.meta.get('mode', 'n/a')}",
-        },
-        {
-            "config": label,
-            "scenario": scenario,
-            "direction": direction,
-            "k": int(k),
-            "kind": "Static WS GiB",
-            "host_gib": bytes_to_gib(record.static_ws.host_bytes),
-            "device_gib": bytes_to_gib(record.static_ws.device_bytes),
-            "note": record.static_ws.note,
-        },
-        {
-            "config": label,
-            "scenario": scenario,
-            "direction": direction,
-            "k": int(k),
-            "kind": "Dynamic WS GiB",
-            "host_gib": bytes_to_gib(record.dynamic_ws.host_bytes),
-            "device_gib": bytes_to_gib(record.dynamic_ws.device_bytes),
-            "note": record.dynamic_ws.note,
-        },
-        {
-            "config": label,
-            "scenario": scenario,
-            "direction": direction,
-            "k": int(k),
-            "kind": "Staging GiB",
-            "host_gib": bytes_to_gib(record.staging.host_bytes),
-            "device_gib": bytes_to_gib(record.staging.device_bytes),
-            "note": record.staging.note,
-        },
-    ]
+            "case_direction": direction,
+            "case_k": int(k),
+            "level": level,
+            "parent": parent,
+            "gib": bytes_to_gib(tree_row.nbytes),
+            "space": space,
+            "note": note,
+        }
+        if not tree_row.is_leaf():
+            rows.append(
+                {
+                    **base_row,
+                    "node": tree_row.node(),
+                    "owner": "-",
+                    "active": "-",
+                    "retention": "-",
+                    "kinds": "",
+                }
+            )
+            last_leaf_key = None
+            last_leaf_row = None
+            continue
+
+        node = "|".join(sorted(tree_row.labels)) if tree_row.labels else "allocation"
+        kinds = "|".join(sorted(tree_row.kinds))
+        owner = "-" if tree_row.owner is None else str(tree_row.owner)
+        activity = "-" if tree_row.activity is None else str(tree_row.activity)
+        retention = "-" if tree_row.retention is None else str(tree_row.retention)
+        leaf_key = (level, parent, node, space, owner, activity, retention, kinds)
+        if leaf_key == last_leaf_key and last_leaf_row is not None:
+            last_leaf_row["gib"] = float(last_leaf_row["gib"]) + bytes_to_gib(tree_row.nbytes)
+            continue
+        leaf_row = {
+            **base_row,
+            "node": node,
+            "owner": owner,
+            "active": activity,
+            "retention": retention,
+            "kinds": kinds,
+        }
+        rows.append(leaf_row)
+        last_leaf_key = leaf_key
+        last_leaf_row = leaf_row
+    return rows
 
 
 def _run_case(
@@ -266,13 +314,20 @@ def _run_case(
 ) -> _CaseResult:
     progress(f"{label}: scenario={scenario} direction={direction} k={k} start")
 
-    calls = op._backend.mem_usage.calls
-    start_idx = len(calls)
     first = np.asarray(op.matmul(matrix, direction, **kwargs_factory()))
+    first_call = op.memory.last_call
+    if first_call is None:
+        raise AssertionError(f"Expected last_call memory after direction={direction}, k={k} preflight")
+    call_records = [first_call]
+    retained_records = [op.memory.retained]
     diagnostics = _IntraDiagnostics(steady_output=np.array(first, copy=True))
 
     for warm_idx in range(n_warmup):
         warm = np.asarray(op.matmul(matrix, direction, **kwargs_factory()))
+        if op.memory.last_call is None:
+            raise AssertionError(f"Expected last_call memory after direction={direction}, k={k} warmup={warm_idx + 1}")
+        call_records.append(op.memory.last_call)
+        retained_records.append(op.memory.retained)
         diagnostics.observe(warm, tag=f"w{warm_idx + 1}", atol=output_atol, rtol=output_rtol)
 
     times: list[float] = []
@@ -280,11 +335,15 @@ def _run_case(
         t0 = perf_counter()
         result = np.asarray(op.matmul(matrix, direction, **kwargs_factory()))
         times.append(perf_counter() - t0)
+        if op.memory.last_call is None:
+            raise AssertionError(f"Expected last_call memory after direction={direction}, k={k} trial={trial_idx + 1}")
+        call_records.append(op.memory.last_call)
+        retained_records.append(op.memory.retained)
         diagnostics.observe(result, tag=f"b{trial_idx + 1}", atol=output_atol, rtol=output_rtol)
 
-    end_idx = len(calls)
-    record = _validate_and_extract_runtime_memory(
-        call_slice=calls[start_idx:end_idx],
+    snapshot = _validate_and_extract_runtime_memory(
+        call_slice=call_records,
+        retained_slice=retained_records,
         direction=direction,
         k=int(k),
         n_warmup=n_warmup,
@@ -307,7 +366,7 @@ def _run_case(
         output=np.array(diagnostics.steady_output, copy=True),
         mean_ms=mean_ms,
         std_ms=std_ms,
-        memory_record=record,
+        memory_snapshot=snapshot,
         intra_errors=int(diagnostics.errors),
         intra_trials=int(diagnostics.trials),
         intra_fail_indices=list(diagnostics.fail_indices),
@@ -397,7 +456,7 @@ def benchmark_config(
                         "k": int(k),
                         "call_ms_mean": result.mean_ms,
                         "call_ms_std": result.std_ms,
-                        "note": f"mode={result.memory_record.meta.get('mode', 'n/a')}",
+                        "note": f"mode={result.memory_snapshot.meta.get('mode', 'n/a')}",
                         "intra_errors": result.intra_errors,
                         "intra_trials": result.intra_trials,
                         "intra_fail_indices": result.intra_fail_indices,
@@ -416,7 +475,7 @@ def benchmark_config(
                         scenario=scenario,
                         direction=direction,
                         k=int(k),
-                        record=result.memory_record,
+                        snapshot=result.memory_snapshot,
                     )
                 )
                 output_rows.append(
@@ -450,6 +509,7 @@ def run_benchmark_suite(
     from pygrgl_spmv import SpmvGRG
 
     progress(f"GRG file: {grg_path}")
+    common_config_lines, config_display = summarize_config_display(configs)
     all_runtime_rows: list[dict[str, object]] = []
     all_memory_rows: list[dict[str, object]] = []
     all_outputs: list[dict[str, object]] = []
@@ -485,8 +545,9 @@ def run_benchmark_suite(
     cross_stats, per_config_cross = evaluate_output_equivalence(all_outputs, atol=output_atol, rtol=output_rtol)
     intra_errors, intra_trials = summarize_intra_diagnostics(all_runtime_rows)
     ref_errors, ref_checked, ref_abs_max, ref_rel_max = _summarize_reference_diagnostics(all_runtime_rows)
-    print_runtime_table(all_runtime_rows, skip_note=skip_note)
-    print_memory_table(all_memory_rows, skip_note=skip_note)
+    print_common_config(common_config_lines)
+    print_runtime_table(all_runtime_rows, config_display=config_display, skip_note=skip_note)
+    print_memory_table(all_memory_rows, config_display=config_display, skip_note=skip_note)
     print(
         "\nCorrectness diagnostics: "
         f"intra_errors={intra_errors}/{intra_trials}, "
@@ -509,7 +570,7 @@ def run_benchmark_suite(
         failures = int(stats.get("failures", 0))
         trials = int(stats.get("trials", 0))
         rate = 0.0 if trials == 0 else 100.0 * float(failures) / float(trials)
-        print(f"  {cfg}: {failures}/{trials} ({rate:.1f}%)")
+        print(f"  {config_display.get(cfg, cfg)}: {failures}/{trials} ({rate:.1f}%)")
 
 
 __all__ = [

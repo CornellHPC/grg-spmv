@@ -99,10 +99,23 @@ def test_one_sided_plan_drops_unused_static_block_storage(
         infer_missing=False,
     )
 
-    static_attr = "host_static" if backend_name == "mkl" else "device_static"
-    base_static = getattr(baseline._backend.mem_usage, static_attr)
-    opt_static = getattr(optimized._backend.mem_usage, static_attr)
-    assert int(base_static.blocks_down) > 0
-    assert int(opt_static.blocks_down) == 0
-    assert int(opt_static.blocks_up) == int(base_static.blocks_up)
-    assert int(opt_static.total()) < int(base_static.total())
+    space = "cpu" if backend_name == "mkl" else "cuda"
+
+    def _node_bytes(op, node: str) -> int:
+        assert op.memory.retained is not None
+        return int(
+            sum(
+                row.nbytes
+                for row in op.memory.retained.allocations
+                if row.space == space and row.retention == "persistent" and node in row.labels
+            )
+        )
+
+    def _root_bytes(op) -> int:
+        assert op.memory.retained is not None
+        return int(sum(row.nbytes for row in op.memory.retained.allocations if row.space == space))
+
+    assert _node_bytes(baseline, "blocks_down") > 0
+    assert _node_bytes(optimized, "blocks_down") == 0
+    assert _node_bytes(optimized, "blocks_up") == _node_bytes(baseline, "blocks_up")
+    assert _root_bytes(optimized) < _root_bytes(baseline)

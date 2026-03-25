@@ -35,9 +35,9 @@ import scipy.sparse as sp
 
 from pygrgl_spmv.backends import (
     BackendBase,
+    CallCapture,
     BackendSetup,
     effective_k_hint,
-    estimate_common_host_static_bytes,
     iter_direction_level_pairs,
     selector_rows_unique_from_csr_indptr,
     warn_instrumentation_ignores_k_hint,
@@ -49,7 +49,7 @@ from pygrgl_spmv.backends.cusparse.ffi import (
     CudaVmmDriver,
     cuda_dtype,
 )
-from pygrgl_spmv.backends.memory import ResidencyBytes, RuntimeBytes, StaticBytes
+from pygrgl_spmv.memory import VmmAliasedAlloc, alloc_field, child_field, ignore_field
 from pygrgl_spmv.backends.types import Direction, InitMode, SparseFormat, parse_init_mode
 from . import plan as cusparse_plan
 from .plan import CusparsePlan, CusparsePlanPair, DenseOrder, Operation, SpMMAlgorithm
@@ -93,15 +93,15 @@ def is_valid_combo(fmt: str, transpose_bool: bool, algo: str) -> bool:
 class _CuBlock:
     """One physical sparse block plus its cuSPARSE descriptors."""
 
-    fmt: str
-    nrows: int
-    ncols: int
-    nnz: int
-    index_buffers: tuple[CupyArray, CupyArray]
-    data_ptr: int
-    graph_desc: c_void_p
-    dynamic_desc: c_void_p
-    payload_key: tuple[int, int, int]
+    fmt: str = ignore_field()
+    nrows: int = ignore_field()
+    ncols: int = ignore_field()
+    nnz: int = ignore_field()
+    index_buffers: tuple[CupyArray, CupyArray] = alloc_field(label="blocks", kind="sparse")
+    data_ptr: int = ignore_field()
+    graph_desc: c_void_p = ignore_field()
+    dynamic_desc: c_void_p = ignore_field()
+    payload_key: tuple[int, int, int] = ignore_field()
 
     @classmethod
     def from_scipy(
@@ -428,28 +428,28 @@ class _SampleRouting:
 class _DenseState:
     """Per-direction dense state, destination views, and source views."""
 
-    level_bufs: list[CupyArray]
-    dst_descs: list[c_void_p]
-    src_descs: list[c_void_p]
-    src_bufs: list[CupyArray] | None
+    level_bufs: list[CupyArray] = alloc_field(label="dense_state", kind="state")
+    dst_descs: list[c_void_p] = ignore_field()
+    src_descs: list[c_void_p] = ignore_field()
+    src_bufs: list[CupyArray] | None = alloc_field(label="source_state", kind="state", default=None)
 
 
 @dataclass
 class _DirectionWorkspace:
     """Reusable device state for one direction and one runtime ``k``."""
 
-    direction: Direction
-    k: int
-    use_graph_descs: bool
-    dense: _DenseState
-    fork_event: CupyEvent
-    ready_events: list[CupyEvent]
-    spmm_ext_by_level: list[list[CupyArray | None]]
-    scratch_views_by_level: list[list[CupyArray]]
-    scratch_dst_descs_by_level: list[list[c_void_p]]
-    scratch_done_events_by_level: list[list[CupyEvent]]
-    input_primary: CupyArray
-    graph: CupyGraph | None = None
+    direction: Direction = ignore_field()
+    k: int = ignore_field()
+    use_graph_descs: bool = ignore_field()
+    dense: _DenseState = child_field()
+    fork_event: CupyEvent = ignore_field()
+    ready_events: list[CupyEvent] = ignore_field()
+    spmm_ext_by_level: list[list[CupyArray | None]] = alloc_field(label="spmm_ext", kind="auxiliary")
+    scratch_views_by_level: list[list[CupyArray]] = alloc_field(label="scratch_views", kind="scratch")
+    scratch_dst_descs_by_level: list[list[c_void_p]] = ignore_field()
+    scratch_done_events_by_level: list[list[CupyEvent]] = ignore_field()
+    input_primary: CupyArray = alloc_field(label="input_primary", kind="input")
+    graph: CupyGraph | None = ignore_field(default=None)
 
     def destroy(self, *, cslib: CuSparseLib) -> None:
         seen: set[int] = set()
@@ -470,22 +470,85 @@ class _DirectionWorkspace:
 
 @dataclass
 class _WorkspaceCache:
-    dynamic_up: _DirectionWorkspace | None = None
-    graph_up: _DirectionWorkspace | None = None
-    dynamic_down: _DirectionWorkspace | None = None
-    graph_down: _DirectionWorkspace | None = None
+    dynamic_up: _DirectionWorkspace | None = child_field(retention="on_demand", activity="no", direction="up", slot_k_from_attr="k", default=None)
+    graph_up: _DirectionWorkspace | None = child_field(retention="captured", activity="no", direction="up", slot_k_from_attr="k", default=None)
+    dynamic_down: _DirectionWorkspace | None = child_field(retention="on_demand", activity="no", direction="down", slot_k_from_attr="k", default=None)
+    graph_down: _DirectionWorkspace | None = child_field(retention="captured", activity="no", direction="down", slot_k_from_attr="k", default=None)
 
 
 @dataclass
 class _DirectionStaging:
-    k: int
-    input_miss: CupyArray | None = None
-    output_main: CupyArray | None = None
-    output_miss: CupyArray | None = None
-    sample_gather_tmp: list[CupyArray | None] | None = None
-    init_vector: CupyArray | None = None
-    init_matrix: CupyArray | None = None
-    xtx_bias: CupyArray | None = None
+    k: int = ignore_field()
+    input_miss: CupyArray | None = alloc_field(label="input_miss", kind="input", default=None)
+    output_main: CupyArray | None = alloc_field(label="output_main", kind="output", default=None)
+    output_miss: CupyArray | None = alloc_field(label="output_miss", kind="output", default=None)
+    sample_gather_tmp: list[CupyArray | None] | None = alloc_field(label="sample_gather_tmp", kind="temporary", default=None)
+    init_vector: CupyArray | None = alloc_field(label="init_vector", kind="init", default=None)
+    init_matrix: CupyArray | None = alloc_field(label="init_matrix", kind="init", default=None)
+    xtx_bias: CupyArray | None = alloc_field(label="xtx_bias", kind="init", default=None)
+
+
+@dataclass
+class CusparseCall:
+    node_values_host: np.ndarray | None = alloc_field(
+        label="node_values_host", kind="state", owner="backend", retention="call", activity="yes", default=None
+    )
+    miss_output_host: np.ndarray | None = alloc_field(
+        label="miss_output_host", kind="output", owner="backend", retention="call", activity="yes", default=None
+    )
+
+
+@dataclass
+class CusparseRetained:
+    alpha: CupyArray | None = alloc_field(
+        label="alpha", kind="auxiliary", owner="backend", retention="persistent", activity="always", default=None
+    )
+    beta_zero: CupyArray | None = alloc_field(
+        label="beta_zero", kind="auxiliary", owner="backend", retention="persistent", activity="always", default=None
+    )
+    beta_one: CupyArray | None = alloc_field(
+        label="beta_one", kind="auxiliary", owner="backend", retention="persistent", activity="always", default=None
+    )
+    shared_values_materialized: CupyArray | None = alloc_field(
+        label="shared_values", kind="sparse", owner="backend", retention="persistent", activity="always", default=None
+    )
+    shared_values_vmm: VmmAliasedAlloc | None = alloc_field(
+        label="shared_values", kind="sparse", owner="backend", retention="persistent", activity="always", default=None
+    )
+    blocks_up: list[tuple[CupyArray, CupyArray]] = alloc_field(
+        label="blocks_up", kind="sparse", owner="backend", retention="persistent", activity="always", default_factory=list
+    )
+    blocks_down: list[tuple[CupyArray, CupyArray]] = alloc_field(
+        label="blocks_down", kind="sparse", owner="backend", retention="persistent", activity="always", default_factory=list
+    )
+    mut_selector_rows: list[CupyArray] | None = alloc_field(
+        label="selector_mut", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    mut_selector_cols: list[CupyArray] | None = alloc_field(
+        label="selector_mut", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    miss_selector_rows: list[CupyArray] | None = alloc_field(
+        label="selector_miss", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    miss_selector_cols: list[CupyArray] | None = alloc_field(
+        label="selector_miss", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    sample_routing_fwd_src: list[CupyArray | None] | None = alloc_field(
+        label="sample_routing_fwd", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
+    )
+    sample_routing_bwd_dst: list[CupyArray] | None = alloc_field(
+        label="sample_routing_bwd_dst", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
+    )
+    sample_routing_bwd_src: list[CupyArray] | None = alloc_field(
+        label="sample_routing_bwd_src", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
+    )
+    workspaces: _WorkspaceCache = child_field(owner="backend", default_factory=_WorkspaceCache)
+    staging_up_by_k: dict[int, _DirectionStaging] = child_field(
+        owner="backend", retention="staging", activity="no", direction="up", slot_k_from_dict_key=True, default_factory=dict
+    )
+    staging_down_by_k: dict[int, _DirectionStaging] = child_field(
+        owner="backend", retention="staging", activity="no", direction="down", slot_k_from_dict_key=True, default_factory=dict
+    )
 
 
 def _dense_order_char(order: DenseOrder) -> str:
@@ -604,6 +667,17 @@ def _destroy_block_grid(grid: list[list[_CuBlock | None]], *, cslib: CuSparseLib
 class CusparseBackend(BackendBase):
     """GPU backend using cuSPARSE for block-wise level traversal."""
 
+    _SETUP_MEMORY_POLICY = {
+        "_A_blocks": "dropped",
+        "_sel_mut": "dropped",
+        "_sel_miss": "dropped",
+        "_level_offsets": "borrowed",
+        "_sample_perm": "borrowed",
+        "_inv_sample_perm": "borrowed",
+        "_coalescence_counts": "borrowed",
+        "_xtx_host": "dropped",
+    }
+
     def __init__(
         self,
         *,
@@ -666,6 +740,28 @@ class CusparseBackend(BackendBase):
         self._staging_up_by_k: dict[int, _DirectionStaging] = {}
         self._staging_down_by_k: dict[int, _DirectionStaging] = {}
         self._nvtx = make_cupy_tracer("grg.cusparse", self._cp) if self._instrumentation else None
+        self._install_memory(
+            retained=CusparseRetained(
+                alpha=None,
+                beta_zero=None,
+                beta_one=None,
+                shared_values_materialized=None,
+                shared_values_vmm=None,
+                blocks_up=[],
+                blocks_down=[],
+                mut_selector_rows=None,
+                mut_selector_cols=None,
+                miss_selector_rows=None,
+                miss_selector_cols=None,
+                sample_routing_fwd_src=None,
+                sample_routing_bwd_dst=None,
+                sample_routing_bwd_src=None,
+                workspaces=self._workspaces,
+                staging_up_by_k=self._staging_up_by_k,
+                staging_down_by_k=self._staging_down_by_k,
+            ),
+            call_type=CusparseCall,
+        )
 
         self._logger.info(
             "cuSPARSE runtime levels: CUDA runtime=%s cuSPARSE=%s",
@@ -694,6 +790,49 @@ class CusparseBackend(BackendBase):
             values.destroy()
         finally:
             self._shared_ones = None
+            self._sync_retained_root()
+            self._bump_retained_epoch()
+
+    def _sync_retained_root(self) -> None:
+        retained = self._retained_mem
+        retained.alpha = self._alpha
+        retained.beta_zero = self._beta_zero
+        retained.beta_one = self._beta_one
+        if self._shared_ones is None:
+            retained.shared_values_materialized = None
+            retained.shared_values_vmm = None
+        elif self._shared_ones.vmm:
+            retained.shared_values_materialized = None
+            retained.shared_values_vmm = VmmAliasedAlloc(
+                ptr=int(self._shared_ones.ptr),
+                physical_nbytes=int(self._shared_ones.physical_nbytes),
+                logical_nbytes=int(self._shared_ones.logical_nbytes),
+            )
+        else:
+            retained.shared_values_materialized = self._shared_ones._materialized
+            retained.shared_values_vmm = None
+        retained.blocks_up = [
+            block.index_buffers
+            for row in self._blocks_up
+            for block in row
+            if block is not None
+        ]
+        retained.blocks_down = [
+            block.index_buffers
+            for row in self._blocks_down
+            for block in row
+            if block is not None
+        ]
+        retained.mut_selector_rows = None if self._mut_selector is None else self._mut_selector.rows_by_level
+        retained.mut_selector_cols = None if self._mut_selector is None else self._mut_selector.cols_by_level
+        retained.miss_selector_rows = None if self._miss_selector is None else self._miss_selector.rows_by_level
+        retained.miss_selector_cols = None if self._miss_selector is None else self._miss_selector.cols_by_level
+        retained.sample_routing_fwd_src = None if self._sample_routing is None else self._sample_routing.fwd_src
+        retained.sample_routing_bwd_dst = None if self._sample_routing is None else self._sample_routing.bwd_dst
+        retained.sample_routing_bwd_src = None if self._sample_routing is None else self._sample_routing.bwd_src
+        retained.workspaces = self._workspaces
+        retained.staging_up_by_k = self._staging_up_by_k
+        retained.staging_down_by_k = self._staging_down_by_k
 
     def _max_block_nnz(self) -> int:
         return max((int(block.nnz) for row in self._A_blocks for block in row), default=0)
@@ -975,9 +1114,9 @@ class CusparseBackend(BackendBase):
             ws.graph = self._capture_wavefront_graph(ws)
             setattr(self._workspaces, slot, ws)
             self._static_workspace_slots.add(slot)
-
-        self.mem_usage.reset()
-        self.mem_usage.host_static, self.mem_usage.device_static = self.estimate_static_bytes()
+        self._sync_retained_root()
+        self._bump_retained_epoch()
+        self._assert_setup_memory_contract()
 
     def _build_direction_blocks(self, *, direction: Direction) -> list[list[_CuBlock | None]]:
         if self._cuda_dtype is None:
@@ -1153,6 +1292,17 @@ class CusparseBackend(BackendBase):
     def _scratch_streams_for(self, direction: Direction) -> list[list[CupyStream]]:
         return self._scratch_streams_up_by_level if direction == Direction.UP else self._scratch_streams_down_by_level
 
+    def _await_direction_streams(self, direction: Direction) -> None:
+        # Host-visible output collection must wait for all streams participating in a traversal,
+        # not just the capture stream that launches the final gather/copy.
+        self._capture_stream.synchronize()
+        for stream in self._level_streams:
+            stream.synchronize()
+        for scratch_streams in self._scratch_streams_for(direction):
+            for stream in scratch_streams:
+                stream.synchronize()
+        self._capture_stream.synchronize()
+
     def _resolve_scratch_levels(self, direction: Direction) -> frozenset[int]:
         plan = self._require_plan(direction)
         token = str(plan.scratch)
@@ -1188,6 +1338,15 @@ class CusparseBackend(BackendBase):
         ]
 
     def _destroy_workspace_cache(self) -> None:
+        had_workspace = any(
+            ws is not None
+            for ws in (
+                self._workspaces.graph_up,
+                self._workspaces.dynamic_up,
+                self._workspaces.graph_down,
+                self._workspaces.dynamic_down,
+            )
+        )
         for ws in (
             self._workspaces.graph_up,
             self._workspaces.dynamic_up,
@@ -1202,10 +1361,17 @@ class CusparseBackend(BackendBase):
                 pass
         self._workspaces = _WorkspaceCache()
         self._static_workspace_slots.clear()
+        self._sync_retained_root()
+        if had_workspace:
+            self._bump_retained_epoch()
 
     def _clear_staging(self) -> None:
+        had_staging = bool(self._staging_up_by_k or self._staging_down_by_k)
         self._staging_up_by_k.clear()
         self._staging_down_by_k.clear()
+        self._sync_retained_root()
+        if had_staging:
+            self._bump_retained_epoch()
 
     def _staging_for(self, direction: Direction, k: int) -> _DirectionStaging:
         mapping = self._staging_up_by_k if direction == Direction.UP else self._staging_down_by_k
@@ -1216,7 +1382,35 @@ class CusparseBackend(BackendBase):
                 sample_gather_tmp=[None for _ in range(self._H)] if direction == Direction.DOWN else None,
             )
             mapping[int(k)] = staging
+            self._sync_retained_root()
+            self._bump_retained_epoch()
         return staging
+
+    def _ensure_staging_array(
+        self,
+        staging: _DirectionStaging,
+        attr: str,
+        shape: tuple[int, ...],
+        *,
+        order: str = "C",
+    ):
+        value = getattr(staging, attr)
+        if value is None:
+            value = self._cp.zeros(shape, dtype=self._dtype, order=order)
+            setattr(staging, attr, value)
+            self._bump_retained_epoch()
+        return value
+
+    def _ensure_sample_gather_tmp(self, staging: _DirectionStaging, h: int, rows: int, k: int):
+        if staging.sample_gather_tmp is None:
+            staging.sample_gather_tmp = [None for _ in range(self._H)]
+            self._bump_retained_epoch()
+        value = staging.sample_gather_tmp[h]
+        if value is None:
+            value = self._cp.zeros((int(rows), int(k)), dtype=self._dtype, order="C")
+            staging.sample_gather_tmp[h] = value
+            self._bump_retained_epoch()
+        return value
 
     def _workspace_slot(self, direction: Direction, *, graph: bool) -> str:
         return f"{'graph' if graph else 'dynamic'}_{direction.value}"
@@ -1388,6 +1582,8 @@ class CusparseBackend(BackendBase):
                 ws.destroy(cslib=self._cslib)
             ws = self._build_direction_workspace(direction, int(k), use_graph_descs=False)
             setattr(self._workspaces, slot, ws)
+            self._sync_retained_root()
+            self._bump_retained_epoch()
         return ws
 
     def _stage_inputs(
@@ -1403,7 +1599,12 @@ class CusparseBackend(BackendBase):
         ws.input_primary.set(x, stream=self._capture_stream)
         if miss_arr is not None:
             if staging.input_miss is None:
-                staging.input_miss = self._cp.zeros((self._num_mutations, ws.k), dtype=self._dtype, order="C")
+                staging.input_miss = self._ensure_staging_array(
+                    staging,
+                    "input_miss",
+                    (self._num_mutations, ws.k),
+                    order="C",
+                )
             staging.input_miss.set(miss_arr, stream=self._capture_stream)
 
         match init_mode:
@@ -1413,13 +1614,18 @@ class CusparseBackend(BackendBase):
                 if init_payload is None:
                     raise ValueError("init vector payload is required for init_mode=vector")
                 if staging.init_vector is None:
-                    staging.init_vector = self._cp.zeros((1, ws.k), dtype=self._dtype, order="C")
+                    staging.init_vector = self._ensure_staging_array(staging, "init_vector", (1, ws.k), order="C")
                 staging.init_vector[0].set(init_payload, stream=self._capture_stream)
             case InitMode.MATRIX:
                 if init_payload is None:
                     raise ValueError("init matrix payload is required for init_mode=matrix")
                 if staging.init_matrix is None:
-                    staging.init_matrix = self._cp.zeros((self._num_nodes, ws.k), dtype=self._dtype, order="C")
+                    staging.init_matrix = self._ensure_staging_array(
+                        staging,
+                        "init_matrix",
+                        (self._num_nodes, ws.k),
+                        order="C",
+                    )
                 staging.init_matrix.set(init_payload, stream=self._capture_stream)
             case _:
                 raise ValueError(f"Unknown init mode: {init_mode!r}")
@@ -1476,6 +1682,7 @@ class CusparseBackend(BackendBase):
                             2.0 * self._coalescence_counts.astype(self._dtype, copy=False),
                             dtype=self._dtype,
                         ).reshape(self._num_nodes)
+                        self._bump_retained_epoch()
                     for h in range(self._H):
                         lo = int(self._level_offsets[h])
                         hi = int(self._level_offsets[h + 1])
@@ -1507,7 +1714,12 @@ class CusparseBackend(BackendBase):
 
         if ws.direction == Direction.UP:
             if staging.output_main is None:
-                staging.output_main = self._cp.zeros((self._num_mutations, ws.k), dtype=self._dtype, order="C")
+                staging.output_main = self._ensure_staging_array(
+                    staging,
+                    "output_main",
+                    (self._num_mutations, ws.k),
+                    order="C",
+                )
             self._mut_selector.gather(
                 cp=self._cp,
                 stream=self._capture_stream,
@@ -1516,7 +1728,12 @@ class CusparseBackend(BackendBase):
             )
             if need_miss_output:
                 if staging.output_miss is None:
-                    staging.output_miss = self._cp.zeros((self._num_mutations, ws.k), dtype=self._dtype, order="C")
+                    staging.output_miss = self._ensure_staging_array(
+                        staging,
+                        "output_miss",
+                        (self._num_mutations, ws.k),
+                        order="C",
+                    )
                 self._miss_selector.gather(
                     cp=self._cp,
                     stream=self._capture_stream,
@@ -1526,21 +1743,26 @@ class CusparseBackend(BackendBase):
             tracer = self._nvtx
             if tracer is not None:
                 with tracer.range("await_outputs", dir=ws.direction.value):
-                    self._capture_stream.synchronize()
+                    self._await_direction_streams(ws.direction)
             else:
-                self._capture_stream.synchronize()
+                self._await_direction_streams(ws.direction)
             out_main = staging.output_main.get()
             out_aux = staging.output_miss.get() if need_miss_output and staging.output_miss is not None else None
             return out_main, out_aux
 
         if staging.output_main is None:
-            staging.output_main = self._cp.zeros((self._num_samples, ws.k), dtype=self._dtype, order="C")
-        if staging.sample_gather_tmp is None:
-            staging.sample_gather_tmp = [None for _ in range(self._H)]
+            staging.output_main = self._ensure_staging_array(
+                staging,
+                "output_main",
+                (self._num_samples, ws.k),
+                order="C",
+            )
         for h, dst in enumerate(self._sample_routing.bwd_dst):
-            if dst.size == 0 or staging.sample_gather_tmp[h] is not None:
+            if dst.size == 0:
                 continue
-            staging.sample_gather_tmp[h] = self._cp.zeros((int(dst.size), ws.k), dtype=self._dtype, order="C")
+            if staging.sample_gather_tmp is not None and staging.sample_gather_tmp[h] is not None:
+                continue
+            self._ensure_sample_gather_tmp(staging, h, int(dst.size), int(ws.k))
         self._sample_routing.gather(
             cp=self._cp,
             stream=self._capture_stream,
@@ -1551,18 +1773,18 @@ class CusparseBackend(BackendBase):
         tracer = self._nvtx
         if tracer is not None:
             with tracer.range("await_outputs", dir=ws.direction.value):
-                self._capture_stream.synchronize()
+                self._await_direction_streams(ws.direction)
         else:
-            self._capture_stream.synchronize()
+            self._await_direction_streams(ws.direction)
         return staging.output_main.get()
 
     def _copy_node_outputs_to_host(self, ws: _DirectionWorkspace) -> np.ndarray:
         tracer = self._nvtx
         if tracer is not None:
             with tracer.range("await_outputs", dir=ws.direction.value):
-                self._capture_stream.synchronize()
+                self._await_direction_streams(ws.direction)
         else:
-            self._capture_stream.synchronize()
+            self._await_direction_streams(ws.direction)
         out = np.empty((self._num_nodes, ws.k), dtype=self._dtype)
         offset = 0
         for buf in ws.dense.level_bufs:
@@ -1835,7 +2057,7 @@ class CusparseBackend(BackendBase):
             for buf in ws.dense.level_bufs:
                 buf.fill(0)
         self._enqueue_wavefront(ws)
-        self._capture_stream.synchronize()
+        self._await_direction_streams(ws.direction)
 
         self._capture_stream.begin_capture()
         try:
@@ -1849,75 +2071,8 @@ class CusparseBackend(BackendBase):
             raise
 
         graph.upload(self._capture_stream)
-        self._capture_stream.synchronize()
+        self._await_direction_streams(ws.direction)
         return graph
-
-    def _staging_nbytes(self, direction: Direction) -> int:
-        mapping = self._staging_up_by_k if direction == Direction.UP else self._staging_down_by_k
-        total = 0
-        for staging in mapping.values():
-            total += int(
-                _gpu_nbytes(staging.input_miss)
-                + _gpu_nbytes(staging.output_main)
-                + _gpu_nbytes(staging.output_miss)
-                + _gpu_nbytes(staging.sample_gather_tmp)
-                + _gpu_nbytes(staging.init_vector)
-                + _gpu_nbytes(staging.init_matrix)
-                + _gpu_nbytes(staging.xtx_bias)
-            )
-        return int(total)
-
-    def _staging_total_nbytes(self) -> int:
-        return int(self._staging_nbytes(Direction.UP) + self._staging_nbytes(Direction.DOWN))
-
-    def _static_workspace_total_nbytes(self) -> int:
-        return int(sum(_workspace_nbytes(getattr(self._workspaces, slot)) for slot in self._static_workspace_slots))
-
-    def _dynamic_workspace_total_nbytes(self) -> int:
-        return int(
-            _workspace_nbytes(self._workspaces.dynamic_up)
-            + _workspace_nbytes(self._workspaces.dynamic_down)
-        )
-
-    def _workspace_note(self, *, graph: bool, active_slot: str | None) -> str:
-        slots = ("graph_up", "graph_down") if graph else ("dynamic_up", "dynamic_down")
-        notes: list[str] = []
-        for slot in slots:
-            ws = getattr(self._workspaces, slot)
-            if ws is None:
-                continue
-            note = f"{slot}(k={ws.k})"
-            if slot == active_slot:
-                note += "(active)"
-            notes.append(note)
-        return "none" if not notes else ",".join(notes)
-
-    def _staging_note(self, direction: Direction, k: int) -> str:
-        notes: list[str] = []
-        for name, mapping in (("up", self._staging_up_by_k), ("down", self._staging_down_by_k)):
-            for runtime_k, staging in sorted(mapping.items()):
-                note = (
-                    f"{name}:{runtime_k}"
-                    f":miss={int(staging.input_miss is not None)}"
-                    f":main={int(staging.output_main is not None)}"
-                    f":miss_out={int(staging.output_miss is not None)}"
-                    f":gather_tmp={int(staging.sample_gather_tmp is not None and any(buf is not None for buf in staging.sample_gather_tmp))}"
-                    f":init_vec={int(staging.init_vector is not None)}"
-                    f":init_mat={int(staging.init_matrix is not None)}"
-                    f":xtx={int(staging.xtx_bias is not None)}"
-                )
-                if name == direction.value and int(runtime_k) == int(k):
-                    note += "(active)"
-                notes.append(note)
-        return "none" if not notes else ",".join(notes)
-
-    def _residency_bytes(self, *, direction: Direction, k: int, use_graph: bool) -> tuple[ResidencyBytes, ResidencyBytes, ResidencyBytes]:
-        active_slot = self._workspace_slot(direction, graph=use_graph)
-        return (
-            ResidencyBytes(host_bytes=0, device_bytes=self._static_workspace_total_nbytes(), note=self._workspace_note(graph=True, active_slot=active_slot)),
-            ResidencyBytes(host_bytes=0, device_bytes=self._dynamic_workspace_total_nbytes(), note=self._workspace_note(graph=False, active_slot=active_slot)),
-            ResidencyBytes(host_bytes=0, device_bytes=self._staging_total_nbytes(), note=self._staging_note(direction, k)),
-        )
 
     def _run_direction(
         self,
@@ -1985,104 +2140,41 @@ class CusparseBackend(BackendBase):
                 else self._collect_outputs(ws, staging, need_miss_output=need_miss_output)
             )
 
-        device_level_buffers = int(_dense_state_nbytes(ws.dense))
-        device_inputs = int(ws.input_primary.nbytes + (0 if staging.input_miss is None or miss_arr is None else staging.input_miss.nbytes))
-        if emit_all_nodes:
-            device_outputs = 0
-        elif direction == Direction.UP:
-            device_outputs = int(
-                (0 if staging.output_main is None else staging.output_main.nbytes)
-                + (0 if staging.output_miss is None or not need_miss_output else staging.output_miss.nbytes)
+        if self._capture_active:
+            call = self._call_mem
+            assert isinstance(call, CusparseCall)
+            call.node_values_host = outputs if emit_all_nodes else None
+            call.miss_output_host = outputs[1] if (direction == Direction.UP and not emit_all_nodes) else None
+            active_values: list[object] = [ws]
+            if direction == Direction.DOWN and miss_arr is not None and staging.input_miss is not None:
+                active_values.append(staging.input_miss)
+            if mode == InitMode.VECTOR and staging.init_vector is not None:
+                active_values.append(staging.init_vector)
+            elif mode == InitMode.MATRIX and staging.init_matrix is not None:
+                active_values.append(staging.init_matrix)
+            elif mode == InitMode.XTX and staging.xtx_bias is not None:
+                active_values.append(staging.xtx_bias)
+            if not emit_all_nodes and staging.output_main is not None:
+                active_values.append(staging.output_main)
+            if direction == Direction.UP and need_miss_output and staging.output_miss is not None:
+                active_values.append(staging.output_miss)
+            if direction == Direction.DOWN and not emit_all_nodes and staging.sample_gather_tmp is not None:
+                active_values.extend(temp for temp in staging.sample_gather_tmp if temp is not None)
+            self._publish_call_capture(
+                CallCapture(
+                    nonce=self._capture_nonce,
+                    direction=direction.value,
+                    runtime_k=int(k),
+                    active_alloc_keys=self._alloc_keys(*active_values),
+                    meta={
+                        "emit_all_nodes": bool(emit_all_nodes),
+                        "need_miss_output": bool(need_miss_output) if direction == Direction.UP else False,
+                        "has_miss_input": bool(miss_arr is not None) if direction == Direction.DOWN else False,
+                        "mode": exec_mode,
+                    },
+                )
             )
-        else:
-            device_outputs = 0 if staging.output_main is None else int(staging.output_main.nbytes)
-        device_live_total = int(
-            self._static_workspace_total_nbytes()
-            + self._dynamic_workspace_total_nbytes()
-            + self._staging_total_nbytes()
-        )
-        device_aux = max(0, device_live_total - device_level_buffers - device_inputs - device_outputs)
-        static_ws, dynamic_ws, staging_bytes = self._residency_bytes(direction=direction, k=int(k), use_graph=use_graph)
-
-        if emit_all_nodes:
-            out = outputs
-            self.mem_usage.record(
-                stage="run_up" if direction == Direction.UP else "run_down",
-                runtime_k=k,
-                host_runtime=RuntimeBytes(
-                    inputs=int(x.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
-                    outputs=int(out.nbytes),
-                    aux=0 if init_payload is None else int(init_payload.nbytes),
-                ),
-                device_runtime=RuntimeBytes(
-                    level_buffers=device_level_buffers,
-                    inputs=device_inputs,
-                    outputs=device_outputs,
-                    aux=device_aux,
-                ),
-                static_ws=static_ws,
-                dynamic_ws=dynamic_ws,
-                staging=staging_bytes,
-                meta={
-                    "direction": direction.value,
-                    "emit_all_nodes": True,
-                    "mode": exec_mode,
-                },
-            )
-            return out
-
-        if direction == Direction.UP:
-            out_mut, out_miss = outputs
-            self.mem_usage.record(
-                stage="run_up",
-                runtime_k=k,
-                host_runtime=RuntimeBytes(
-                    inputs=int(x.nbytes),
-                    outputs=int(out_mut.nbytes + (0 if out_miss is None else out_miss.nbytes)),
-                    aux=0 if init_payload is None else int(init_payload.nbytes),
-                ),
-                device_runtime=RuntimeBytes(
-                    level_buffers=device_level_buffers,
-                    inputs=device_inputs,
-                    outputs=device_outputs,
-                    aux=device_aux,
-                ),
-                static_ws=static_ws,
-                dynamic_ws=dynamic_ws,
-                staging=staging_bytes,
-                meta={
-                    "direction": direction.value,
-                    "need_miss_output": bool(need_miss_output),
-                    "mode": exec_mode,
-                },
-            )
-            return out_mut, out_miss
-
-        out = outputs
-        self.mem_usage.record(
-            stage="run_down",
-            runtime_k=k,
-            host_runtime=RuntimeBytes(
-                inputs=int(x.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
-                outputs=int(out.nbytes),
-                aux=0 if init_payload is None else int(init_payload.nbytes),
-            ),
-            device_runtime=RuntimeBytes(
-                level_buffers=device_level_buffers,
-                inputs=device_inputs,
-                outputs=device_outputs,
-                aux=device_aux,
-            ),
-            static_ws=static_ws,
-            dynamic_ws=dynamic_ws,
-            staging=staging_bytes,
-            meta={
-                "direction": direction.value,
-                "has_miss_input": bool(miss_arr is not None),
-                "mode": exec_mode,
-            },
-        )
-        return out
+        return outputs
 
     def run_up(
         self,
@@ -2155,38 +2247,6 @@ class CusparseBackend(BackendBase):
             need_miss_output=False,
             emit_all_nodes=True,
         )
-
-    def estimate_static_bytes(self) -> tuple[StaticBytes, StaticBytes]:
-        host = estimate_common_host_static_bytes(
-            level_offsets=self._level_offsets,
-            sample_perm=self._sample_perm,
-            inv_sample_perm=self._inv_sample_perm,
-            coalescence_counts=self._coalescence_counts,
-            xtx_init=None,
-        )
-        device = StaticBytes()
-        index_itemsize = int(np.dtype(np.int32).itemsize)
-        device.blocks_up = _estimate_block_grid_bytes(
-            self._blocks_up,
-            index_itemsize=index_itemsize,
-        )
-        device.blocks_down = 0 if not self._store_blocks_down else _estimate_block_grid_bytes(
-            self._blocks_down,
-            index_itemsize=index_itemsize,
-        )
-        shared_bytes = 0 if self._shared_ones is None else int(self._shared_ones.physical_nbytes)
-        if shared_bytes:
-            shared_bucket = "blocks_up" if self._plan_up is not None else "blocks_down"
-            setattr(device, shared_bucket, int(getattr(device, shared_bucket) + shared_bytes))
-        device.selector_mut = 0 if self._mut_selector is None else int(self._mut_selector.nbytes())
-        device.selector_miss = 0 if self._miss_selector is None else int(self._miss_selector.nbytes())
-        device.workspace = int(
-            sum(
-                _workspace_nbytes(getattr(self._workspaces, slot))
-                for slot in self._static_workspace_slots
-            )
-        )
-        return host, device
 
     def __del__(self):
         cslib = getattr(self, "_cslib", None)

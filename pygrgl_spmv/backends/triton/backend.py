@@ -15,14 +15,14 @@ import triton
 
 from pygrgl_spmv.backends.base import (
     BackendBase,
+    CallCapture,
     BackendSetup,
     effective_k_hint,
-    estimate_common_host_static_bytes,
     iter_direction_level_pairs,
     warn_instrumentation_ignores_k_hint,
 )
-from pygrgl_spmv.backends.memory import ResidencyBytes, RuntimeBytes, StaticBytes
 from pygrgl_spmv.backends._nvtx import make_torch_tracer
+from pygrgl_spmv.memory import alloc_field, child_field, ignore_field
 from pygrgl_spmv.backends.triton.kernel import (
     CSC_CANDIDATE_CONFIGS,
     CSR_CANDIDATE_CONFIGS,
@@ -82,12 +82,12 @@ def _structure_signature(ops_by_level: list[list["_TritonOp"]]) -> str:
 
 @dataclass(frozen=True)
 class _TritonBlock:
-    indices: torch.Tensor
-    indptr: torch.Tensor
-    nrows: int
-    ncols: int
-    nnz: int
-    fmt: SparseFormat
+    indices: torch.Tensor = alloc_field(label="blocks", kind="sparse")
+    indptr: torch.Tensor = alloc_field(label="blocks", kind="sparse")
+    nrows: int = ignore_field()
+    ncols: int = ignore_field()
+    nnz: int = ignore_field()
+    fmt: SparseFormat = ignore_field()
 
     def nbytes(self) -> int:
         return _torch_nbytes(self.indices) + _torch_nbytes(self.indptr)
@@ -119,40 +119,92 @@ class _TritonScratchLevelPlan:
 
 @dataclass
 class _DirectionWorkspace:
-    direction: Direction
-    capture_stream: torch.cuda.Stream
-    level_streams: list[torch.cuda.Stream]
-    fork_event: torch.cuda.Event
-    ready_events: list[torch.cuda.Event]
-    node_state: torch.Tensor
-    level_views: list[torch.Tensor]
-    scratch_streams_by_level: list[list[torch.cuda.Stream]]
-    scratch_done_events_by_level: list[list[torch.cuda.Event]]
-    scratch_views_by_level: list[list[torch.Tensor]]
-    input_primary: torch.Tensor
-    graph: torch.cuda.CUDAGraph | None = None
+    direction: Direction = ignore_field()
+    capture_stream: torch.cuda.Stream = ignore_field()
+    level_streams: list[torch.cuda.Stream] = ignore_field()
+    fork_event: torch.cuda.Event = ignore_field()
+    ready_events: list[torch.cuda.Event] = ignore_field()
+    node_state: torch.Tensor = alloc_field(label="node_state", kind="state")
+    level_views: list[torch.Tensor] = alloc_field(label="level_view", kind="state")
+    scratch_streams_by_level: list[list[torch.cuda.Stream]] = ignore_field()
+    scratch_done_events_by_level: list[list[torch.cuda.Event]] = ignore_field()
+    scratch_views_by_level: list[list[torch.Tensor]] = alloc_field(label="scratch_views", kind="scratch")
+    input_primary: torch.Tensor = alloc_field(label="input_primary", kind="input")
+    graph: torch.cuda.CUDAGraph | None = ignore_field(default=None)
 
 
 @dataclass
 class _WorkspaceCache:
-    dynamic_up: _DirectionWorkspace | None = None
-    graph_up: _DirectionWorkspace | None = None
-    dynamic_down: _DirectionWorkspace | None = None
-    graph_down: _DirectionWorkspace | None = None
+    dynamic_up: _DirectionWorkspace | None = child_field(retention="on_demand", activity="no", direction="up", default=None)
+    graph_up: _DirectionWorkspace | None = child_field(retention="captured", activity="no", direction="up", default=None)
+    dynamic_down: _DirectionWorkspace | None = child_field(retention="on_demand", activity="no", direction="down", default=None)
+    graph_down: _DirectionWorkspace | None = child_field(retention="captured", activity="no", direction="down", default=None)
 
 
 @dataclass
 class _DirectionStaging:
-    input_miss: torch.Tensor | None = None
-    output_main: torch.Tensor | None = None
-    output_miss: torch.Tensor | None = None
-    init_vector: torch.Tensor | None = None
-    init_matrix: torch.Tensor | None = None
-    xtx_bias: torch.Tensor | None = None
+    input_miss: torch.Tensor | None = alloc_field(label="input_miss", kind="input", default=None)
+    output_main: torch.Tensor | None = alloc_field(label="output_main", kind="output", default=None)
+    output_miss: torch.Tensor | None = alloc_field(label="output_miss", kind="output", default=None)
+    init_vector: torch.Tensor | None = alloc_field(label="init_vector", kind="init", default=None)
+    init_matrix: torch.Tensor | None = alloc_field(label="init_matrix", kind="init", default=None)
+    xtx_bias: torch.Tensor | None = alloc_field(label="xtx_bias", kind="init", default=None)
+
+
+@dataclass
+class TritonCall:
+    node_values_host: np.ndarray | None = alloc_field(
+        label="node_values_host", kind="state", owner="backend", retention="call", activity="yes", default=None
+    )
+    miss_output_host: np.ndarray | None = alloc_field(
+        label="miss_output_host", kind="output", owner="backend", retention="call", activity="yes", default=None
+    )
+
+
+@dataclass
+class TritonRetained:
+    sample_perm_gpu: torch.Tensor | None = alloc_field(
+        label="sample_perm_gpu", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
+    )
+    inv_sample_perm_gpu: torch.Tensor | None = alloc_field(
+        label="inv_sample_perm_gpu", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
+    )
+    sel_mut_rows_gpu: torch.Tensor | None = alloc_field(
+        label="selector_mut", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    sel_mut_cols_gpu: torch.Tensor | None = alloc_field(
+        label="selector_mut", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    sel_miss_rows_gpu: torch.Tensor | None = alloc_field(
+        label="selector_miss", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    sel_miss_cols_gpu: torch.Tensor | None = alloc_field(
+        label="selector_miss", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    blocks_up: list[tuple[torch.Tensor, torch.Tensor]] = alloc_field(
+        label="blocks_up", kind="sparse", owner="backend", retention="persistent", activity="always", default_factory=list
+    )
+    blocks_down: list[tuple[torch.Tensor, torch.Tensor]] = alloc_field(
+        label="blocks_down", kind="sparse", owner="backend", retention="persistent", activity="always", default_factory=list
+    )
+    workspaces: _WorkspaceCache = child_field(owner="backend", default_factory=_WorkspaceCache)
+    staging_up: _DirectionStaging | None = child_field(owner="backend", retention="staging", activity="no", direction="up", default=None)
+    staging_down: _DirectionStaging | None = child_field(owner="backend", retention="staging", activity="no", direction="down", default=None)
 
 
 class TritonBackend(BackendBase):
     """GPU backend using Triton naive CSR/CSC kernels on singleton vectors."""
+
+    _SETUP_MEMORY_POLICY = {
+        "_A_blocks": "dropped",
+        "_sel_mut": "dropped",
+        "_sel_miss": "dropped",
+        "_level_offsets": "borrowed",
+        "_sample_perm": "borrowed",
+        "_inv_sample_perm": "borrowed",
+        "_coalescence_counts": "borrowed",
+        "_xtx_host": "dropped",
+    }
 
     @staticmethod
     def plan(
@@ -200,6 +252,22 @@ class TritonBackend(BackendBase):
         self._scratch_plan_up: list[_TritonScratchLevelPlan] = []
         self._scratch_plan_down: list[_TritonScratchLevelPlan] = []
         self._nvtx = make_torch_tracer("grg.triton", torch) if self._instrumentation else None
+        self._install_memory(
+            retained=TritonRetained(
+                sample_perm_gpu=None,
+                inv_sample_perm_gpu=None,
+                sel_mut_rows_gpu=None,
+                sel_mut_cols_gpu=None,
+                sel_miss_rows_gpu=None,
+                sel_miss_cols_gpu=None,
+                blocks_up=[],
+                blocks_down=[],
+                workspaces=self._workspaces,
+                staging_up=self._staging_up,
+                staging_down=self._staging_down,
+            ),
+            call_type=TritonCall,
+        )
 
     def _configured_kernel_configs(self, direction: Direction) -> tuple[CsrKernelConfig | CscKernelConfig, ...]:
         plan = self._require_plan(direction)
@@ -233,6 +301,8 @@ class TritonBackend(BackendBase):
                 raise RuntimeError(f"Triton {key} workspace is not initialized")
             ws = self._build_direction_workspace(direction)
             setattr(self._workspaces, key, ws)
+            self._sync_retained_root()
+            self._bump_retained_epoch()
         return ws
 
     def _staging_for(self, direction: Direction) -> _DirectionStaging:
@@ -241,11 +311,49 @@ class TritonBackend(BackendBase):
         if staging is None:
             staging = _DirectionStaging()
             setattr(self, attr, staging)
+            self._sync_retained_root()
+            self._bump_retained_epoch()
         return staging
 
     def _clear_staging(self) -> None:
+        had_staging = self._staging_up is not None or self._staging_down is not None
         self._staging_up = None
         self._staging_down = None
+        self._sync_retained_root()
+        if had_staging:
+            self._bump_retained_epoch()
+
+    def _sync_retained_root(self) -> None:
+        retained = self._retained_mem
+        retained.sample_perm_gpu = self._sample_perm_gpu
+        retained.inv_sample_perm_gpu = self._inv_sample_perm_gpu
+        retained.sel_mut_rows_gpu = self._sel_mut_rows_gpu
+        retained.sel_mut_cols_gpu = self._sel_mut_cols_gpu
+        retained.sel_miss_rows_gpu = self._sel_miss_rows_gpu
+        retained.sel_miss_cols_gpu = self._sel_miss_cols_gpu
+        retained.blocks_up = [
+            (block.indices, block.indptr)
+            for row in self._blocks_up
+            for block in row
+            if block is not None
+        ]
+        retained.blocks_down = [
+            (block.indices, block.indptr)
+            for row in self._blocks_down
+            for block in row
+            if block is not None
+        ]
+        retained.workspaces = self._workspaces
+        retained.staging_up = self._staging_up
+        retained.staging_down = self._staging_down
+
+    def _ensure_staging_tensor(self, staging: _DirectionStaging, attr: str, shape: tuple[int, ...]) -> torch.Tensor:
+        value = getattr(staging, attr)
+        if value is None:
+            value = torch.zeros(shape, device=self._device, dtype=self._torch_dtype)
+            setattr(staging, attr, value)
+            self._bump_retained_epoch()
+        return value
 
     def _operator_matrix(self, direction: Direction, *, dst_level: int, src_level: int) -> sp.spmatrix:
         if direction == Direction.UP:
@@ -503,6 +611,7 @@ class TritonBackend(BackendBase):
                         staging.xtx_bias = torch.from_numpy(
                             (2.0 * self._coalescence_counts.astype(self._dtype, copy=False)).reshape(self._num_nodes)
                         ).to(device=self._device, dtype=self._torch_dtype)
+                        self._bump_retained_epoch()
                     ws.node_state.add_(staging.xtx_bias)
                 case InitMode.VECTOR:
                     if staging.init_vector is None:
@@ -771,7 +880,7 @@ class TritonBackend(BackendBase):
         with torch.cuda.stream(ws.capture_stream):
             if ws.direction == Direction.UP:
                 if staging.output_main is None:
-                    staging.output_main = torch.zeros((self._num_mutations,), device=self._device, dtype=self._torch_dtype)
+                    staging.output_main = self._ensure_staging_tensor(staging, "output_main", (self._num_mutations,))
                 staging.output_main.zero_()
                 if self._sel_mut_rows_gpu.numel() > 0:
                     staging.output_main.index_add_(
@@ -781,7 +890,7 @@ class TritonBackend(BackendBase):
                     )
                 if need_miss_output:
                     if staging.output_miss is None:
-                        staging.output_miss = torch.zeros((self._num_mutations,), device=self._device, dtype=self._torch_dtype)
+                        staging.output_miss = self._ensure_staging_tensor(staging, "output_miss", (self._num_mutations,))
                     staging.output_miss.zero_()
                     if self._sel_miss_rows_gpu.numel() > 0:
                         staging.output_miss.index_add_(
@@ -791,7 +900,7 @@ class TritonBackend(BackendBase):
                         )
             else:
                 if staging.output_main is None:
-                    staging.output_main = torch.zeros((self._num_samples,), device=self._device, dtype=self._torch_dtype)
+                    staging.output_main = self._ensure_staging_tensor(staging, "output_main", (self._num_samples,))
                 staging.output_main.copy_(ws.node_state.index_select(0, self._inv_sample_perm_gpu))
 
     def _tune_once(self, direction: Direction, ws: _DirectionWorkspace, config: CsrKernelConfig | CscKernelConfig) -> None:
@@ -876,16 +985,16 @@ class TritonBackend(BackendBase):
             ws.input_primary.copy_(primary_cpu)
             if miss_cpu is not None:
                 if staging.input_miss is None:
-                    staging.input_miss = torch.zeros((self._num_mutations,), device=self._device, dtype=self._torch_dtype)
+                    staging.input_miss = self._ensure_staging_tensor(staging, "input_miss", (self._num_mutations,))
                 staging.input_miss.copy_(miss_cpu)
             if init_mode == InitMode.VECTOR:
                 assert init_value is not None
                 if staging.init_vector is None:
-                    staging.init_vector = torch.zeros((1,), device=self._device, dtype=self._torch_dtype)
+                    staging.init_vector = self._ensure_staging_tensor(staging, "init_vector", (1,))
                 staging.init_vector.fill_(float(np.asarray(init_value).reshape(())))
             if init_matrix_cpu is not None:
                 if staging.init_matrix is None:
-                    staging.init_matrix = torch.zeros((self._num_nodes,), device=self._device, dtype=self._torch_dtype)
+                    staging.init_matrix = self._ensure_staging_tensor(staging, "init_matrix", (self._num_nodes,))
                 staging.init_matrix.copy_(init_matrix_cpu)
 
         tracer = self._nvtx
@@ -1000,144 +1109,9 @@ class TritonBackend(BackendBase):
         self._A_blocks = []
         self._sel_mut = sp.csr_matrix((0, 0))
         self._sel_miss = sp.csr_matrix((0, 0))
-
-        self.mem_usage.reset()
-        self.mem_usage.host_static = estimate_common_host_static_bytes(
-            level_offsets=self._level_offsets,
-            sample_perm=self._sample_perm,
-            inv_sample_perm=self._inv_sample_perm,
-            coalescence_counts=self._coalescence_counts,
-            xtx_init=None,
-        )
-        self.mem_usage.device_static = self.estimate_static_bytes()[1]
-
-    def _block_grid_bytes(self, direction: Direction) -> int:
-        store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
-        if not store_actual:
-            return 0
-        grid = self._grid_for(direction)
-        return int(sum(block.nbytes() for row in grid for block in row if block is not None))
-
-    def estimate_static_bytes(self) -> tuple[StaticBytes, StaticBytes]:
-        host = estimate_common_host_static_bytes(
-            level_offsets=self._level_offsets,
-            sample_perm=self._sample_perm,
-            inv_sample_perm=self._inv_sample_perm,
-            coalescence_counts=self._coalescence_counts,
-            xtx_init=None,
-        )
-        device = StaticBytes()
-        device.sample_perm = _torch_nbytes(self._sample_perm_gpu)
-        device.inv_sample_perm = _torch_nbytes(self._inv_sample_perm_gpu)
-        device.blocks_up = self._block_grid_bytes(Direction.UP)
-        device.blocks_down = self._block_grid_bytes(Direction.DOWN)
-        device.selector_mut = _torch_nbytes(self._sel_mut_rows_gpu) + _torch_nbytes(self._sel_mut_cols_gpu)
-        device.selector_miss = _torch_nbytes(self._sel_miss_rows_gpu) + _torch_nbytes(self._sel_miss_cols_gpu)
-        device.workspace = int(
-            sum(
-                _workspace_nbytes(getattr(self._workspaces, slot))
-                for slot in self._static_workspace_slots
-            )
-        )
-        return host, device
-
-    def _staging_nbytes(self, direction: Direction) -> int:
-        staging = self._staging_up if direction == Direction.UP else self._staging_down
-        if staging is None:
-            return 0
-        return int(
-            _torch_nbytes(staging.input_miss)
-            + _torch_nbytes(staging.output_main)
-            + _torch_nbytes(staging.output_miss)
-            + _torch_nbytes(staging.init_vector)
-            + _torch_nbytes(staging.init_matrix)
-            + _torch_nbytes(staging.xtx_bias)
-        )
-
-    def _staging_total_nbytes(self) -> int:
-        return int(self._staging_nbytes(Direction.UP) + self._staging_nbytes(Direction.DOWN))
-
-    def _static_workspace_total_nbytes(self) -> int:
-        return int(sum(_workspace_nbytes(getattr(self._workspaces, slot)) for slot in self._static_workspace_slots))
-
-    def _dynamic_workspace_total_nbytes(self) -> int:
-        return int(
-            _workspace_nbytes(self._workspaces.dynamic_up)
-            + _workspace_nbytes(self._workspaces.dynamic_down)
-        )
-
-    def _workspace_note(self, *, graph: bool, active_slot: str | None) -> str:
-        slots = ("graph_up", "graph_down") if graph else ("dynamic_up", "dynamic_down")
-        notes: list[str] = []
-        for slot in slots:
-            if getattr(self._workspaces, slot) is None:
-                continue
-            note = slot
-            if slot == active_slot:
-                note += "(active)"
-            notes.append(note)
-        return "none" if not notes else ",".join(notes)
-
-    def _staging_note(self, active_direction: Direction) -> str:
-        notes: list[str] = []
-        for name, staging in (("up", self._staging_up), ("down", self._staging_down)):
-            if staging is None:
-                continue
-            note = (
-                f"{name}:miss={int(staging.input_miss is not None)}"
-                f":main={int(staging.output_main is not None)}"
-                f":miss_out={int(staging.output_miss is not None)}"
-                f":init_vec={int(staging.init_vector is not None)}"
-                f":init_mat={int(staging.init_matrix is not None)}"
-                f":xtx={int(staging.xtx_bias is not None)}"
-            )
-            if name == active_direction.value:
-                note += "(active)"
-            notes.append(note)
-        return "none" if not notes else ",".join(notes)
-
-    def _residency_bytes(self, *, direction: Direction, use_graph: bool) -> tuple[ResidencyBytes, ResidencyBytes, ResidencyBytes]:
-        active_slot = self._workspace_slot(direction, graph=use_graph)
-        return (
-            ResidencyBytes(host_bytes=0, device_bytes=self._static_workspace_total_nbytes(), note=self._workspace_note(graph=True, active_slot=active_slot)),
-            ResidencyBytes(host_bytes=0, device_bytes=self._dynamic_workspace_total_nbytes(), note=self._workspace_note(graph=False, active_slot=active_slot)),
-            ResidencyBytes(host_bytes=0, device_bytes=self._staging_total_nbytes(), note=self._staging_note(direction)),
-        )
-
-    def _device_runtime_bytes(
-        self,
-        ws: _DirectionWorkspace,
-        staging: _DirectionStaging,
-        *,
-        use_graph: bool,
-        has_miss_input: bool,
-        need_miss_output: bool,
-        emit_all_nodes: bool,
-    ) -> RuntimeBytes:
-        level_buffers = int(_torch_nbytes(ws.node_state))
-        inputs = int(ws.input_primary.numel() * ws.input_primary.element_size())
-        if has_miss_input and staging.input_miss is not None:
-            inputs += _torch_nbytes(staging.input_miss)
-        if emit_all_nodes:
-            outputs = 0
-        elif ws.direction == Direction.UP:
-            outputs = int(
-                _torch_nbytes(staging.output_main)
-                + (0 if not need_miss_output else _torch_nbytes(staging.output_miss))
-            )
-        else:
-            outputs = int(_torch_nbytes(staging.output_main))
-        live_total = int(
-            self._static_workspace_total_nbytes()
-            + self._dynamic_workspace_total_nbytes()
-            + self._staging_total_nbytes()
-        )
-        return RuntimeBytes(
-            level_buffers=level_buffers,
-            inputs=inputs,
-            outputs=outputs,
-            aux=max(0, live_total - level_buffers - inputs - outputs),
-        )
+        self._sync_retained_root()
+        self._bump_retained_epoch()
+        self._assert_setup_memory_contract()
 
     def _run_direction(
         self,
@@ -1195,38 +1169,38 @@ class TritonBackend(BackendBase):
 
         ws = self._workspace_for(direction, graph=use_graph)
         staging = self._staging_for(direction)
-        static_ws, dynamic_ws, staging_bytes = self._residency_bytes(direction=direction, use_graph=use_graph)
-        self.mem_usage.record(
-            stage="run_up" if direction == Direction.UP else "run_down",
-            runtime_k=k,
-            host_runtime=RuntimeBytes(
-                inputs=int(x.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
-                outputs=int(
-                    out.nbytes
-                    if emit_all_nodes or direction == Direction.DOWN
-                    else out.nbytes + (0 if out_miss is None else out_miss.nbytes)
-                ),
-                aux=0 if payload is None else int(payload.nbytes),
-            ),
-            device_runtime=self._device_runtime_bytes(
-                ws,
-                staging,
-                use_graph=use_graph,
-                has_miss_input=miss_arr is not None,
-                need_miss_output=need_miss_output,
-                emit_all_nodes=emit_all_nodes,
-            ),
-            static_ws=static_ws,
-            dynamic_ws=dynamic_ws,
-            staging=staging_bytes,
-            meta={
-                "direction": direction.value,
-                "mode": "instrumented" if self._instrumentation else ("graph" if use_graph else "dynamic"),
-                "emit_all_nodes": bool(emit_all_nodes),
-                "need_miss_output": bool(need_miss_output) if direction == Direction.UP else False,
-                "has_miss_input": bool(miss_arr is not None) if direction == Direction.DOWN else False,
-            },
-        )
+        if self._capture_active:
+            call = self._call_mem
+            assert isinstance(call, TritonCall)
+            call.node_values_host = out if emit_all_nodes else None
+            call.miss_output_host = out_miss if (direction == Direction.UP and not emit_all_nodes) else None
+            active_values: list[object] = [ws]
+            if direction == Direction.DOWN and miss_arr is not None and staging.input_miss is not None:
+                active_values.append(staging.input_miss)
+            if mode == InitMode.VECTOR and staging.init_vector is not None:
+                active_values.append(staging.init_vector)
+            elif mode == InitMode.MATRIX and staging.init_matrix is not None:
+                active_values.append(staging.init_matrix)
+            elif mode == InitMode.XTX and staging.xtx_bias is not None:
+                active_values.append(staging.xtx_bias)
+            if not emit_all_nodes and staging.output_main is not None:
+                active_values.append(staging.output_main)
+            if direction == Direction.UP and need_miss_output and staging.output_miss is not None:
+                active_values.append(staging.output_miss)
+            self._publish_call_capture(
+                CallCapture(
+                    nonce=self._capture_nonce,
+                    direction=direction.value,
+                    runtime_k=k,
+                    active_alloc_keys=self._alloc_keys(*active_values),
+                    meta={
+                        "emit_all_nodes": bool(emit_all_nodes),
+                        "need_miss_output": bool(need_miss_output) if direction == Direction.UP else False,
+                        "has_miss_input": bool(miss_arr is not None) if direction == Direction.DOWN else False,
+                        "mode": "instrumented" if self._instrumentation else ("graph" if use_graph else "dynamic"),
+                    },
+                )
+            )
         if emit_all_nodes or direction == Direction.DOWN:
             return out
         return out, out_miss
@@ -1301,16 +1275,4 @@ class TritonBackend(BackendBase):
             need_miss_output=False,
             emit_all_nodes=True,
         )
-
-
-def _workspace_nbytes(ws: _DirectionWorkspace | None) -> int:
-    if ws is None:
-        return 0
-    return int(
-        _torch_nbytes(ws.node_state)
-        + _torch_nbytes(ws.input_primary)
-        + sum(_torch_nbytes(buf) for level_bufs in ws.scratch_views_by_level for buf in level_bufs)
-    )
-
-
 __all__ = ["TritonBackend"]

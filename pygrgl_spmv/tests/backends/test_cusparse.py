@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import logging
 import warnings
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlan, CusparsePlanPair, is_valid_combo
 from pygrgl_spmv.backends.types import Direction
+from pygrgl_spmv.memory import alloc_field, capture_snapshot, live_snapshot, tree_rows
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
     INDEX_DTYPE,
@@ -72,6 +74,24 @@ def _run_up(op, X_col_major):
 
 def _run_down(op, X_col_major):
     return op.matmul(X_col_major.T, "down").T
+
+
+def test_cupy_memory_accounting_uses_logical_bytes():
+    @dataclass
+    class _CupyRoot:
+        payload: object | None = alloc_field(
+            label="payload",
+            kind="temporary",
+            owner="backend",
+            retention="persistent",
+            activity="always",
+            default=None,
+        )
+
+    arr = cp.zeros((3,), dtype=cp.float64)
+    snapshot = capture_snapshot(_CupyRoot(payload=arr), stage="retained", runtime_k=None)
+    assert len(snapshot.allocations) == 1
+    assert snapshot.allocations[0].nbytes == int(arr.nbytes)
 
 
 @pytest.mark.parametrize(
@@ -318,7 +338,11 @@ def test_graph_workspaces_built_during_setup(primary_grg_path):
     assert backend._workspaces.graph_down.graph is not None
     assert backend._workspaces.dynamic_up is None
     assert backend._workspaces.dynamic_down is None
-    assert backend.mem_usage.device_static.workspace > 0
+    assert op.memory.retained is not None
+    assert any(
+        row.path[:4] == ("cuda_live", "retained", "up", "k=4") and row.retention == "captured"
+        for row in tree_rows(op.memory.retained)
+    )
 
 
 def test_graph_workspace_keeps_optional_buffers_lazy(primary_grg_path):
@@ -386,9 +410,22 @@ def test_debug_log_level_keeps_graph_mode(primary_grg_path, gt_small):
     x_up, _ = gt_small.get("forward", 4, seed=5003, dtype=DATA_DTYPE)
     x_down, _ = gt_small.get("backward", 4, seed=5004, dtype=DATA_DTYPE)
     _ = _run_up(op, x_up)
+    assert op.memory.last_call is not None
+    assert op.memory.last_call.meta["mode"] == "graph"
+    assert op.memory.last_call.active_alloc_keys
+    merged = live_snapshot(op.memory.retained, op.memory.last_call)
+    assert merged is not None
+    assert any(
+        row.owner == "backend"
+        and row.direction == "up"
+        and row.slot_k == 4
+        and row.retention in {"captured", "staging"}
+        and row.activity == "yes"
+        for row in merged.allocations
+    )
     _ = _run_down(op, x_down)
-    assert op._backend.mem_usage.calls[-2].meta["mode"] == "graph"
-    assert op._backend.mem_usage.calls[-1].meta["mode"] == "graph"
+    assert op.memory.last_call is not None
+    assert op.memory.last_call.meta["mode"] == "graph"
     assert op._backend._workspaces.graph_up is not None
     assert op._backend._workspaces.graph_down is not None
     assert op._backend._workspaces.graph_up.graph is not None
@@ -409,11 +446,13 @@ def test_instrumentation_disables_graph_mode(primary_grg_path, gt_small):
         op = _make_op(primary_grg_path, fmt_up="csr", k_hint=4, instrumentation=True)
     x_up, y_up = gt_small.get("forward", 4, seed=5005, dtype=DATA_DTYPE)
     np.testing.assert_allclose(_run_up(op, x_up), y_up, atol=1e-5, rtol=1e-5)
-    assert op._backend.mem_usage.calls[-1].meta["mode"] == "instrumented"
+    assert op.memory.last_call is not None
+    assert op.memory.last_call.meta["mode"] == "instrumented"
     assert op._backend._workspaces.dynamic_up is not None
     assert op._backend._workspaces.graph_up is None
     assert op._backend._workspaces.graph_down is None
-    assert op._backend.mem_usage.device_static.workspace == 0
+    assert op.memory.retained is not None
+    assert not any(row.retention == "captured" for row in tree_rows(op.memory.retained))
 
 
 def test_transpose_compatible_storage_aliases_payload_but_not_descriptors(primary_grg_path):
@@ -796,6 +835,27 @@ def test_warn_every_mismatch_call(primary_grg_path, gt_small):
         _run_up(op, X1)
     with pytest.warns(RuntimeWarning, match="k_hint"):
         _run_up(op, X2)
+
+
+def test_first_mismatch_call_matches_reference(primary_grg_path, gt_small):
+    op = _make_op(primary_grg_path, fmt_up="csr", k_hint=4, log_level="INFO")
+    X, Y_expected = gt_small.get("forward", 1, seed=123, dtype=DATA_DTYPE)
+    atol, rtol = tol(DATA_DTYPE)
+    with pytest.warns(RuntimeWarning, match="k_hint"):
+        Y = _run_up(op, X)
+    np.testing.assert_allclose(Y, Y_expected, atol=atol, rtol=rtol)
+
+
+def test_repeated_mismatch_calls_match_reference(primary_grg_path, gt_small):
+    op = _make_op(primary_grg_path, fmt_up="csr", k_hint=4, log_level="INFO")
+    X, Y_expected = gt_small.get("forward", 1, seed=123, dtype=DATA_DTYPE)
+    atol, rtol = tol(DATA_DTYPE)
+    with pytest.warns(RuntimeWarning, match="k_hint"):
+        Y_first = _run_up(op, X)
+    with pytest.warns(RuntimeWarning, match="k_hint"):
+        Y_second = _run_up(op, X)
+    np.testing.assert_allclose(Y_first, Y_expected, atol=atol, rtol=rtol)
+    np.testing.assert_allclose(Y_second, Y_expected, atol=atol, rtol=rtol)
 
 
 def test_runtime_logging_reports_versions_and_warns_for_non_doc_cuda(caplog, monkeypatch):

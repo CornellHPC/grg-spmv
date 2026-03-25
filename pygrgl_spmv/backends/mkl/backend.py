@@ -13,15 +13,13 @@ import scipy.sparse as sp
 
 from pygrgl_spmv.backends import (
     BackendBase,
+    CallCapture,
     BackendSetup,
-    _sparse_host_bytes,
-    estimate_common_host_static_bytes,
-    estimate_sparse_payload_bytes,
     iter_direction_level_pairs,
     selector_rows_unique_from_csr_indptr,
     warn_k_hint_mismatch,
 )
-from pygrgl_spmv.backends.memory import RuntimeBytes, StaticBytes
+from pygrgl_spmv.memory import alloc_field, child_field
 from pygrgl_spmv.backends.mkl.ffi import (
     MklSparseHandle,
     mkl_get_max_threads,
@@ -56,48 +54,50 @@ class _MklDirectionSpec:
     stage_name: str
 
 
+@dataclass
+class MklCall:
+    node_values: np.ndarray | None = alloc_field(
+        label="node_state", kind="state", owner="backend", retention="call", activity="yes", default=None
+    )
+    miss_output: np.ndarray | None = alloc_field(
+        label="miss_output", kind="output", owner="backend", retention="call", activity="yes", default=None
+    )
+    level_ms: np.ndarray | None = alloc_field(
+        label="level_ms", kind="temporary", owner="backend", retention="call", activity="yes", default=None
+    )
+
+
+@dataclass
+class MklRetained:
+    blocks_up: list[sp.spmatrix] = alloc_field(
+        label="blocks_up", kind="sparse", owner="backend", retention="persistent", activity="always", default_factory=list
+    )
+    blocks_down: list[sp.spmatrix] = alloc_field(
+        label="blocks_down", kind="sparse", owner="backend", retention="persistent", activity="always", default_factory=list
+    )
+    selector_mut_rows: np.ndarray | None = alloc_field(
+        label="selector_mut", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    selector_mut_cols: np.ndarray | None = alloc_field(
+        label="selector_mut", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    selector_miss_rows: np.ndarray | None = alloc_field(
+        label="selector_miss", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    selector_miss_cols: np.ndarray | None = alloc_field(
+        label="selector_miss", kind="selector", owner="backend", retention="persistent", activity="always", default=None
+    )
+    xtx_host: np.ndarray | None = alloc_field(
+        label="xtx_host", kind="init", owner="backend", retention="persistent", activity="always", default=None
+    )
+
+
 def _stored_block(base_block: sp.spmatrix, store: StoredMatrix) -> sp.spmatrix:
     return base_block if store == StoredMatrix.N else base_block.T
 
 
 def _needs_transpose(direction: Direction, store: StoredMatrix) -> bool:
     return (direction == Direction.DOWN) != (store == StoredMatrix.T)
-
-
-def _estimate_handle_payload_bytes(handle: MklSparseHandle) -> int:
-    mat = getattr(handle, "_mat", None)
-    if mat is None:
-        return 0
-    fmt = str(getattr(handle, "_fmt", "csr"))
-    nrows, ncols = mat.shape
-    nnz = int(mat.nnz)
-    data_itemsize = int(np.dtype(mat.data.dtype).itemsize)
-
-    if fmt in {"csr", "csc"}:
-        if hasattr(mat, "indices"):
-            index_itemsize = int(np.dtype(mat.indices.dtype).itemsize)
-        elif hasattr(mat, "indptr"):
-            index_itemsize = int(np.dtype(mat.indptr.dtype).itemsize)
-        else:
-            raise ValueError(f"MKL sparse matrix in {fmt} is missing indices/indptr arrays")
-    elif fmt == "coo":
-        if hasattr(mat, "row"):
-            index_itemsize = int(np.dtype(mat.row.dtype).itemsize)
-        elif hasattr(mat, "col"):
-            index_itemsize = int(np.dtype(mat.col.dtype).itemsize)
-        else:
-            raise ValueError("MKL COO matrix is missing row/col arrays")
-    else:
-        raise ValueError(f"Unknown MKL sparse format {fmt!r} for static estimate")
-
-    return estimate_sparse_payload_bytes(
-        fmt=fmt,
-        nrows=int(nrows),
-        ncols=int(ncols),
-        nnz=nnz,
-        data_itemsize=data_itemsize,
-        index_itemsize=index_itemsize,
-    )
 
 
 def _level_call_stats(ops_by_level: list[list[object]]) -> tuple[np.ndarray, np.ndarray]:
@@ -141,12 +141,22 @@ def _log_level_timing(
 
 
 class MklBackend(BackendBase):
-    """
-    MKL-accelerated backend using the Inspector-Executor Sparse BLAS API.
+    """MKL-accelerated backend using the Inspector-Executor Sparse BLAS API.
 
     Persistent MKL handles are created once in setup().
     Each run_up()/run_down() call performs one fused traversal.
     """
+
+    _SETUP_MEMORY_POLICY = {
+        "_A_blocks": "dropped",
+        "_sel_mut": "dropped",
+        "_sel_miss": "dropped",
+        "_level_offsets": "borrowed",
+        "_sample_perm": "borrowed",
+        "_inv_sample_perm": "borrowed",
+        "_coalescence_counts": "borrowed",
+        "_xtx_host": "retained",
+    }
 
     def __init__(
         self,
@@ -172,6 +182,10 @@ class MklBackend(BackendBase):
         if self._plan_down is not None and self._fmt_down not in {"csr", "csc", "coo"}:
             raise ValueError(f"Unsupported MKL fmt_down={self._fmt_down!r}; expected csr/csc/coo")
         self._coalescence_counts = None
+        self._selector_rows: dict[str, np.ndarray] = {}
+        self._selector_cols: dict[str, np.ndarray] = {}
+        self._selector_row_unique: dict[str, bool] = {}
+        self._install_memory(retained=MklRetained(), call_type=MklCall)
 
     def _resolve_thread_count(self, plan: MklPlan | None) -> int | None:
         if plan is None:
@@ -233,6 +247,44 @@ class MklBackend(BackendBase):
                 None if stored.nnz == 0 else MklSparseHandle(stored, spec.plan.fmt.value.lower())
             )
         return rows
+
+    @staticmethod
+    def _handle_payload_arrays(handles: list[list[MklSparseHandle | None]]) -> list[np.ndarray]:
+        arrays: list[np.ndarray] = []
+        for row in handles:
+            for handle in row:
+                if handle is None:
+                    continue
+                mat = getattr(handle, "_mat", None)
+                if mat is None:
+                    continue
+                for attr in ("data", "indices", "indptr", "row", "col"):
+                    value = getattr(mat, attr, None)
+                    if value is not None:
+                        arrays.append(np.asarray(value))
+        return arrays
+
+    @staticmethod
+    def _handle_payload_matrices(handles: list[list[MklSparseHandle | None]]) -> list[sp.spmatrix]:
+        mats: list[sp.spmatrix] = []
+        for row in handles:
+            for handle in row:
+                if handle is None:
+                    continue
+                mat = getattr(handle, "_mat", None)
+                if mat is not None:
+                    mats.append(mat)
+        return mats
+
+    def _sync_retained_root(self) -> None:
+        retained = self._retained_mem
+        retained.blocks_up = self._handle_payload_matrices(self._blocks_up)
+        retained.blocks_down = self._handle_payload_matrices(self._blocks_down)
+        retained.selector_mut_rows = self._selector_rows.get("mut")
+        retained.selector_mut_cols = self._selector_cols.get("mut")
+        retained.selector_miss_rows = self._selector_rows.get("miss")
+        retained.selector_miss_cols = self._selector_cols.get("miss")
+        retained.xtx_host = self._xtx_host
 
     def _build_direction_ops(self, spec: _MklDirectionSpec) -> list[list[_MklBlockOp]]:
         num_levels = len(self._level_offsets) - 1
@@ -352,32 +404,6 @@ class MklBackend(BackendBase):
         )
         self._configure_handle_hints()
 
-        self.mem_usage.reset()
-        common_host = estimate_common_host_static_bytes(
-            level_offsets=self._level_offsets,
-            sample_perm=self._sample_perm,
-            inv_sample_perm=self._inv_sample_perm,
-            coalescence_counts=self._coalescence_counts,
-            xtx_init=self._xtx_host,
-        )
-        self.mem_usage.host_static.level_offsets = common_host.level_offsets
-        self.mem_usage.host_static.sample_perm = common_host.sample_perm
-        self.mem_usage.host_static.inv_sample_perm = common_host.inv_sample_perm
-        self.mem_usage.host_static.coalescence_counts = common_host.coalescence_counts
-        self.mem_usage.host_static.xtx_init = common_host.xtx_init
-        self.mem_usage.host_static.blocks_up = int(
-            sum(_sparse_host_bytes(getattr(h, "_mat", None)) for row in self._blocks_up for h in row)
-        )
-        self.mem_usage.host_static.blocks_down = int(
-            sum(_sparse_host_bytes(getattr(h, "_mat", None)) for row in self._blocks_down for h in row)
-        )
-        self.mem_usage.host_static.selector_mut = int(
-            self._selector_rows["mut"].nbytes + self._selector_cols["mut"].nbytes
-        )
-        self.mem_usage.host_static.selector_miss = int(
-            self._selector_rows["miss"].nbytes + self._selector_cols["miss"].nbytes
-        )
-
         self._logger.info(
             (
                 "MklBackend setup: fmt_up=%s fmt_down=%s k_hint=%s n_threads=%s (actual=%d) "
@@ -394,6 +420,12 @@ class MklBackend(BackendBase):
             self._down_ops_owner,
         )
         self._refresh_level_stats()
+        self._sync_retained_root()
+        self._bump_retained_epoch()
+        self._A_blocks = []
+        self._sel_mut = sp.csr_matrix((0, 0))
+        self._sel_miss = sp.csr_matrix((0, 0))
+        self._assert_setup_memory_contract()
 
     def _refresh_level_stats(self) -> None:
         self._ops_up_calls, self._ops_up_nnz = _level_call_stats(self._ops_up)
@@ -514,24 +546,24 @@ class MklBackend(BackendBase):
         if emit_all_nodes:
             if track_wave and level_ms is not None:
                 self._log_wavefront_levels(spec.direction, level_ms)
-            self.mem_usage.record(
-                stage=spec.stage_name,
-                runtime_k=k,
-                host_runtime=RuntimeBytes(
-                    level_buffers=int(node_values.nbytes),
-                    inputs=int(x.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
-                    outputs=int(node_values.nbytes),
-                    aux=int(
-                        (0 if init_payload is None else init_payload.nbytes)
-                        + (0 if level_ms is None else level_ms.nbytes)
-                    ),
-                ),
-                meta={
-                    "direction": spec.direction.value,
-                    "emit_all_nodes": True,
-                    "mode": "instrumented" if self._instrumentation else "n/a",
-                },
-            )
+            if self._capture_active:
+                call = self._call_mem
+                assert isinstance(call, MklCall)
+                call.node_values = node_values
+                call.miss_output = None
+                call.level_ms = level_ms
+                self._publish_call_capture(
+                    CallCapture(
+                        nonce=self._capture_nonce,
+                        direction=spec.direction.value,
+                        runtime_k=k,
+                        active_alloc_keys=frozenset(),
+                        meta={
+                            "emit_all_nodes": True,
+                            "mode": "instrumented" if self._instrumentation else "n/a",
+                        },
+                    )
+                )
             return node_values
 
         if spec.direction == Direction.UP:
@@ -543,48 +575,48 @@ class MklBackend(BackendBase):
 
             if track_wave and level_ms is not None:
                 self._log_wavefront_levels(spec.direction, level_ms)
-            self.mem_usage.record(
-                stage=spec.stage_name,
-                runtime_k=k,
-                host_runtime=RuntimeBytes(
-                    level_buffers=int(node_values.nbytes),
-                    inputs=int(x.nbytes),
-                    outputs=int(out_mut.nbytes + (0 if out_miss is None else out_miss.nbytes)),
-                    aux=int(
-                        (0 if init_payload is None else init_payload.nbytes)
-                        + (0 if level_ms is None else level_ms.nbytes)
-                    ),
-                ),
-                meta={
-                    "direction": spec.direction.value,
-                    "need_miss_output": bool(need_miss_output),
-                    "mode": "instrumented" if self._instrumentation else "n/a",
-                },
-            )
+            if self._capture_active:
+                call = self._call_mem
+                assert isinstance(call, MklCall)
+                call.node_values = node_values
+                call.miss_output = out_miss
+                call.level_ms = level_ms
+                self._publish_call_capture(
+                    CallCapture(
+                        nonce=self._capture_nonce,
+                        direction=spec.direction.value,
+                        runtime_k=k,
+                        active_alloc_keys=frozenset(),
+                        meta={
+                            "need_miss_output": bool(need_miss_output),
+                            "mode": "instrumented" if self._instrumentation else "n/a",
+                        },
+                    )
+                )
             return out_mut, out_miss
 
         out = node_values[self._inv_sample_perm]
 
         if track_wave and level_ms is not None:
             self._log_wavefront_levels(spec.direction, level_ms)
-        self.mem_usage.record(
-            stage=spec.stage_name,
-            runtime_k=k,
-            host_runtime=RuntimeBytes(
-                level_buffers=int(node_values.nbytes),
-                inputs=int(x.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
-                outputs=int(out.nbytes),
-                aux=int(
-                    (0 if init_payload is None else init_payload.nbytes)
-                    + (0 if level_ms is None else level_ms.nbytes)
-                ),
-            ),
-            meta={
-                "direction": spec.direction.value,
-                "has_miss_input": bool(miss_arr is not None),
-                "mode": "instrumented" if self._instrumentation else "n/a",
-            },
-        )
+        if self._capture_active:
+            call = self._call_mem
+            assert isinstance(call, MklCall)
+            call.node_values = node_values
+            call.miss_output = None
+            call.level_ms = level_ms
+            self._publish_call_capture(
+                CallCapture(
+                    nonce=self._capture_nonce,
+                    direction=spec.direction.value,
+                    runtime_k=k,
+                    active_alloc_keys=frozenset(),
+                    meta={
+                        "has_miss_input": bool(miss_arr is not None),
+                        "mode": "instrumented" if self._instrumentation else "n/a",
+                    },
+                )
+            )
         return out
 
     def run_up(
@@ -664,32 +696,5 @@ class MklBackend(BackendBase):
             emit_all_nodes=True,
         )
         return out
-
-    def estimate_static_bytes(self) -> tuple[StaticBytes, StaticBytes]:
-        host = estimate_common_host_static_bytes(
-            level_offsets=self._level_offsets,
-            sample_perm=self._sample_perm,
-            inv_sample_perm=self._inv_sample_perm,
-            coalescence_counts=self._coalescence_counts,
-            xtx_init=self._xtx_host,
-        )
-        device = StaticBytes()
-
-        host.blocks_up = int(sum(_estimate_handle_payload_bytes(h) for row in self._blocks_up for h in row if h is not None))
-        host.blocks_down = int(
-            sum(_estimate_handle_payload_bytes(h) for row in self._blocks_down for h in row if h is not None)
-        )
-        host.selector_mut = self._estimate_selector_payload_bytes("mut")
-        host.selector_miss = self._estimate_selector_payload_bytes("miss")
-        return host, device
-
-    def _estimate_selector_payload_bytes(self, selector: str) -> int:
-        rows = self._selector_rows[selector]
-        cols = self._selector_cols[selector]
-        if rows.shape != cols.shape:
-            raise ValueError(f"Selector {selector!r} row/col shapes mismatch: {rows.shape} vs {cols.shape}")
-        itemsize = int(np.dtype(rows.dtype).itemsize)
-        return int(rows.size * 2 * itemsize)
-
 
 __all__ = ["MklBackend", "MklPlan"]

@@ -9,10 +9,11 @@ import pytest
 
 from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.backends.triton import TritonBackend, TritonPlanPair
-from pygrgl_spmv.backends import estimate_sparse_payload_bytes, iter_direction_level_pairs
+from pygrgl_spmv.backends import iter_direction_level_pairs
 from pygrgl_spmv.backends.triton.backend import _AUTOTUNE_CACHE
 from pygrgl_spmv.backends.triton.kernel import CscKernelConfig, CsrKernelConfig
 from pygrgl_spmv.backends.types import Direction
+from pygrgl_spmv.memory import live_snapshot
 from pygrgl_spmv.tests.conftest import DATA_DTYPE, HAS_TRITON_RUNTIME, INDEX_DTYPE, make_triton_backend, make_triton_plan
 
 torch = pytest.importorskip("torch")
@@ -112,7 +113,18 @@ def test_triton_hint_none_uses_dynamic_mode(primary_grg_path, spmv_cache_dir):
     assert backend._workspaces.graph_down is None
     x_up = np.ones((1, op.num_samples), dtype=DATA_DTYPE)
     _ = op.matmul(x_up, "up")
-    assert backend.mem_usage.calls[-1].meta["mode"] == "dynamic"
+    assert op.memory.last_call is not None
+    assert op.memory.last_call.meta["mode"] == "dynamic"
+    assert op.memory.last_call.active_alloc_keys
+    merged = live_snapshot(op.memory.retained, op.memory.last_call)
+    assert merged is not None
+    assert any(
+        row.owner == "backend"
+        and row.direction == "up"
+        and row.retention in {"on_demand", "staging"}
+        and row.activity == "yes"
+        for row in merged.allocations
+    )
     assert backend._workspaces.dynamic_up is not None
 
 
@@ -175,14 +187,7 @@ def test_triton_structure_only_block_bytes_less_than_value_payload(primary_grg_p
     op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, fmt_up="csr", fmt_down=None, infer_missing=False)
     block = _first_present_block(op._backend._blocks_up)
     structure_only = int(block.nbytes())
-    dense_value_payload = estimate_sparse_payload_bytes(
-        fmt=block.fmt.value.lower(),
-        nrows=block.nrows,
-        ncols=block.ncols,
-        nnz=block.nnz,
-        data_itemsize=int(np.dtype(DATA_DTYPE).itemsize),
-        index_itemsize=4,
-    )
+    dense_value_payload = int(block.nnz * (int(np.dtype(DATA_DTYPE).itemsize) + 4) + (block.nrows + 1) * 4)
     assert structure_only < dense_value_payload
 
 
@@ -237,9 +242,11 @@ def test_triton_debug_log_level_keeps_graph_mode(primary_grg_path, gt_small, spm
     x_up, _ = gt_small.get("forward", 1, seed=124, dtype=DATA_DTYPE)
     x_down, _ = gt_small.get("backward", 1, seed=125, dtype=DATA_DTYPE)
     _ = op.matmul(x_up.T, "up")
+    assert op.memory.last_call is not None
+    assert op.memory.last_call.meta["mode"] == "graph"
     _ = op.matmul(x_down.T, "down")
-    assert op._backend.mem_usage.calls[-2].meta["mode"] == "graph"
-    assert op._backend.mem_usage.calls[-1].meta["mode"] == "graph"
+    assert op.memory.last_call is not None
+    assert op.memory.last_call.meta["mode"] == "graph"
     assert op._backend._workspaces.graph_up is not None
     assert op._backend._workspaces.graph_up.graph is not None
     assert op._backend._workspaces.graph_down is not None
