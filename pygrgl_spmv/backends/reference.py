@@ -10,12 +10,11 @@ import scipy.sparse as sp
 
 from pygrgl_spmv.backends.base import (
     BackendBase,
+    CallCapture,
     BackendSetup,
     _parse_optional_k_hint,
-    _sparse_host_bytes,
-    estimate_common_host_static_bytes,
 )
-from pygrgl_spmv.backends.memory import RuntimeBytes
+from pygrgl_spmv.memory import alloc_field
 from pygrgl_spmv.backends.types import (
     Direction,
     InitMode,
@@ -53,8 +52,39 @@ class ReferencePlan:
         return transpose_compatible_format(self.fmt) == other.fmt
 
 
+@dataclass
+class ReferenceCall:
+    node_values: np.ndarray | None = alloc_field(
+        label="node_state", kind="state", owner="backend", retention="call", activity="yes", default=None
+    )
+    miss_output: np.ndarray | None = alloc_field(
+        label="miss_output", kind="output", owner="backend", retention="call", activity="yes", default=None
+    )
+
+
+@dataclass
+class ReferenceRetained:
+    blocks: list[sp.spmatrix] = alloc_field(
+        label="blocks", kind="sparse", owner="backend", retention="persistent", activity="always", default_factory=list
+    )
+    xtx_host: np.ndarray | None = alloc_field(
+        label="xtx_host", kind="init", owner="backend", retention="persistent", activity="always", default=None
+    )
+
+
 class ReferenceBackend(BackendBase):
     """Concrete CPU reference implementation."""
+
+    _SETUP_MEMORY_POLICY = {
+        "_A_blocks": "retained",
+        "_sel_mut": "borrowed",
+        "_sel_miss": "borrowed",
+        "_level_offsets": "borrowed",
+        "_sample_perm": "borrowed",
+        "_inv_sample_perm": "borrowed",
+        "_coalescence_counts": "borrowed",
+        "_xtx_host": "retained",
+    }
 
     @staticmethod
     def plan(
@@ -90,33 +120,18 @@ class ReferenceBackend(BackendBase):
             log_level=log_level,
             instrumentation=instrumentation,
         )
+        self._install_memory(retained=ReferenceRetained(), call_type=ReferenceCall)
 
     def setup(self, setup: BackendSetup) -> None:
         self._apply_setup_state(setup)
+        self._sync_retained_root()
+        self._bump_retained_epoch()
+        self._assert_setup_memory_contract()
 
-        self.mem_usage.reset()
-        common_host = estimate_common_host_static_bytes(
-            level_offsets=self._level_offsets,
-            sample_perm=self._sample_perm,
-            inv_sample_perm=self._inv_sample_perm,
-            coalescence_counts=self._coalescence_counts,
-            xtx_init=self._xtx_host,
-        )
-        self.mem_usage.host_static.level_offsets = common_host.level_offsets
-        self.mem_usage.host_static.sample_perm = common_host.sample_perm
-        self.mem_usage.host_static.inv_sample_perm = common_host.inv_sample_perm
-        self.mem_usage.host_static.coalescence_counts = common_host.coalescence_counts
-        self.mem_usage.host_static.xtx_init = common_host.xtx_init
-        self.mem_usage.host_static.selector_mut = _sparse_host_bytes(self._sel_mut)
-        self.mem_usage.host_static.selector_miss = _sparse_host_bytes(self._sel_miss)
-        self.mem_usage.host_static.blocks_up = int(
-            sum(_sparse_host_bytes(blk) for blocks in self._A_blocks for blk in blocks)
-        )
-
-    def estimate_static_bytes(self):
-        raise NotImplementedError(
-            f"{self.__class__.__name__}.estimate_static_bytes() is required for benchmark static_est rows."
-        )
+    def _sync_retained_root(self) -> None:
+        retained = self._retained_mem
+        retained.blocks = [blk for row in self._A_blocks for blk in row if blk is not None]
+        retained.xtx_host = self._xtx_host
 
     def _propagate_up_inplace(self, node_values: np.ndarray) -> None:
         off = self._level_offsets
@@ -173,17 +188,20 @@ class ReferenceBackend(BackendBase):
                 out_miss = np.zeros((self._num_mutations, k), dtype=self._dtype)
             else:
                 out_miss = np.asarray(self._sel_miss @ node_values, dtype=self._dtype)
-        self.mem_usage.record(
-            stage="run_up",
-            runtime_k=k,
-            host_runtime=RuntimeBytes(
-                level_buffers=int(node_values.nbytes),
-                inputs=int(X.nbytes),
-                outputs=int(out_mut.nbytes + (0 if out_miss is None else out_miss.nbytes)),
-                aux=0 if payload is None else int(payload.nbytes),
-            ),
-            meta={"direction": "up", "need_miss_output": bool(need_miss_output)},
-        )
+        if self._capture_active:
+            call = self._call_mem
+            assert isinstance(call, ReferenceCall)
+            call.node_values = node_values
+            call.miss_output = out_miss
+            self._publish_call_capture(
+                CallCapture(
+                    nonce=self._capture_nonce,
+                    direction="up",
+                    runtime_k=k,
+                    active_alloc_keys=frozenset(),
+                    meta={"need_miss_output": bool(need_miss_output), "mode": "host"},
+                )
+            )
         return out_mut, out_miss
 
     def run_down(
@@ -219,17 +237,20 @@ class ReferenceBackend(BackendBase):
             node_values += self._sel_miss.T @ miss_arr
         self._propagate_down_inplace(node_values)
         out = node_values[self._inv_sample_perm]
-        self.mem_usage.record(
-            stage="run_down",
-            runtime_k=k,
-            host_runtime=RuntimeBytes(
-                level_buffers=int(node_values.nbytes),
-                inputs=int(X.nbytes + (0 if miss_arr is None else miss_arr.nbytes)),
-                outputs=int(out.nbytes),
-                aux=0 if payload is None else int(payload.nbytes),
-            ),
-            meta={"direction": "down", "has_miss_input": bool(miss_arr is not None)},
-        )
+        if self._capture_active:
+            call = self._call_mem
+            assert isinstance(call, ReferenceCall)
+            call.node_values = node_values
+            call.miss_output = None
+            self._publish_call_capture(
+                CallCapture(
+                    nonce=self._capture_nonce,
+                    direction="down",
+                    runtime_k=k,
+                    active_alloc_keys=frozenset(),
+                    meta={"has_miss_input": bool(miss_arr is not None), "mode": "host"},
+                )
+            )
         return out
 
     def run_up_nodes(
@@ -252,6 +273,20 @@ class ReferenceBackend(BackendBase):
         self._apply_init_inplace(node_values, mode, payload)
         np.add(node_values[: self._num_samples], X[self._sample_perm], out=node_values[: self._num_samples])
         self._propagate_up_inplace(node_values)
+        if self._capture_active:
+            call = self._call_mem
+            assert isinstance(call, ReferenceCall)
+            call.node_values = node_values
+            call.miss_output = None
+            self._publish_call_capture(
+                CallCapture(
+                    nonce=self._capture_nonce,
+                    direction="up",
+                    runtime_k=k,
+                    active_alloc_keys=frozenset(),
+                    meta={"emit_all_nodes": True, "mode": "host"},
+                )
+            )
         return node_values
 
     def run_down_nodes(
@@ -275,6 +310,20 @@ class ReferenceBackend(BackendBase):
         if self._sel_mut.nnz > 0:
             node_values += self._sel_mut.T @ X
         self._propagate_down_inplace(node_values)
+        if self._capture_active:
+            call = self._call_mem
+            assert isinstance(call, ReferenceCall)
+            call.node_values = node_values
+            call.miss_output = None
+            self._publish_call_capture(
+                CallCapture(
+                    nonce=self._capture_nonce,
+                    direction="down",
+                    runtime_k=k,
+                    active_alloc_keys=frozenset(),
+                    meta={"emit_all_nodes": True, "mode": "host"},
+                )
+            )
         return node_values
 
 

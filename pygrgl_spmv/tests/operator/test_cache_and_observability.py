@@ -10,6 +10,7 @@ import pygrgl
 import pytest
 
 from pygrgl_spmv import SpmvGRG
+from pygrgl_spmv.backends import ReferenceBackend, ReferencePlanPair
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
     HAS_MKL_RUNTIME,
@@ -49,6 +50,41 @@ def test_wavefront_debug_logging_preserves_values(backend_builder, primary_grg_p
         atol=atol,
         rtol=rtol,
     )
+
+
+@pytest.mark.smoke
+def test_reusing_backend_instance_does_not_leak_call_buffers_into_next_setup(primary_grg_path, spmv_cache_dir):
+    backend = ReferenceBackend(
+        pair=ReferencePlanPair(
+            plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
+            plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+        ),
+    )
+    first = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    x = np.ones((8, first.num_samples), dtype=DATA_DTYPE)
+    _ = first.matmul(x, pygrgl.TraversalDirection.UP)
+
+    second = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    assert second.memory.retained is not None
+    assert not any(row.retention == "call" and row.owner == "backend" for row in second.memory.retained.allocations)
+
+
+@pytest.mark.smoke
+def test_validation_error_before_backend_run_does_not_leave_capture_active(primary_grg_path, spmv_cache_dir):
+    backend = ReferenceBackend(
+        pair=ReferencePlanPair(
+            plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
+            plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+        ),
+    )
+    op = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    op._compiled.coalescence_counts = None
+    op._retained_mem.coalescence_counts = None
+    x = np.ones((2, op.num_samples), dtype=DATA_DTYPE)
+    with pytest.raises(ValueError, match="coalescence counts"):
+        op.matmul(x, pygrgl.TraversalDirection.UP, init="xtx")
+    reused = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    assert reused.memory.retained is not None
 
 
 @pytest.mark.mkl
@@ -289,7 +325,7 @@ def test_artifact_index_dtype_mismatch_rejected(primary_grg_path, tmp_path):
 @pytest.mark.smoke
 @pytest.mark.mkl
 @MKL_ONLY
-def test_mem_usage_records_setup_and_calls(primary_grg_path, spmv_cache_dir):
+def test_mem_usage_tracks_retained_and_last_call(primary_grg_path, spmv_cache_dir):
     op = SpmvGRG(
         primary_grg_path,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1, log_level="WARNING"),
@@ -297,15 +333,22 @@ def test_mem_usage_records_setup_and_calls(primary_grg_path, spmv_cache_dir):
         INDEX_DTYPE,
         artifact_dir=spmv_cache_dir,
     )
-    assert op._backend.mem_usage.host_static.level_offsets > 0
-    assert len(op._backend.mem_usage.calls) == 0
+    assert op.memory.retained is not None
+    assert op.memory.last_call is None
+    assert not any(row.retention == "call" for row in op.memory.retained.allocations)
 
     x_up = np.ones((2, op.num_samples), dtype=DATA_DTYPE)
     x_down = np.ones((2, op.num_mutations), dtype=DATA_DTYPE)
     _ = op.matmul(x_up, pygrgl.TraversalDirection.UP)
+    first_call = op.memory.last_call
+    assert first_call is not None
+    assert first_call.stage == "run_up"
+    assert int(first_call.runtime_k) == 2
+    assert all(row.retention == "call" for row in first_call.allocations)
     _ = op.matmul(x_down, pygrgl.TraversalDirection.DOWN)
-
-    stages = [call.stage for call in op._backend.mem_usage.calls]
-    assert stages == ["run_up", "run_down"]
-    assert int(op._backend.mem_usage.calls[0].runtime_k) == 2
-    assert int(op._backend.mem_usage.calls[1].runtime_k) == 2
+    second_call = op.memory.last_call
+    assert second_call is not None
+    assert second_call is not first_call
+    assert second_call.stage == "run_down"
+    assert int(second_call.runtime_k) == 2
+    assert all(row.retention == "call" for row in second_call.allocations)

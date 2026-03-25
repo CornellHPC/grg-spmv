@@ -35,8 +35,8 @@ class CompiledOperatorState:
     sample_to_individual: np.ndarray
     mutation_positions: np.ndarray
     mutation_times: np.ndarray
-    mutation_alleles: np.ndarray        # uint8 packed-bit data buffer
-    mutation_allele_offsets: np.ndarray  # uint32 CSR offsets (nucleotide indices)
+    mutation_alleles: np.ndarray
+    mutation_allele_offsets: np.ndarray
     mutation_ref_alleles: np.ndarray
     mutation_ref_allele_offsets: np.ndarray
     coalescence_counts: np.ndarray | None
@@ -341,45 +341,38 @@ def _build_coalescence_counts(grg, *, node_perm: np.ndarray) -> np.ndarray | Non
 
 
 _NUCLEOTIDE_ENCODE = {"A": 0b00, "T": 0b01, "C": 0b10, "G": 0b11}
-# Data buffer: 2 bits per nucleotide, packed 4 per byte (nucleotide j → byte j//4, bits (j%4)*2).
-# Offsets array: dtype[num_alleles+1], offsets[i] is the cumulative nucleotide count up to allele i.
-# Empty/invalid alleles have offsets[i] == offsets[i+1] (zero length).
 
 
-def _encode_alleles(alleles: list[str], offset_dtype: np.dtype = np.dtype(np.uint32)) -> tuple[np.ndarray, np.ndarray]:
-    """CSR-style 2-bit encoding of allele strings (ATCG only, variable length).
+def _encode_alleles(alleles: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Pack variable-length allele strings into a 2-bit-per-nucleotide uint8 buffer with CSR offsets.
 
-    Returns (data, offsets) where data is a uint8 packed-bit buffer and offsets has dtype offset_dtype.
-    Invalid alleles (non-ATCG chars) or alleles that would overflow offset_dtype's max are stored as empty.
+    Returns (data, offsets) where offsets[i]:offsets[i+1] gives the nucleotide
+    range for allele i within the packed data buffer.
     """
     n = len(alleles)
-    dtype_max = int(np.iinfo(offset_dtype).max)
-    offsets = np.zeros(n + 1, dtype=offset_dtype)
-    nucleotide_codes: list[int] = []
+    offsets = np.empty(n + 1, dtype=np.uint32)
+    offsets[0] = 0
 
-    for i, a in enumerate(alleles):
-        valid_codes: list[int] = []
-        for ch in a:
+    # First pass: validate and compute offsets
+    total = 0
+    for i, allele_str in enumerate(alleles):
+        for ch in allele_str:
             if ch not in _NUCLEOTIDE_ENCODE:
-                print(f"[encode_alleles] non-ATCG character {ch!r} in allele at index {i}: {a!r}; storing as empty")
-                valid_codes = []
-                break
-            valid_codes.append(_NUCLEOTIDE_ENCODE[ch])
-        new_total = int(offsets[i]) + len(valid_codes)
-        if new_total > dtype_max:
-            print(
-                f"[encode_alleles] cumulative nucleotide count {new_total} would overflow "
-                f"{offset_dtype} (max {dtype_max}) at allele index {i}: {a!r}; storing as empty"
-            )
-            valid_codes = []
-        offsets[i + 1] = int(offsets[i]) + len(valid_codes)
-        nucleotide_codes.extend(valid_codes)
+                raise ValueError(f"Non-ATCG character {ch!r} in allele at index {i}: {allele_str!r}")
+        total += len(allele_str)
+        if total > np.iinfo(np.uint32).max:
+            raise ValueError(f"Allele offset overflow at index {i}: total nucleotide count {total} exceeds uint32 max")
+        offsets[i + 1] = total
 
-    total = len(nucleotide_codes)
-    data = np.zeros((total + 3) // 4, dtype=np.uint8)
-    for j, code in enumerate(nucleotide_codes):
-        data[j // 4] |= np.uint8(code << ((j % 4) * 2))
-    return data, offsets
+    # Second pass: pack 2-bit codes
+    buf = np.zeros((total + 3) // 4, dtype=np.uint8)
+    pos = 0
+    for allele_str in alleles:
+        for ch in allele_str:
+            buf[pos // 4] |= np.uint8(_NUCLEOTIDE_ENCODE[ch] << ((pos % 4) * 2))
+            pos += 1
+
+    return buf, offsets
 
 
 def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -395,14 +388,14 @@ def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.n
         ref_alleles.append(str(mutation.ref_allele))
 
     allele_data, allele_offsets = _encode_alleles(alleles)
-    ref_allele_data, ref_allele_offsets = _encode_alleles(ref_alleles)
+    ref_data, ref_offsets = _encode_alleles(ref_alleles)
     return (
         np.asarray(positions, dtype=np.float64),
         np.asarray(times, dtype=np.float64),
         allele_data,
         allele_offsets,
-        ref_allele_data,
-        ref_allele_offsets,
+        ref_data,
+        ref_offsets,
     )
 
 

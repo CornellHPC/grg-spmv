@@ -49,6 +49,20 @@ profiling/observability behavior that may reduce absolute performance.
 - derived artifact paths encode the full GRG path to avoid collisions between GRGs with the same filename in different directories
 - you can also construct `SpmvGRG` directly from a `.grg_spmv` file without the original `.grg`
 
+## Documentation
+
+- [GRG Operator Docs](pygrgl_spmv/grg/README.md)
+- [Backend Docs](pygrgl_spmv/backends/README.md)
+- [Benchmark Script Docs](scripts/README.md)
+- [Test Suite Docs](pygrgl_spmv/tests/README.md)
+
+## Package layout
+
+- `pygrgl_spmv/grg/`: operator construction, artifact I/O, and GRG compilation
+- `pygrgl_spmv/backends/`: backend implementations and backend-specific plan types
+- `pygrgl_spmv/memory.py`: additive live-memory ledger
+- `scripts/bench/`: benchmark runner, reporting, and CLI helpers
+
 ## Benchmarks
 
 Benchmark scripts:
@@ -60,12 +74,10 @@ Benchmark scripts:
 See `scripts/README.md` for the explicit `--plan-up-down` syntax, wildcard
 expansion, search commands, and the shared `--instrumentation` flag.
 
-Internally, the GRG implementation now lives under `pygrgl_spmv/grg/`, and backend implementations live under `pygrgl_spmv/backends/mkl/` and `pygrgl_spmv/backends/cusparse/`.
-
 ## Tests
 
 See `pygrgl_spmv/tests/README.md` for test layout, marker policy, CLI options, and recommended commands.
 
-## Backend memory tracking
+## Memory ledger
 
-See `pygrgl_spmv/backends/README.md` for static/runtime memory tracking, plan objects, and backend-specific accounting details.
+See `pygrgl_spmv/backends/README.md` for the additive live-memory ledger, snapshot timing, and benchmark memory-table taxonomy.

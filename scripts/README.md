@@ -1,3 +1,5 @@
+Parent docs: [Project README](../README.md)
+
 # Benchmark scripts
 
 Backend-specific entrypoints:
@@ -9,8 +11,13 @@ Backend-specific entrypoints:
 Each script expands explicit backend plan pairs, runs the requested scenarios,
 then prints separate runtime and memory summary tables.
 
-Both entrypoints call the same shared benchmark runner and therefore execute
+All entrypoints call the same shared benchmark runner and therefore execute
 the same stress/correctness workflow (intra-case + cross-config diagnostics).
+
+Before the tables, the runner also prints a compact `Common config:` banner.
+Shared config fields are factored there once, and the `Config` column in both
+tables shows only the per-config differences. When a benchmark run has exactly
+one config, the `Config` column is rendered as `-`.
 
 Internal layout:
 
@@ -48,23 +55,48 @@ Columns:
 
 - `Config`
 - `Scenario`
-- `Direction`
-- `k`
-- `Kind`
-- `Host GiB`
-- `Device GiB`
+- `CaseDir`
+- `CaseK`
+- `Node`
+- `Parent`
+- `GiB`
+- `Space`
+- `Owner`
+- `Active`
+- `Retention`
+- `Kinds`
 - `Note`
 
 Row semantics:
 
-- each executed runtime case expands into four rows:
-  - `Total GiB`
-  - `Static WS GiB`
-  - `Dynamic WS GiB`
-  - `Staging GiB`
-- `Total GiB` comes from the recorded runtime totals
-- the three `* GiB` residency rows report retained workspace/staging bytes
-- skip cases emit four memory rows with `Host GiB=SKIP` / `Device GiB=SKIP`
+- each executed runtime case expands into one compact live-allocation tree
+- rows are derived from a benchmark-local live snapshot assembled from `SpmvGRG.memory.retained` plus the case-local `last_call` history
+- rows are rendered in BFS order
+- a delimiter line is printed whenever the BFS level changes
+- `Parent=-` marks a root row
+- the roots are `cuda_live` and `cpu_live`
+- only structural levels appear in the tree:
+  - space root
+  - `call` or `retained`
+  - direction when present
+  - `k=<value>` when present
+- `CaseDir` and `CaseK` identify the executed benchmark case, not each row's own binding
+- the row's own binding lives in the tree path, so retained rows may still appear under `down`, `up|down`, `k=1`, or `k=1|2` even when the case columns show a different current case
+- metadata-only levels such as `persistent`, `backend`, and `always` are not promoted into tree nodes
+- repeated leaves with the same displayed label and metadata are aggregated into one summed row
+- skip cases emit two rows only:
+  - `cuda_live`
+  - `cpu_live`
+
+Column meanings:
+
+- `Owner`: merged owner bindings such as `backend` or `caller|operator`, or `-` for internal rows
+- `Active`: merged activity bindings such as `yes` or `always|yes`, or `-` for internal rows
+- `Retention`: merged retention bindings such as `persistent` or `call|persistent`, or `-` for internal rows
+- `Node`: merged logical labels attached to the displayed allocation class
+- `Kinds`: merged logical kinds attached to a physical allocation
+
+See `pygrgl_spmv/backends/README.md` for the full taxonomy and the exact snapshot contract.
 
 ## Output equivalence checks
 
@@ -115,7 +147,7 @@ Pass them as one argument with no delimiter between the two bracket groups:
 
 For cuSPARSE, `*` is allowed for every field except `k_hint`. Negation is also supported for enum-like fields, for example `fmt=!COO` or `fmt=!CSR!CSC`. `scratch` is a concrete execution-policy field and accepts `none`, `all`, or an explicit level list such as `1|2`; wildcard and negation are not supported for `scratch`. Empty sides are allowed: `[][PLAN]` means benchmark DOWN only, `[PLAN][]` means benchmark UP only. The current executor now supports the broader docs-valid dense-side plan space, including `opB=T` and column-major `orderB/orderC`. Unsupported combinations such as `CSC + CSR_ALG3` are rejected directly by `CusparsePlan.supported`.
 
-For Triton, benchmark plans currently expose only `k_hint`, `store`, and `fmt`.
+For Triton, benchmark plans expose only `k_hint`, `store`, and `fmt`.
 `k_hint` must be either `none` or `1`. Wildcards and negation are supported
 for `store` and `fmt`, but not for `k_hint`.
 One-sided dry-run examples:

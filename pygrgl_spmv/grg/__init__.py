@@ -2,18 +2,63 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 from pathlib import Path
 
 import numpy as np
 import pygrgl
+import scipy.sparse as sp
 
 from pygrgl_spmv.backends import BackendBase, ReferenceBackend, ReferencePlanPair
 from pygrgl_spmv.backends.types import Direction, InitMode, parse_direction
 from pygrgl_spmv.grg.artifact import artifact_path_for_grg, load_grg_spmv, save_grg_spmv
 from pygrgl_spmv.grg.compile import CompiledOperatorState, compile_grg
+from pygrgl_spmv.memory import (
+    MemoryLedger,
+    alloc_field,
+    capture_snapshot,
+)
 
-_NUCLEOTIDE_DECODE = {0b00: "A", 0b01: "T", 0b10: "C", 0b11: "G"}
+
+@dataclass
+class OperatorRetainedMem:
+    level_offsets: np.ndarray = alloc_field(label="level_offsets", kind="mapping", owner="operator", retention="persistent", activity="always")
+    sample_perm: np.ndarray = alloc_field(label="sample_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
+    inv_sample_perm: np.ndarray = alloc_field(label="inv_sample_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
+    node_perm: np.ndarray = alloc_field(label="node_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
+    inv_node_perm: np.ndarray = alloc_field(label="inv_node_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
+    sample_to_individual: np.ndarray = alloc_field(label="sample_to_individual", kind="mapping", owner="operator", retention="persistent", activity="always")
+    mutation_positions: np.ndarray = alloc_field(label="mutation_positions", kind="tables", owner="operator", retention="persistent", activity="always")
+    mutation_times: np.ndarray = alloc_field(label="mutation_times", kind="tables", owner="operator", retention="persistent", activity="always")
+    mutation_alleles: np.ndarray = alloc_field(label="mutation_alleles", kind="tables", owner="operator", retention="persistent", activity="always")
+    mutation_allele_offsets: np.ndarray = alloc_field(label="mutation_allele_offsets", kind="tables", owner="operator", retention="persistent", activity="always")
+    mutation_ref_alleles: np.ndarray = alloc_field(label="mutation_ref_alleles", kind="tables", owner="operator", retention="persistent", activity="always")
+    mutation_ref_allele_offsets: np.ndarray = alloc_field(label="mutation_ref_allele_offsets", kind="tables", owner="operator", retention="persistent", activity="always")
+    sel_mut: sp.spmatrix = alloc_field(label="sel_mut", kind="selector", owner="operator", retention="persistent", activity="always")
+    sel_miss: sp.spmatrix = alloc_field(label="sel_miss", kind="selector", owner="operator", retention="persistent", activity="always")
+    coalescence_counts: np.ndarray | None = alloc_field(label="coalescence_counts", kind="coalescence", owner="operator", retention="persistent", activity="always", default=None)
+    init_vector_up_bias: np.ndarray | None = alloc_field(label="init_vector_up_bias", kind="init", owner="operator", retention="persistent", activity="always", default=None)
+    init_vector_down_bias: np.ndarray | None = alloc_field(label="init_vector_down_bias", kind="init", owner="operator", retention="persistent", activity="always", default=None)
+    init_xtx_up_bias: np.ndarray | None = alloc_field(label="init_xtx_up_bias", kind="init", owner="operator", retention="persistent", activity="always", default=None)
+    init_xtx_down_bias: np.ndarray | None = alloc_field(label="init_xtx_down_bias", kind="init", owner="operator", retention="persistent", activity="always", default=None)
+
+
+@dataclass
+class OperatorCallMem:
+    caller_input: np.ndarray | None = alloc_field(label="input", kind="input", owner="caller", retention="call", activity="yes", default=None)
+    caller_miss_input: np.ndarray | None = alloc_field(label="miss_input", kind="input", owner="caller", retention="call", activity="yes", default=None)
+    caller_miss_output: np.ndarray | None = alloc_field(label="miss_output", kind="output", owner="caller", retention="call", activity="yes", default=None)
+    caller_init: np.ndarray | None = alloc_field(label="init", kind="input", owner="caller", retention="call", activity="yes", default=None)
+    caller_output: np.ndarray | None = alloc_field(label="output", kind="output", owner="caller", retention="call", activity="yes", default=None)
+    caller_aux_output: np.ndarray | None = alloc_field(label="aux_output", kind="output", owner="caller", retention="call", activity="yes", default=None)
+    input_internal: np.ndarray | None = alloc_field(label="input_internal", kind="input", owner="operator", retention="call", activity="yes", default=None)
+    miss_internal: np.ndarray | None = alloc_field(label="miss_internal", kind="input", owner="operator", retention="call", activity="yes", default=None)
+    init_payload: np.ndarray | None = alloc_field(label="init_payload", kind="init", owner="operator", retention="call", activity="yes", default=None)
+    backend_init_payload: np.ndarray | None = alloc_field(label="backend_init_payload", kind="init", owner="operator", retention="call", activity="yes", default=None)
+    input_by_individual: np.ndarray | None = alloc_field(label="input_by_individual", kind="temporary", owner="operator", retention="call", activity="yes", default=None)
+
+_NUCLEOTIDE_DECODE = ["A", "T", "C", "G"]
 
 
 def _decode_allele(data: np.ndarray, offsets: np.ndarray, idx: int) -> str:
@@ -50,15 +95,19 @@ class SpmvGRG:
             artifact_root = Path(artifact_dir).expanduser()
             self._artifact_path = artifact_path_for_grg(source_path, artifact_root)
             self._artifact_path.parent.mkdir(parents=True, exist_ok=True)
-            self._state = self._load_or_build_from_grg(source_path=source_path, artifact_path=self._artifact_path)
+            self._compiled = self._load_or_build_from_grg(source_path=source_path, artifact_path=self._artifact_path)
         elif source_path.suffix == ".grg_spmv":
             self._artifact_path = source_path
-            self._state = load_grg_spmv(self._artifact_path, self._dtype, self._index_dtype)
+            self._compiled = load_grg_spmv(self._artifact_path, self._dtype, self._index_dtype)
         else:
             raise ValueError(f"Unsupported SpmvGRG input path {source_path}; expected .grg or .grg_spmv")
 
-        self._backend.setup(self._state.to_backend_setup(self._dtype))
-        self._state.A_blocks = None
+        self.memory = MemoryLedger()
+        self._backend.setup(self._compiled.to_backend_setup(self._dtype))
+        self._compiled.A_blocks = None
+        self._retained_mem = self._build_retained_mem()
+        self._seen_retained_epoch = -1
+        self._refresh_retained_snapshot(force=True)
 
     def _load_or_build_from_grg(self, *, source_path: Path, artifact_path: Path) -> CompiledOperatorState:
         if artifact_path.exists():
@@ -78,12 +127,12 @@ class SpmvGRG:
 
     def _build_and_save_artifact(self, *, source_path: Path, artifact_path: Path) -> CompiledOperatorState:
         grg = pygrgl.load_immutable_grg(str(source_path), load_up_edges=True)
-        state = compile_grg(grg, dtype=self._dtype, index_dtype=self._index_dtype)
-        self._build_init_biases(state)
-        save_grg_spmv(state, artifact_path)
-        return state
+        compiled = compile_grg(grg, dtype=self._dtype, index_dtype=self._index_dtype)
+        self._build_init_biases(compiled)
+        save_grg_spmv(compiled, artifact_path)
+        return compiled
 
-    def _build_init_biases(self, state: CompiledOperatorState) -> None:
+    def _build_init_biases(self, compiled: CompiledOperatorState) -> None:
         helper = ReferenceBackend(
             pair=ReferencePlanPair(
                 plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
@@ -91,22 +140,71 @@ class SpmvGRG:
             ),
             log_level="WARNING",
         )
-        helper.setup(state.to_backend_setup(self._dtype))
-        zeros_up = np.zeros((state.num_samples, 1), dtype=self._dtype)
-        zeros_down = np.zeros((state.num_mutations, 1), dtype=self._dtype)
+        helper.setup(compiled.to_backend_setup(self._dtype))
+        zeros_up = np.zeros((compiled.num_samples, 1), dtype=self._dtype)
+        zeros_down = np.zeros((compiled.num_mutations, 1), dtype=self._dtype)
         init_vec = np.ones(1, dtype=self._dtype)
 
         up_bias, _ = helper.run_up(zeros_up, init_mode=InitMode.VECTOR, init=init_vec, need_miss_output=False)
         down_bias = helper.run_down(zeros_down, init_mode=InitMode.VECTOR, init=init_vec, miss=None)
-        state.init_vector_up_bias = np.asarray(up_bias[:, 0], dtype=self._dtype).reshape(state.num_mutations)
-        state.init_vector_down_bias = np.asarray(down_bias[:, 0], dtype=self._dtype).reshape(state.num_samples)
-        state.init_xtx_up_bias = None
-        state.init_xtx_down_bias = None
-        if state.coalescence_counts is not None:
+        compiled.init_vector_up_bias = np.asarray(up_bias[:, 0], dtype=self._dtype).reshape(compiled.num_mutations)
+        compiled.init_vector_down_bias = np.asarray(down_bias[:, 0], dtype=self._dtype).reshape(compiled.num_samples)
+        compiled.init_xtx_up_bias = None
+        compiled.init_xtx_down_bias = None
+        if compiled.coalescence_counts is not None:
             up_xtx, _ = helper.run_up(zeros_up, init_mode=InitMode.XTX, init=None, need_miss_output=False)
             down_xtx = helper.run_down(zeros_down, init_mode=InitMode.XTX, init=None, miss=None)
-            state.init_xtx_up_bias = np.asarray(up_xtx[:, 0], dtype=self._dtype).reshape(state.num_mutations)
-            state.init_xtx_down_bias = np.asarray(down_xtx[:, 0], dtype=self._dtype).reshape(state.num_samples)
+            compiled.init_xtx_up_bias = np.asarray(up_xtx[:, 0], dtype=self._dtype).reshape(compiled.num_mutations)
+            compiled.init_xtx_down_bias = np.asarray(down_xtx[:, 0], dtype=self._dtype).reshape(compiled.num_samples)
+
+    def _build_retained_mem(self) -> OperatorRetainedMem:
+        return OperatorRetainedMem(
+            level_offsets=self._compiled.level_offsets,
+            sample_perm=self._compiled.sample_perm,
+            inv_sample_perm=self._compiled.inv_sample_perm,
+            node_perm=self._compiled.node_perm,
+            inv_node_perm=self._compiled.inv_node_perm,
+            sample_to_individual=self._compiled.sample_to_individual,
+            mutation_positions=self._compiled.mutation_positions,
+            mutation_times=self._compiled.mutation_times,
+            mutation_alleles=self._compiled.mutation_alleles,
+            mutation_allele_offsets=self._compiled.mutation_allele_offsets,
+            mutation_ref_alleles=self._compiled.mutation_ref_alleles,
+            mutation_ref_allele_offsets=self._compiled.mutation_ref_allele_offsets,
+            coalescence_counts=self._compiled.coalescence_counts,
+            init_vector_up_bias=self._compiled.init_vector_up_bias,
+            init_vector_down_bias=self._compiled.init_vector_down_bias,
+            init_xtx_up_bias=self._compiled.init_xtx_up_bias,
+            init_xtx_down_bias=self._compiled.init_xtx_down_bias,
+            sel_mut=self._compiled.sel_mut,
+            sel_miss=self._compiled.sel_miss,
+        )
+
+    def _refresh_retained_snapshot(self, *, force: bool = False) -> None:
+        current_epoch = int(self._backend._retained_epoch)
+        if not force and current_epoch == self._seen_retained_epoch:
+            return
+        self.memory.retained = capture_snapshot(self._retained_mem, self._backend._retained_mem, stage="retained", runtime_k=None)
+        self._seen_retained_epoch = current_epoch
+
+    def _record_last_call_snapshot(
+        self,
+        *,
+        stage: str,
+        operator_call: OperatorCallMem,
+        backend_call,
+        capture,
+    ) -> None:
+        self.memory.last_call = capture_snapshot(
+            operator_call,
+            backend_call,
+            stage=stage,
+            runtime_k=capture.runtime_k,
+            direction=capture.direction,
+            active_alloc_keys=capture.active_alloc_keys,
+            meta=dict(capture.meta),
+        )
+        self._refresh_retained_snapshot()
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -118,93 +216,93 @@ class SpmvGRG:
 
     @property
     def num_samples(self):
-        return self._state.num_samples
+        return self._compiled.num_samples
 
     @property
     def num_individuals(self):
-        return self._state.num_individuals
+        return self._compiled.num_individuals
 
     @property
     def num_mutations(self):
-        return self._state.num_mutations
+        return self._compiled.num_mutations
 
     @property
     def ploidy(self):
-        return self._state.ploidy
+        return self._compiled.ploidy
 
     @property
     def num_nodes(self):
-        return self._state.num_nodes
+        return self._compiled.num_nodes
 
     @property
     def num_edges(self):
-        return self._state.num_edges
+        return self._compiled.num_edges
 
     @property
     def has_missing_data(self):
-        return self._state.has_missing_data
+        return self._compiled.has_missing_data
 
     @property
     def level_offsets(self):
-        return self._state.level_offsets
+        return self._compiled.level_offsets
 
     @property
     def sample_perm(self):
-        return self._state.sample_perm
+        return self._compiled.sample_perm
 
     @property
     def inv_sample_perm(self):
-        return self._state.inv_sample_perm
+        return self._compiled.inv_sample_perm
 
     @property
     def node_perm(self):
-        return self._state.node_perm
+        return self._compiled.node_perm
 
     @property
     def inv_node_perm(self):
-        return self._state.inv_node_perm
+        return self._compiled.inv_node_perm
 
     @property
     def sel_mut(self):
-        return self._state.sel_mut
+        return self._compiled.sel_mut
 
     @property
     def sel_miss(self):
-        return self._state.sel_miss
+        return self._compiled.sel_miss
 
     @property
     def sample_to_individual(self):
-        return self._state.sample_to_individual
+        return self._compiled.sample_to_individual
 
     @property
     def coalescence_counts(self):
-        return self._state.coalescence_counts
+        return self._compiled.coalescence_counts
 
     @property
     def init_vector_up_bias(self):
-        return self._state.init_vector_up_bias
+        return self._compiled.init_vector_up_bias
 
     @property
     def init_vector_down_bias(self):
-        return self._state.init_vector_down_bias
+        return self._compiled.init_vector_down_bias
 
     @property
     def init_xtx_up_bias(self):
-        return self._state.init_xtx_up_bias
+        return self._compiled.init_xtx_up_bias
 
     @property
     def init_xtx_down_bias(self):
-        return self._state.init_xtx_down_bias
+        return self._compiled.init_xtx_down_bias
 
     def get_mutation_by_id(self, mutation_id: int):
         idx = int(mutation_id)
         if idx < 0 or idx >= self.num_mutations:
             raise IndexError(f"Mutation id out of range: {mutation_id}")
         return pygrgl.Mutation(
-            float(self._state.mutation_positions[idx]),
-            _decode_allele(self._state.mutation_alleles, self._state.mutation_allele_offsets, idx),
-            _decode_allele(self._state.mutation_ref_alleles, self._state.mutation_ref_allele_offsets, idx),
-            float(self._state.mutation_times[idx]),
+            float(self._compiled.mutation_positions[idx]),
+            _decode_allele(self._compiled.mutation_alleles, self._compiled.mutation_allele_offsets, idx),
+            _decode_allele(self._compiled.mutation_ref_alleles, self._compiled.mutation_ref_allele_offsets, idx),
+            float(self._compiled.mutation_times[idx]),
         )
 
     def _parse_direction(self, direction: str | Direction | pygrgl.TraversalDirection) -> Direction:
@@ -233,15 +331,17 @@ class SpmvGRG:
                     "This SpmvGRG instance was loaded without coalescence counts."
                 )
             return InitMode.XTX, None
+        if not isinstance(init, np.ndarray):
+            raise TypeError(f"init must be None, 'xtx', or a numpy.ndarray, got {type(init).__name__}")
 
-        init_arr = np.asarray(init)
+        init_arr = init
         if init_arr.dtype != input_dtype:
             raise TypeError(f"The init matrix must match the dtype of the input matrix. Got: {init_arr.dtype}")
 
         if init_arr.ndim == 1:
             if init_arr.shape[0] != rows:
                 raise ValueError("If init has a single dimension, it must match the number of rows in the input matrix")
-            return InitMode.VECTOR, np.asarray(init_arr, dtype=self._dtype, order="C")
+            return InitMode.VECTOR, init_arr.astype(self._dtype, order="C", copy=False)
 
         if init_arr.ndim == 2:
             if init_arr.shape != (rows, self.num_nodes):
@@ -249,12 +349,14 @@ class SpmvGRG:
                     f"If init is a matrix, it must match the dimensions ({rows}, {self.num_nodes})"
                 )
             init_nodes = init_arr[:, self.node_perm].T
-            return InitMode.MATRIX, np.asarray(init_nodes, dtype=self._dtype, order="C")
+            return InitMode.MATRIX, init_nodes.astype(self._dtype, order="C", copy=False)
 
         raise ValueError("init must be None, 'xtx', a vector, or a matrix")
 
     def _validate_miss(self, miss: np.ndarray, rows: int, direction: Direction, input_dtype: np.dtype) -> np.ndarray:
-        miss_arr = np.asarray(miss)
+        if not isinstance(miss, np.ndarray):
+            raise TypeError(f'The "miss" input must be a numpy.ndarray. Got: {type(miss).__name__}')
+        miss_arr = miss
         if miss_arr.dtype != input_dtype:
             raise TypeError(f'The "miss" input must match the dtype of the input matrix. Got: {miss_arr.dtype}')
         if miss_arr.ndim != 2:
@@ -313,7 +415,9 @@ class SpmvGRG:
         init=None,
         miss=None,
     ):
-        X_in = np.asarray(input)
+        if not isinstance(input, np.ndarray):
+            raise TypeError(f"matmul() requires input to be a numpy.ndarray, got {type(input).__name__}")
+        X_in = input
         if X_in.ndim != 2:
             raise ValueError("matmul() only supports two-dimensional numpy arrays as input.")
         rows, cols = X_in.shape
@@ -346,28 +450,116 @@ class SpmvGRG:
                 (InitMode.NONE, None) if init_mode in (InitMode.VECTOR, InitMode.XTX) else (init_mode, init_payload)
             )
 
-        input_matrix = np.asarray(X_in, dtype=self._dtype, order="C")
+        input_matrix = X_in.astype(self._dtype, order="C", copy=False)
         input_internal = input_matrix.T
+        caller_init = init if isinstance(init, np.ndarray) else None
+        operator_call = OperatorCallMem(
+            caller_input=X_in,
+            caller_init=caller_init,
+            input_internal=input_matrix,
+            init_payload=init_payload,
+            backend_init_payload=backend_init_payload,
+        )
 
-        if direction_name == Direction.UP:
-            if by_individual:
-                input_internal = input_internal[self.sample_to_individual]
+        with self._backend._call_capture_scope() as capture_nonce:
+            if direction_name == Direction.UP:
+                if by_individual:
+                    input_internal = input_internal[self.sample_to_individual]
+                    operator_call.input_by_individual = input_internal
+                if emit_all_nodes:
+                    node_values = self._backend.run_up_nodes(
+                        input_internal,
+                        init_mode=backend_init_mode,
+                        init=backend_init_payload,
+                    )
+                    capture = self._backend._consume_call_capture(
+                        expected_nonce=capture_nonce,
+                        expected_direction=direction_name,
+                        expected_k=rows,
+                    )
+                    output = self._finish_node_output(node_values)
+                    operator_call.caller_output = output
+                    assert self._backend._call_mem is not None
+                    self._record_last_call_snapshot(
+                        stage="run_up",
+                        operator_call=operator_call,
+                        backend_call=self._backend._call_mem,
+                        capture=capture,
+                    )
+                    return output
+
+                miss_output = None
+                if miss is not None:
+                    miss_output = self._validate_miss(miss, rows, direction_name, X_in.dtype)
+                result_internal, miss_internal = self._backend.run_up(
+                    input_internal,
+                    init_mode=backend_init_mode,
+                    init=backend_init_payload,
+                    need_miss_output=(miss_output is not None),
+                )
+                capture = self._backend._consume_call_capture(
+                    expected_nonce=capture_nonce,
+                    expected_direction=direction_name,
+                    expected_k=rows,
+                )
+                if init_mode != InitMode.NONE:
+                    self._apply_endpoint_init_bias(
+                        result_internal,
+                        direction=direction_name,
+                        init_mode=init_mode,
+                        init_payload=init_payload,
+                    )
+                if miss_output is not None and miss_internal is not None:
+                    miss_output += miss_internal.T.astype(miss_output.dtype, copy=False)
+                output = self._finish_endpoint_output(result_internal)
+                operator_call.caller_output = output
+                operator_call.caller_miss_output = miss_output
+                assert self._backend._call_mem is not None
+                self._record_last_call_snapshot(
+                    stage="run_up",
+                    operator_call=operator_call,
+                    backend_call=self._backend._call_mem,
+                    capture=capture,
+                )
+                return output
+
             if emit_all_nodes:
-                node_values = self._backend.run_up_nodes(
+                node_values = self._backend.run_down_nodes(
                     input_internal,
                     init_mode=backend_init_mode,
                     init=backend_init_payload,
                 )
-                return self._finish_node_output(node_values)
+                capture = self._backend._consume_call_capture(
+                    expected_nonce=capture_nonce,
+                    expected_direction=direction_name,
+                    expected_k=rows,
+                )
+                output = self._finish_node_output(node_values)
+                operator_call.caller_output = output
+                assert self._backend._call_mem is not None
+                self._record_last_call_snapshot(
+                    stage="run_down",
+                    operator_call=operator_call,
+                    backend_call=self._backend._call_mem,
+                    capture=capture,
+                )
+                return output
 
+            miss_internal = None
             miss_output = None
             if miss is not None:
                 miss_output = self._validate_miss(miss, rows, direction_name, X_in.dtype)
-            result_internal, miss_internal = self._backend.run_up(
+                miss_internal = miss_output.T.astype(self._dtype, order="C", copy=False)
+            result_internal = self._backend.run_down(
                 input_internal,
+                miss=miss_internal,
                 init_mode=backend_init_mode,
                 init=backend_init_payload,
-                need_miss_output=(miss_output is not None),
+            )
+            capture = self._backend._consume_call_capture(
+                expected_nonce=capture_nonce,
+                expected_direction=direction_name,
+                expected_k=rows,
             )
             if init_mode != InitMode.NONE:
                 self._apply_endpoint_init_bias(
@@ -376,42 +568,22 @@ class SpmvGRG:
                     init_mode=init_mode,
                     init_payload=init_payload,
                 )
-            if miss_output is not None and miss_internal is not None:
-                miss_output += miss_internal.T.astype(miss_output.dtype, copy=False)
-            return self._finish_endpoint_output(result_internal)
-
-        if emit_all_nodes:
-            node_values = self._backend.run_down_nodes(
-                input_internal,
-                init_mode=backend_init_mode,
-                init=backend_init_payload,
+            if by_individual:
+                result_by_individual = np.zeros((self.num_individuals, rows), dtype=self._dtype)
+                np.add.at(result_by_individual, self.sample_to_individual, result_internal)
+                result_internal = result_by_individual
+            output = self._finish_endpoint_output(result_internal)
+            operator_call.caller_output = output
+            operator_call.caller_miss_input = miss_output
+            operator_call.miss_internal = miss_internal
+            assert self._backend._call_mem is not None
+            self._record_last_call_snapshot(
+                stage="run_down",
+                operator_call=operator_call,
+                backend_call=self._backend._call_mem,
+                capture=capture,
             )
-            return self._finish_node_output(node_values)
-
-        miss_internal = None
-        miss_output = None
-        if miss is not None:
-            miss_output = self._validate_miss(miss, rows, direction_name, X_in.dtype)
-            miss_internal = np.asarray(miss_output.T, dtype=self._dtype, order="C")
-
-        result_internal = self._backend.run_down(
-            input_internal,
-            miss=miss_internal,
-            init_mode=backend_init_mode,
-            init=backend_init_payload,
-        )
-        if init_mode != InitMode.NONE:
-            self._apply_endpoint_init_bias(
-                result_internal,
-                direction=direction_name,
-                init_mode=init_mode,
-                init_payload=init_payload,
-            )
-        if by_individual:
-            result_by_individual = np.zeros((self.num_individuals, rows), dtype=self._dtype)
-            np.add.at(result_by_individual, self.sample_to_individual, result_internal)
-            result_internal = result_by_individual
-        return self._finish_endpoint_output(result_internal)
+            return output
 
 
 __all__ = ["SpmvGRG"]

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field, is_dataclass
 import logging
 import warnings
 from typing import Any, Iterator
@@ -10,8 +11,10 @@ from typing import Any, Iterator
 import numpy as np
 import scipy.sparse as sp
 
-from pygrgl_spmv.backends.memory import MemoryUsage, StaticBytes
+from pygrgl_spmv.memory import AllocKey, _alloc_keys_for_value
 from pygrgl_spmv.backends.types import Direction, InitMode
+
+_RESERVED_CAPTURE_META_KEYS = frozenset({"direction", "runtime_k", "active_alloc_keys"})
 
 
 def _parse_optional_k_hint(value: Any) -> int | None:
@@ -45,6 +48,38 @@ class BackendSetup:
     dtype: np.dtype
 
 
+@dataclass(frozen=True)
+class CallCapture:
+    nonce: int
+    direction: str
+    runtime_k: int
+    active_alloc_keys: frozenset[AllocKey] = field(default_factory=frozenset)
+    meta: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "nonce", int(self.nonce))
+        token = str(self.direction)
+        if token not in {"up", "down"}:
+            raise ValueError(f"Unknown CallCapture direction {self.direction!r}; expected 'up' or 'down'")
+        object.__setattr__(self, "direction", token)
+        object.__setattr__(self, "runtime_k", int(self.runtime_k))
+        normalized: set[AllocKey] = set()
+        for key in self.active_alloc_keys:
+            if isinstance(key, tuple):
+                normalized.add(tuple(key))
+                continue
+            if isinstance(key, list):
+                normalized.add(tuple(key))
+                continue
+            raise TypeError(f"CallCapture active_alloc_keys entries must be tuple/list, got {type(key).__name__}")
+        object.__setattr__(self, "active_alloc_keys", frozenset(normalized))
+        meta = dict(self.meta)
+        reserved = sorted(_RESERVED_CAPTURE_META_KEYS.intersection(meta))
+        if reserved:
+            raise ValueError(f"CallCapture.meta contains reserved semantic key(s): {reserved}")
+        object.__setattr__(self, "meta", meta)
+
+
 def iter_direction_level_pairs(direction: Direction, H: int) -> Iterator[tuple[int, int, int]]:
     """Yield ``(dst_level, src_level, row_index)`` tuples in execution order."""
     if H < 0:
@@ -60,71 +95,6 @@ def iter_direction_level_pairs(direction: Direction, H: int) -> Iterator[tuple[i
                     yield dst_level, src_level, src_level - dst_level - 1
         case _:
             raise ValueError(f"Unknown direction {direction!r}")
-
-
-def _sparse_host_bytes(mat: object | None) -> int:
-    if mat is None:
-        return 0
-    obj = getattr(mat, "_mat", mat)
-    data = getattr(obj, "data", None)
-    if data is None:
-        return 0
-    total = int(data.nbytes)
-    if hasattr(obj, "indices"):
-        total += int(obj.indices.nbytes)
-    if hasattr(obj, "indptr"):
-        total += int(obj.indptr.nbytes)
-    if hasattr(obj, "row"):
-        total += int(obj.row.nbytes)
-    if hasattr(obj, "col"):
-        total += int(obj.col.nbytes)
-    return total
-
-
-def estimate_sparse_payload_bytes(
-    *,
-    fmt: str,
-    nrows: int,
-    ncols: int,
-    nnz: int,
-    data_itemsize: int,
-    index_itemsize: int,
-) -> int:
-    if nnz < 0:
-        raise ValueError(f"nnz must be non-negative, got {nnz}")
-    if data_itemsize <= 0 or index_itemsize <= 0:
-        raise ValueError(
-            f"data_itemsize and index_itemsize must be positive, got {data_itemsize}, {index_itemsize}"
-        )
-    match fmt:
-        case "csr":
-            return int(nnz * (data_itemsize + index_itemsize) + (nrows + 1) * index_itemsize)
-        case "csc":
-            return int(nnz * (data_itemsize + index_itemsize) + (ncols + 1) * index_itemsize)
-        case "coo":
-            return int(nnz * (data_itemsize + 2 * index_itemsize))
-        case _:
-            raise ValueError(f"Unsupported sparse format for size estimate: {fmt!r}")
-
-
-def estimate_common_host_static_bytes(
-    *,
-    level_offsets: np.ndarray,
-    sample_perm: np.ndarray,
-    inv_sample_perm: np.ndarray,
-    coalescence_counts: np.ndarray | None,
-    xtx_init: np.ndarray | None,
-) -> StaticBytes:
-    host = StaticBytes(
-        level_offsets=int(level_offsets.nbytes),
-        sample_perm=int(sample_perm.nbytes),
-        inv_sample_perm=int(inv_sample_perm.nbytes),
-    )
-    if coalescence_counts is not None:
-        host.coalescence_counts = int(coalescence_counts.nbytes)
-    if xtx_init is not None:
-        host.xtx_init = int(xtx_init.nbytes)
-    return host
 
 
 def selector_rows_unique_from_csr_indptr(indptr: np.ndarray) -> bool:
@@ -159,7 +129,19 @@ def warn_instrumentation_ignores_k_hint(*, backend: str, direction: Direction, k
 
 
 class BackendBase:
-    """Shared backend state, validation, and memory tracking."""
+    """Shared backend state, validation, and fail-fast call-capture hooks."""
+
+    _SETUP_MEMORY_FIELDS = (
+        "_A_blocks",
+        "_sel_mut",
+        "_sel_miss",
+        "_level_offsets",
+        "_sample_perm",
+        "_inv_sample_perm",
+        "_coalescence_counts",
+        "_xtx_host",
+    )
+    _SETUP_MEMORY_POLICY: dict[str, str] = {}
 
     def __init__(
         self,
@@ -205,7 +187,13 @@ class BackendBase:
         self._num_samples = 0
         self._num_nodes = 0
         self._num_mutations = 0
-        self.mem_usage = MemoryUsage()
+        self._capture_nonce = 0
+        self._capture_active = False
+        self._last_call_capture: CallCapture | None = None
+        self._retained_mem = None
+        self._call_mem_type = None
+        self._call_mem = None
+        self._retained_epoch = 0
 
     def _require_plan(self, direction: Direction):
         plan = self._plan_for(direction)
@@ -237,6 +225,11 @@ class BackendBase:
         return tuple(directions)
 
     def _apply_setup_state(self, setup: BackendSetup) -> None:
+        self._require_memory_installed()
+        if self._capture_active:
+            raise RuntimeError(f"{self.__class__.__name__} cannot apply setup state while a call capture is active")
+        if self._call_mem is not None:
+            raise RuntimeError(f"{self.__class__.__name__} cannot apply setup state while call memory is live")
         self._A_blocks = setup.A_blocks
         self._level_offsets = np.asarray(setup.level_offsets)
         self._num_samples = int(setup.num_samples)
@@ -330,10 +323,133 @@ class BackendBase:
             raise ValueError(f"miss input must have shape ({self._num_mutations}, {k}), got {miss_arr.shape}")
         return miss_arr
 
-    def setup(self, setup: BackendSetup) -> None:
-        raise NotImplementedError
+    @contextmanager
+    def _call_capture_scope(self):
+        self._require_memory_installed()
+        if self._capture_active:
+            raise RuntimeError(f"{self.__class__.__name__} call capture is already active")
+        if self._call_mem is not None:
+            raise RuntimeError(f"{self.__class__.__name__} call memory is unexpectedly live")
+        if self._call_mem_type is None:
+            raise RuntimeError(f"{self.__class__.__name__} call memory type is not installed")
+        self._capture_nonce += 1
+        nonce = int(self._capture_nonce)
+        self._capture_active = True
+        self._last_call_capture = None
+        self._call_mem = self._call_mem_type()
+        try:
+            yield nonce
+        finally:
+            self._capture_active = False
+            self._last_call_capture = None
+            self._call_mem = None
 
-    def estimate_static_bytes(self) -> tuple[StaticBytes, StaticBytes]:
+    def _publish_call_capture(self, capture: CallCapture) -> None:
+        if not self._capture_active:
+            raise RuntimeError(f"{self.__class__.__name__} published call capture outside an active capture scope")
+        if self._call_mem is None:
+            raise RuntimeError(f"{self.__class__.__name__} has no call memory while publishing call capture")
+        if int(capture.nonce) != int(self._capture_nonce):
+            raise RuntimeError(
+                f"Stale call-capture nonce {capture.nonce} for {self.__class__.__name__}; current nonce is {self._capture_nonce}"
+            )
+        if self._last_call_capture is not None:
+            raise RuntimeError(f"{self.__class__.__name__} published duplicate call capture")
+        self._last_call_capture = capture
+
+    def _consume_call_capture(
+        self,
+        *,
+        expected_nonce: int,
+        expected_direction: Direction,
+        expected_k: int,
+    ) -> CallCapture:
+        capture = self._last_call_capture
+        if capture is None:
+            raise RuntimeError(f"{self.__class__.__name__} failed to publish call capture")
+        if int(capture.nonce) != int(expected_nonce):
+            raise RuntimeError(
+                f"{self.__class__.__name__} published nonce {capture.nonce}, expected {expected_nonce}"
+            )
+        if str(capture.direction) != str(expected_direction.value):
+            raise RuntimeError(
+                f"{self.__class__.__name__} published direction {capture.direction!r}, expected {expected_direction.value!r}"
+            )
+        if int(capture.runtime_k) != int(expected_k):
+            raise RuntimeError(
+                f"{self.__class__.__name__} published runtime_k {capture.runtime_k}, expected {expected_k}"
+            )
+        return capture
+
+    def _require_memory_installed(self) -> None:
+        if self._retained_mem is None or not (is_dataclass(self._retained_mem) and not isinstance(self._retained_mem, type)):
+            raise RuntimeError(f"{self.__class__.__name__} retained memory root is not installed")
+        if self._call_mem_type is None or not (isinstance(self._call_mem_type, type) and is_dataclass(self._call_mem_type)):
+            raise RuntimeError(f"{self.__class__.__name__} call memory type is not installed")
+
+    def _install_memory(self, *, retained, call_type) -> None:
+        if not (is_dataclass(retained) and not isinstance(retained, type)):
+            raise RuntimeError(f"{self.__class__.__name__} retained memory root must be a dataclass instance")
+        if not (isinstance(call_type, type) and is_dataclass(call_type)):
+            raise RuntimeError(f"{self.__class__.__name__} call memory type must be a dataclass type")
+        self._retained_mem = retained
+        self._call_mem_type = call_type
+        self._call_mem = None
+        self._retained_epoch = 0
+
+    @staticmethod
+    def _alloc_keys(*values: Any) -> frozenset[AllocKey]:
+        keys: set[AllocKey] = set()
+        for value in values:
+            keys.update(_alloc_keys_for_value(value))
+        return frozenset(keys)
+
+    def _bump_retained_epoch(self) -> None:
+        self._retained_epoch += 1
+
+    def _assert_setup_memory_contract(self) -> None:
+        self._require_memory_installed()
+        policy = dict(getattr(self, "_SETUP_MEMORY_POLICY", {}))
+        expected = set(self._SETUP_MEMORY_FIELDS)
+        actual = set(policy)
+        if actual != expected:
+            raise RuntimeError(
+                f"{self.__class__.__name__} setup memory policy keys mismatch: actual={sorted(actual)!r}, expected={sorted(expected)!r}"
+            )
+        if self._call_mem is not None:
+            raise RuntimeError(f"{self.__class__.__name__} call memory must be absent outside an active capture scope")
+        retained_ids = _alloc_keys_for_value(self._retained_mem)
+        for name in self._SETUP_MEMORY_FIELDS:
+            mode = str(policy[name])
+            if mode not in {"retained", "borrowed", "dropped"}:
+                raise RuntimeError(f"{self.__class__.__name__} setup memory policy for {name} is invalid: {mode!r}")
+            value = getattr(self, name)
+            if mode == "dropped":
+                if not self._is_dropped_setup_value(value):
+                    raise RuntimeError(f"{self.__class__.__name__} expected dropped setup field {name} to be empty")
+                continue
+            if mode == "retained":
+                missing = _alloc_keys_for_value(value) - retained_ids
+                if missing:
+                    raise RuntimeError(f"{self.__class__.__name__} retained setup field {name} is not represented in backend retained memory")
+
+    @staticmethod
+    def _is_dropped_setup_value(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, dict):
+            return len(value) == 0
+        if isinstance(value, list):
+            return len(value) == 0
+        if isinstance(value, tuple):
+            return len(value) == 0
+        if sp.issparse(value):
+            return tuple(value.shape) == (0, 0)
+        if isinstance(value, np.ndarray):
+            return int(value.size) == 0
+        return False
+
+    def setup(self, setup: BackendSetup) -> None:
         raise NotImplementedError
 
     def run_up_nodes(
@@ -357,11 +473,9 @@ class BackendBase:
 
 __all__ = [
     "BackendBase",
+    "CallCapture",
     "BackendSetup",
     "_parse_optional_k_hint",
-    "_sparse_host_bytes",
-    "estimate_common_host_static_bytes",
-    "estimate_sparse_payload_bytes",
     "iter_direction_level_pairs",
     "selector_rows_unique_from_csr_indptr",
     "warn_k_hint_mismatch",

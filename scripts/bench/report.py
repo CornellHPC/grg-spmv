@@ -5,10 +5,144 @@ from __future__ import annotations
 import numpy as np
 
 from scripts.bench.cli import OUTPUT_ATOL, OUTPUT_RTOL
+from scripts.bench.configs import BenchConfig
 
 
 def bytes_to_gib(value: int | float) -> float:
     return float(value) / float(1024 ** 3)
+
+
+def _common_value(values: list[object]) -> object | None:
+    if not values:
+        return None
+    head = values[0]
+    if all(value == head for value in values[1:]):
+        return head
+    return None
+
+
+def _parse_plan_text(plan_text: str | None) -> tuple[tuple[str, str], ...] | None:
+    if plan_text is None:
+        return None
+    text = str(plan_text).strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        raise ValueError(f"Unexpected benchmark plan text {plan_text!r}")
+    body = text[1:-1]
+    if not body:
+        return tuple()
+    parts: list[tuple[str, str]] = []
+    for token in body.split(","):
+        key, value = token.split("=", 1)
+        parts.append((key, value))
+    return tuple(parts)
+
+
+def _format_plan_fields(fields: tuple[tuple[str, str], ...]) -> str:
+    return "[" + ",".join(f"{key}={value}" for key, value in fields) + "]"
+
+
+def _format_side(side: str, fields: tuple[tuple[str, str], ...] | None) -> str:
+    if fields is None:
+        return f"{side}=<unspecified>"
+    return f"{side}{_format_plan_fields(fields)}"
+
+
+def summarize_config_display(configs: list[BenchConfig]) -> tuple[list[str], dict[str, str]]:
+    if not configs:
+        return [], {}
+    label_counts: dict[str, int] = {}
+    for entry in configs:
+        label = str(entry.label)
+        label_counts[label] = label_counts.get(label, 0) + 1
+    duplicates = sorted(label for label, count in label_counts.items() if count > 1)
+    if duplicates:
+        raise ValueError(f"Benchmark config labels must be unique, got duplicates: {duplicates}")
+
+    backend_common = _common_value([entry.backend_name for entry in configs])
+    instrumentation_common = _common_value([bool(entry.instrumentation) for entry in configs])
+    parsed_up = [_parse_plan_text(entry.plan_up_text) for entry in configs]
+    parsed_down = [_parse_plan_text(entry.plan_down_text) for entry in configs]
+
+    def _common_side(plans: list[tuple[tuple[str, str], ...] | None]) -> tuple[tuple[str, str], ...] | None:
+        if all(plan is None for plan in plans):
+            return None
+        if any(plan is None for plan in plans):
+            return ()
+        first = plans[0]
+        assert first is not None
+        common: list[tuple[str, str]] = []
+        lookups = [dict(plan) for plan in plans if plan is not None]
+        for key, value in first:
+            if all(lookup.get(key) == value for lookup in lookups):
+                common.append((key, value))
+        return tuple(common)
+
+    common_up = _common_side(parsed_up)
+    common_down = _common_side(parsed_down)
+
+    common_lines: list[str] = []
+    if backend_common is not None:
+        common_lines.append(f"backend={backend_common}")
+    if instrumentation_common is not None:
+        common_lines.append(f"instrumentation={'on' if bool(instrumentation_common) else 'off'}")
+    if all(plan is None for plan in parsed_up):
+        common_lines.append("up=<unspecified>")
+    elif common_up:
+        common_lines.append(_format_side("up", common_up))
+    if all(plan is None for plan in parsed_down):
+        common_lines.append("down=<unspecified>")
+    elif common_down:
+        common_lines.append(_format_side("down", common_down))
+
+    display_by_label: dict[str, str] = {}
+    for entry, up_fields, down_fields in zip(configs, parsed_up, parsed_down, strict=True):
+        parts: list[str] = []
+        if backend_common is None:
+            parts.append(f"backend={entry.backend_name}")
+        if instrumentation_common is None:
+            parts.append(f"instr={'on' if entry.instrumentation else 'off'}")
+
+        if not all(plan is None for plan in parsed_up):
+            if up_fields is None:
+                if common_up != up_fields:
+                    parts.append("up=<unspecified>")
+            else:
+                common_keys = set() if common_up is None else {key for key, _ in common_up}
+                diff_fields = tuple((key, value) for key, value in up_fields if key not in common_keys)
+                if common_up == () or diff_fields:
+                    parts.append(_format_side("up", diff_fields if diff_fields else up_fields))
+
+        if not all(plan is None for plan in parsed_down):
+            if down_fields is None:
+                if common_down != down_fields:
+                    parts.append("down=<unspecified>")
+            else:
+                common_keys = set() if common_down is None else {key for key, _ in common_down}
+                diff_fields = tuple((key, value) for key, value in down_fields if key not in common_keys)
+                if common_down == () or diff_fields:
+                    parts.append(_format_side("down", diff_fields if diff_fields else down_fields))
+
+        display_by_label[entry.label] = " ".join(parts) if parts else "-"
+
+    if len(configs) > 1:
+        display_counts: dict[str, int] = {}
+        for entry in configs:
+            display = str(display_by_label[entry.label])
+            display_counts[display] = display_counts.get(display, 0) + 1
+        for entry in configs:
+            display = str(display_by_label[entry.label])
+            if display == "-" or display_counts[display] > 1:
+                display_by_label[entry.label] = str(entry.label)
+
+    return common_lines, display_by_label
+
+
+def print_common_config(common_lines: list[str]) -> None:
+    if not common_lines:
+        return
+    print("\nCommon config:")
+    for line in common_lines:
+        print(f"  {line}")
 
 
 def compare_outputs(
@@ -27,7 +161,12 @@ def compare_outputs(
     return bool(np.allclose(arr, ref, atol=atol, rtol=rtol)), True, max_abs, max_rel
 
 
-def print_runtime_table(rows: list[dict[str, object]], *, skip_note: bool = False) -> None:
+def print_runtime_table(
+    rows: list[dict[str, object]],
+    *,
+    config_display: dict[str, str] | None = None,
+    skip_note: bool = False,
+) -> None:
     if not rows:
         print("No benchmark runtime results.")
         return
@@ -35,7 +174,8 @@ def print_runtime_table(rows: list[dict[str, object]], *, skip_note: bool = Fals
     title = "BENCHMARK RUNTIME SUMMARY (time + correctness diagnostics)"
     rendered: list[tuple[str, str, str, str, str, str, str, str, str]] = []
     for row in rows:
-        config = str(row["config"])
+        raw_config = str(row["config"])
+        config = raw_config if config_display is None else str(config_display.get(raw_config, raw_config))
         scenario = str(row["scenario"])
         direction = str(row["direction"])
         k_value = row.get("k")
@@ -91,38 +231,71 @@ def print_runtime_table(rows: list[dict[str, object]], *, skip_note: bool = Fals
         print(line)
 
 
-def print_memory_table(rows: list[dict[str, object]], *, skip_note: bool = False) -> None:
+def print_memory_table(
+    rows: list[dict[str, object]],
+    *,
+    config_display: dict[str, str] | None = None,
+    skip_note: bool = False,
+) -> None:
     if not rows:
         print("No benchmark memory results.")
         return
 
-    title = "BENCHMARK MEMORY SUMMARY (retained workspace + staging residency)"
-    rendered: list[tuple[str, str, str, str, str, str, str, str]] = []
+    title = "BENCHMARK MEMORY SUMMARY (compact live allocation tree)"
+    rendered: list[tuple[int, str, str, str, str, str, str, str, str, str, str, str, str, str]] = []
     for row in rows:
-        config = str(row["config"])
+        raw_config = str(row["config"])
+        config = raw_config if config_display is None else str(config_display.get(raw_config, raw_config))
         scenario = str(row["scenario"])
-        direction = str(row["direction"])
-        k_value = row.get("k")
-        k_cell = "-" if k_value is None else str(int(k_value))
-        kind = str(row["kind"])
+        case_direction = str(row["case_direction"])
+        case_k_value = row.get("case_k")
+        case_k_cell = "-" if case_k_value is None else str(int(case_k_value))
+        node = str(row["node"])
+        parent = str(row["parent"])
+        level = int(row.get("level", 0))
         if "skip" in row:
-            host_cell = "SKIP"
-            device_cell = "SKIP"
+            gib_cell = "SKIP"
+            space = "-"
         else:
-            host_cell = f"{float(row['host_gib']):.6f}"
-            device_cell = f"{float(row['device_gib']):.6f}"
-        rendered.append((config, scenario, direction, k_cell, kind, host_cell, device_cell, str(row.get("note", ""))))
+            gib_cell = f"{float(row['gib']):.6f}"
+            space = str(row["space"])
+        rendered.append(
+            (
+                level,
+                config,
+                scenario,
+                case_direction,
+                case_k_cell,
+                node,
+                parent,
+                gib_cell,
+                space,
+                str(row.get("owner", "")),
+                str(row.get("active", "")),
+                str(row.get("retention", "")),
+                str(row.get("kinds", "")),
+                str(row.get("note", "")),
+            )
+        )
 
-    config_w = max(len("Config"), max(len(item[0]) for item in rendered))
-    scenario_w = max(len("Scenario"), max(len(item[1]) for item in rendered))
-    direction_w = max(len("Direction"), max(len(item[2]) for item in rendered))
-    k_w = max(len("k"), max(len(item[3]) for item in rendered))
-    kind_w = max(len("Kind"), max(len(item[4]) for item in rendered))
-    host_w = max(len("Host GiB"), max(len(item[5]) for item in rendered))
-    device_w = max(len("Device GiB"), max(len(item[6]) for item in rendered))
+    config_w = max(len("Config"), max(len(item[1]) for item in rendered))
+    scenario_w = max(len("Scenario"), max(len(item[2]) for item in rendered))
+    direction_w = max(len("CaseDir"), max(len(item[3]) for item in rendered))
+    k_w = max(len("CaseK"), max(len(item[4]) for item in rendered))
+    node_w = max(len("Node"), max(len(item[5]) for item in rendered))
+    parent_w = max(len("Parent"), max(len(item[6]) for item in rendered))
+    gib_w = max(len("GiB"), max(len(item[7]) for item in rendered))
+    space_w = max(len("Space"), max(len(item[8]) for item in rendered))
+    owner_w = max(len("Owner"), max(len(item[9]) for item in rendered))
+    active_w = max(len("Active"), max(len(item[10]) for item in rendered))
+    retention_w = max(len("Retention"), max(len(item[11]) for item in rendered))
+    kinds_w = max(len("Kinds"), max(len(item[12]) for item in rendered))
 
-    header = f"{'Config':<{config_w}} {'Scenario':<{scenario_w}} {'Direction':<{direction_w}} {'k':>{k_w}} "
-    header += f"{'Kind':<{kind_w}} {'Host GiB':>{host_w}} {'Device GiB':>{device_w}}"
+    header = f"{'Config':<{config_w}} {'Scenario':<{scenario_w}} {'CaseDir':<{direction_w}} {'CaseK':>{k_w}} "
+    header += (
+        f"{'Node':<{node_w}} {'Parent':<{parent_w}} {'GiB':>{gib_w}} {'Space':<{space_w}} "
+        f"{'Owner':<{owner_w}} {'Active':<{active_w}} {'Retention':<{retention_w}} {'Kinds':<{kinds_w}}"
+    )
     if not skip_note:
         header += " Note"
     width = max(len(title), len(header))
@@ -132,10 +305,15 @@ def print_memory_table(rows: list[dict[str, object]], *, skip_note: bool = False
     print("=" * width)
     print(header)
     print("-" * width)
-    for config, scenario, direction, k_cell, kind, host_cell, device_cell, note in rendered:
+    current_level: int | None = None
+    for level, config, scenario, case_direction, case_k_cell, node, parent, gib_cell, space, owner, active, retention, kinds, note in rendered:
+        if current_level is not None and level != current_level:
+            print(f" LEVEL {level} ".center(width, "-"))
+        current_level = level
         line = (
-            f"{config:<{config_w}} {scenario:<{scenario_w}} {direction:<{direction_w}} {k_cell:>{k_w}} "
-            f"{kind:<{kind_w}} {host_cell:>{host_w}} {device_cell:>{device_w}}"
+            f"{config:<{config_w}} {scenario:<{scenario_w}} {case_direction:<{direction_w}} {case_k_cell:>{k_w}} "
+            f"{node:<{node_w}} {parent:<{parent_w}} {gib_cell:>{gib_w}} {space:<{space_w}} "
+            f"{owner:<{owner_w}} {active:<{active_w}} {retention:<{retention_w}} {kinds:<{kinds_w}}"
         )
         if not skip_note:
             line += f" {note}"
@@ -209,7 +387,9 @@ __all__ = [
     "bytes_to_gib",
     "compare_outputs",
     "evaluate_output_equivalence",
+    "print_common_config",
     "print_memory_table",
     "print_runtime_table",
+    "summarize_config_display",
     "summarize_intra_diagnostics",
 ]

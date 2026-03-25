@@ -189,3 +189,17 @@ def test_bool_init_dtype_strict_behavior(op):
 
     with pytest.raises(TypeError):
         matmul_expect_k_hint_warning(op, up_bool.astype(DATA_DTYPE), pygrgl.TraversalDirection.UP, init=init_vec_bool)
+
+
+def test_matmul_requires_numpy_array_inputs(op):
+    rows = 2
+    x_up = np.ones((rows, op.num_samples), dtype=DATA_DTYPE)
+    miss_up = np.zeros((rows, op.num_mutations), dtype=DATA_DTYPE)
+    init_vec = np.ones((rows,), dtype=DATA_DTYPE)
+
+    with pytest.raises(TypeError, match="numpy.ndarray"):
+        op.matmul(x_up.tolist(), pygrgl.TraversalDirection.UP)
+    with pytest.raises(TypeError, match="numpy.ndarray"):
+        op.matmul(x_up, pygrgl.TraversalDirection.UP, miss=miss_up.tolist())
+    with pytest.raises(TypeError, match="numpy.ndarray"):
+        op.matmul(x_up, pygrgl.TraversalDirection.UP, init=init_vec.tolist())

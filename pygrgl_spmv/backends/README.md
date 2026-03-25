@@ -1,218 +1,135 @@
-# Backend Memory Model
+Parent docs: [Project README](../../README.md)
 
-This document describes how memory usage is tracked for all backends through
-`Backend.mem_usage` (`MemoryUsage` dataclass).
+# Backends
 
-## Shared Memory Tracking
-
-`mem_usage` has three parts:
-
-1. `host_static: StaticBytes`
-2. `device_static: StaticBytes`
-3. `calls: list[MemoryRecord]`
-
-Each runtime `MemoryRecord` now also carries retained residency buckets:
-
-- `static_ws`
-- `dynamic_ws`
-- `staging`
-
-### Static memory (`StaticBytes`) keys
-
-- `level_offsets`
-- `sample_perm`
-- `inv_sample_perm`
-- `coalescence_counts`
-- `xtx_init`
-- `blocks_up`
-- `blocks_down`
-- `selector_mut`
-- `selector_miss`
-- `workspace`
-
-For the GPU backends, `workspace` means setup-retained execution workspaces
-only. GPU XTX bias is no longer backend-owned static state, so `xtx_init`
-remains zero for GPU static accounting.
-
-### Runtime memory (`RuntimeBytes`) keys
-
-- `level_buffers`
-- `inputs`
-- `outputs`
-- `aux`
-
-GPU runtime accounting reports the active runtime footprint in `RuntimeBytes`.
-Retained workspace/staging bytes are reported separately through the residency
-buckets. `aux` includes retained inactive bytes that are not part of the
-current `level_buffers` / `inputs` / `outputs` slices.
-
-### Residency buckets
-
-- `static_ws`: setup-retained static workspaces
-- `dynamic_ws`: lazily created dynamic workspaces
-- `staging`: miss/output/init/XTX state
-
-For the GPU backends, the intended ownership split is:
-
-- workspaces hold execution state only
-- staging holds optional miss/output/init/XTX state
-
-### Actual vs Estimated static memory
-
-- actual static memory comes from `backend.setup()` accounting
-- estimated static memory comes from `backend.estimate_static_bytes()`
-- tests assert alignment between measured and estimated static fields
+This package contains the backend implementations used by `SpmvGRG`.
 
 ## Layout
 
-- `pygrgl_spmv/backends/base.py`: shared backend scaffolding, setup payloads, and validation
-- `pygrgl_spmv/backends/reference.py`: `ReferenceBackend` and `ReferencePlan`
-- `pygrgl_spmv/backends/mkl/`: MKL plan, backend, and FFI modules
-- `pygrgl_spmv/backends/cusparse/`: cuSPARSE plan, backend, and FFI modules
+- `base.py`: shared backend scaffolding, validation, and fail-fast memory-capture hooks
+- `reference.py`: reference CPU backend used for correctness and init-bias generation
+- `mkl/`: MKL backend
+- `triton/`: Triton backend
+- `cusparse/`: cuSPARSE backend
 
-## Plan-driven backends
+## Child docs
 
-Backends are constructed from explicit backend-specific plan-pair objects.
+- [MKL Backend](mkl/README.md)
+- [Triton Backend](triton/README.md)
+- [cuSPARSE Backend](cusparse/README.md)
 
-- `MklPlan` carries MKL-specific storage/runtime hints (`store`, `fmt`,
-  `n_threads`, `k_hint`)
-- `CusparsePlan` carries explicit cuSPARSE SpMM choices (`store`, `fmt`,
-  `opA`, `opB`, `orderB`, `orderC`, `algo`, `scratch`, and `k_hint`); the
-  current CUDA runtime version remains available as an environment-derived
-  property
-- each backend exposes a backend-specific `*PlanPair` type that validates
-  its `plan_up` / `plan_down` pair before backend construction
+## Shared backend concepts
 
-The plan object is the single source of truth for backend execution semantics.
-Runtime helper objects may still cache raw storage buffers or workspaces, but
-should not duplicate plan metadata such as algorithm, dense order, or transpose
-mode.
+Backends are constructed from explicit backend-specific plan pairs.
 
-Either side of a `*PlanPair` may be omitted: `plan_up=None` builds a DOWN-only
-backend and `plan_down=None` builds an UP-only backend.
+- MKL uses `MklPlanPair`
+- Triton uses `TritonPlanPair`
+- cuSPARSE uses `CusparsePlanPair`
 
-## Backend config instrumentation
+Either side of a plan pair may be omitted.
 
-All public backends accept a common backend-config flag:
+- `plan_up=None` builds a DOWN-only backend
+- `plan_down=None` builds an UP-only backend
 
-- `instrumentation=False` (default): keep the normal fast path
-- `instrumentation=True`: enable slower observability behavior
+`log_level` controls verbosity only.
 
-This flag is runtime/config state, not plan state. `log_level` only controls
-verbosity and must not change execution mode by itself.
+`instrumentation` enables slower observability behavior. Each backend decides how that affects execution, but the flag is runtime configuration, not plan state.
 
-## MKL backend details
+## Memory ledger
 
-- sparse blocks are MKL handle payloads backed by host sparse arrays
-- selector buffers are stored on host
-- `device_static` remains zero for MKL by design
-- common host arrays are included in measured and estimated static host usage
-- `n_threads` and `k_hint` are applied per direction; one side does not override
-  the other unless both traversals truly share the same handle and transpose
-  mode
+`SpmvGRG.memory` is the public memory-accounting surface.
 
-## Triton backend details
+The ledger stores:
 
-- sparse blocks are structure-only device CSR/CSC payloads
-- graph and dynamic workspaces are kept as separate concepts even though the
-  current kernels only support singleton-vector execution
-- public `k_hint` accepts only `none` or `1`
-- `instrumentation=True` ignores configured `k_hint` and uses the effective
-  `k_hint=none` path
-- optional miss/output/init/XTX buffers live in per-direction staging
-- `device_static.workspace` counts only retained graph workspaces
+- one retained snapshot captured after operator construction and refreshed only when retained state changes
+- one `last_call` snapshot overwritten on each successful `SpmvGRG.matmul()` call
 
-## cuSPARSE backend details
+Each snapshot stores flat allocations, not a prebuilt tree.
 
-- sparse blocks are device payloads with separate sparse descriptors for graph
-  and dynamic preprocess state
-- CSR/CSC/COO block values are binary ones; the backend uses one shared ones
-  source across all sparse blocks instead of one `data` allocation per block
-- when CUDA VMM is supported and one minimum-granularity VMM tile is smaller
-  than a materialized ones array, that shared ones source is virtually aliased
-  from one physical allocation tile using the CUDA Driver API
-- the VMM tile size, reservation alignment, and physical byte accounting all
-  use the allocation minimum granularity; the recommended granularity is logged
-  as a performance hint only
-- when VMM is unsupported, unavailable in the current context, or offers no
-  memory savings, the backend uses one shared materialized all-ones array
-- warnings are reserved for VMM query/build failures; normal materialized-path
-  selection is INFO-only
-- selector row/col index buffers are stored on device
-- `instrumentation=True` ignores configured `k_hint` and retains no static
-  workspace for that hint
-- setup-retained workspaces contain only the buffers needed for the minimal
-  node-output matvec for that execution path
-- optional miss/output/init/XTX buffers live in per-direction-per-`k` staging
-- runtime memory tracks dense level buffers, active staging buffers, eager
-  scratch/ext buffers, and retained inactive staging/dynamic state in `aux`
-- static block memory accounting reflects the physical shared ones allocation,
-  not the reserved virtual alias range
+Each backend exposes:
 
-### cuSPARSE package layout
+- one persistent retained-memory root stored on the backend instance
+- one lexical call-memory root that exists only while a capture scope is active
 
-- `pygrgl_spmv/backends/cusparse/backend.py`: `CusparseBackend`, sparse-block descriptors, selector routing, dense-view logic, workspace helpers, and execution
-- `pygrgl_spmv/backends/cusparse/plan.py`: `CusparsePlan` and its enums/parsers
-- `pygrgl_spmv/backends/cusparse/ffi.py`: ctypes bindings and CUDA/cuSPARSE constants
+Each allocation row records:
 
-### `CusparsePlan`
+- counted bytes
+  - logical payload bytes for ordinary `numpy`, `torch`, and `cupy` arrays
+  - physical reservation bytes only for explicit physical carriers such as `cuda_vmm`
+- storage carrier: `numpy`, `torch`, `cupy`, or `cuda_vmm`
+- one or more logical bindings
+  - owner: `caller`, `operator`, or `backend`
+  - retention: `call`, `persistent`, `captured`, `on_demand`, `staging`
+  - activity:
+    - `always`: retained and always live
+    - `yes`: live because the current call is using it
+    - `no`: retained but inactive for the current call
+  - optional direction / retained-slot `k`
+  - merged logical roles (`label`, `kind`)
 
-`CusparsePlan` is grounded on CUDA 12.9.0 SpMM semantics and exposes the
-current CUDA 12.x runtime version as an environment-derived property backed by
-`cupy.cuda.runtime.runtimeGetVersion()`.
+The ledger counts live data buffers visible to this library at the snapshot checkpoint.
 
-It exposes doc-driven properties such as:
+The ledger does not count:
 
-- `direction`
-- `supported`
-- `deterministic`
-- `need_buffer`
-- `need_preprocess`
-- `can_share_storage_with(...)`
+- Python object headers
+- opaque library metadata such as CUDA streams, CUDA events, cuSPARSE descriptors, or MKL internal handle overhead
+- allocator reserve, pool slack, or unrelated process RSS
 
-The executor now consumes `need_buffer` and `need_preprocess` directly, while
-still auditing `need_buffer` against the runtime `cusparseSpMM_bufferSize`
-result and warning when the plan expectation disagrees with the queried buffer
-size.
+## Derived tree
 
-The `scratch` field controls which destination levels use the multi-stream
-scratch scheduler. Accepted values are:
+Human-facing reports call `tree_rows(snapshot, ...)` to derive an additive tree from flat allocations.
 
-- `none`
-- `all`
-- a `|`-separated list of destination levels such as `0|2|3`
+The default grouping is:
 
-### Dense layout execution
+- space root: `cuda_live` or `cpu_live`
+- `call` vs `retained`
+- direction when present
+- retained `k=<value>` when present
 
-The cuSPARSE backend now treats the dense side of each direction plan
-(`order_b`, `order_c`, `op_b`) explicitly.
+When one retained physical allocation is bound to multiple observed directions or slot bindings in the same snapshot, the tree keeps that exact merged binding such as `up|down` or `k=1|2`.
 
-For one direction and one runtime `k`, each level owns a canonical dense state
-buffer stored in `order_c`. The backend then derives the source-side `matB`
-view in one of three ways:
+Leaf rows are named from merged logical labels.
+Leaf annotations summarize merged bindings. When a physical allocation has multiple bindings, owner/retention/activity are rendered as joined values.
 
-- direct alias: `order_b == order_c` and `op_b == N`
-- descriptor reinterpretation: `order_b != order_c` and `op_b == T`
-- one-per-level repack into a separate source buffer for all remaining cases
+## Table columns
 
-This keeps the wavefront level-oriented: if repacking is needed, it happens once
-per completed destination level, not once per block SpMM call.
+The benchmark memory table renders the derived tree with these columns:
 
-### Scratch scheduling and workspace lifecycle
+- `CaseDir`
+- `CaseK`
+- `Node`
+- `Parent`
+- `GiB`
+- `Space`
+- `Owner`
+- `Active`
+- `Retention`
+- `Kinds`
+- `Note`
 
-For scratch-enabled levels, cuSPARSE now mirrors Triton's helper-stream
-scheduler shape:
+## Fail-fast capture contract
 
-- each op for the destination level gets its own scratch buffer
-- helper streams launch `SpMM` into scratch buffers with `beta=0`
-- the destination level stream reduces scratch buffers back into the canonical
-  level buffer in a deterministic order
-- source repack/publication happens only after the reduction finishes
+`SpmvGRG.matmul()` opens a backend call-capture scope only after all input validation and internal conversions succeed.
 
-Workspace allocation follows the backend memory model:
+Every successful backend run method must publish exactly one `CallCapture` before return.
 
-- setup-retained workspaces are whichever hinted graph workspaces are actually
-  built in `setup()` for the effective mode
-- other dynamic workspaces are allocated lazily on first use
-- output staging, miss staging, init staging, and XTX bias live in staging
-- `device_static.workspace` counts only the setup-retained workspaces
+Direct backend API calls do not participate in memory capture unless a capture scope is already active.
+
+`SpmvGRG.matmul()` consumes that capture immediately after the backend call and raises if:
+
+- no capture was published
+- the nonce is stale
+- the published direction is wrong
+- the published runtime `k` is wrong
+
+Snapshot construction also raises if:
+
+- a producer memory root is missing
+- a field in a walked memory dataclass is unclassified
+- an ignored field hides a supported allocation carrier
+- the same physical allocation is seen with conflicting physical facts
+
+`BackendBase` also enforces two lifetime rules:
+
+- backend call memory exists only inside an active capture scope and is dropped structurally when that scope exits
+- generic setup payload kept on `BackendBase` after `setup()` must be explicitly classified as `retained`, `borrowed`, or `dropped`
