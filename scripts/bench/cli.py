@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from pygrgl_spmv.grg.compile import VALID_INTRA_BLOCK_ORDERINGS, VALID_ORDERINGS
 from scripts.bench.configs import PlanPairSpec, parse_plan_pair_literal
 
 DTYPE = np.float64
@@ -33,6 +34,8 @@ LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
 class CommonBenchArgs:
     grg: str
     ks: list[int]
+    orderings: list[str]
+    intra_block_orderings: list[str]
     plan_pair_specs: list[PlanPairSpec]
     options: list[str]
     n_trials: int
@@ -54,6 +57,18 @@ def add_common_bench_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="32",
         help="Comma-separated runtime-k values (input rows); e.g. 1,4,16",
+    )
+    parser.add_argument(
+        "--orderings",
+        type=str,
+        default="height",
+        help="Comma-separated compile orderings; e.g. height,depth",
+    )
+    parser.add_argument(
+        "--intra-block-orderings",
+        type=str,
+        default="rcm_mincol",
+        help="Comma-separated intra-block orderings; e.g. rcm_mincol,none",
     )
     parser.add_argument("--trials", type=int, default=10, help="Number of timed trials")
     parser.add_argument("--warmup", type=int, default=3, help="Number of warmup runs")
@@ -115,6 +130,20 @@ def parse_csv_ints(raw: str, field_name: str) -> list[int]:
     return values
 
 
+def parse_csv_choices(raw: str, field_name: str, allowed: set[str] | frozenset[str]) -> list[str]:
+    values: list[str] = []
+    for token in raw.split(","):
+        tok = token.strip().lower()
+        if not tok:
+            continue
+        if tok not in allowed:
+            raise ValueError(f"{field_name} contains invalid value {token!r}; expected one of {sorted(allowed)}")
+        values.append(tok)
+    if not values:
+        raise ValueError(f"{field_name} must contain at least one value")
+    return values
+
+
 def parse_dtype(raw: str) -> np.dtype:
     token = str(raw).strip().lower()
     if token == "float32":
@@ -155,6 +184,12 @@ def parse_matmul_options(raw: str) -> list[str]:
 
 def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
     ks = parse_csv_ints(args.ks, "--ks")
+    orderings = parse_csv_choices(args.orderings, "--orderings", VALID_ORDERINGS)
+    intra_block_orderings = parse_csv_choices(
+        args.intra_block_orderings,
+        "--intra-block-orderings",
+        VALID_INTRA_BLOCK_ORDERINGS,
+    )
     plan_pair_specs = list(args.plan_up_down or [])
     if not plan_pair_specs:
         raise ValueError("--plan-up-down must be provided at least once")
@@ -165,6 +200,8 @@ def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
     return CommonBenchArgs(
         grg=str(args.grg),
         ks=ks,
+        orderings=orderings,
+        intra_block_orderings=intra_block_orderings,
         plan_pair_specs=plan_pair_specs,
         options=options,
         n_trials=int(args.trials),
@@ -209,6 +246,7 @@ __all__ = [
     "add_common_bench_args",
     "configure_logging",
     "parse_common_bench_args",
+    "parse_csv_choices",
     "parse_csv_ints",
     "parse_dtype",
     "parse_index_dtype",

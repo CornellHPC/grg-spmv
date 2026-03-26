@@ -13,7 +13,12 @@ import scipy.sparse as sp
 from pygrgl_spmv.backends import BackendBase, ReferenceBackend, ReferencePlanPair
 from pygrgl_spmv.backends.types import Direction, InitMode, parse_direction
 from pygrgl_spmv.grg.artifact import artifact_path_for_grg, load_grg_spmv, save_grg_spmv
-from pygrgl_spmv.grg.compile import CompiledOperatorState, compile_grg
+from pygrgl_spmv.grg.compile import (
+    CompiledOperatorState,
+    VALID_INTRA_BLOCK_ORDERINGS,
+    VALID_ORDERINGS,
+    compile_grg,
+)
 from pygrgl_spmv.memory import (
     MemoryLedger,
     alloc_field,
@@ -24,8 +29,7 @@ from pygrgl_spmv.memory import (
 @dataclass
 class OperatorRetainedMem:
     level_offsets: np.ndarray = alloc_field(label="level_offsets", kind="mapping", owner="operator", retention="persistent", activity="always")
-    sample_perm: np.ndarray = alloc_field(label="sample_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
-    inv_sample_perm: np.ndarray = alloc_field(label="inv_sample_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
+    sample_rows: np.ndarray = alloc_field(label="sample_rows", kind="mapping", owner="operator", retention="persistent", activity="always")
     node_perm: np.ndarray = alloc_field(label="node_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
     inv_node_perm: np.ndarray = alloc_field(label="inv_node_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
     sample_to_individual: np.ndarray = alloc_field(label="sample_to_individual", kind="mapping", owner="operator", retention="persistent", activity="always")
@@ -80,9 +84,14 @@ class SpmvGRG:
         dtype,
         index_dtype,
         artifact_dir: str | Path = "pygrgl_spmv_artifacts",
+        *,
+        ordering: str = "height",
+        intra_block_ordering: str = "rcm_mincol",
     ):
         self._dtype = np.dtype(dtype)
         self._index_dtype = np.dtype(index_dtype)
+        self._requested_ordering = self._parse_ordering(ordering)
+        self._requested_intra_block_ordering = self._parse_intra_block_ordering(intra_block_ordering)
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         self._logger.setLevel(logging.WARNING)
         if not isinstance(backend, BackendBase):
@@ -93,7 +102,12 @@ class SpmvGRG:
         self._artifact_path: Path
         if source_path.suffix == ".grg":
             artifact_root = Path(artifact_dir).expanduser()
-            self._artifact_path = artifact_path_for_grg(source_path, artifact_root)
+            self._artifact_path = artifact_path_for_grg(
+                source_path,
+                artifact_root,
+                ordering=self._requested_ordering,
+                intra_block_ordering=self._requested_intra_block_ordering,
+            )
             self._artifact_path.parent.mkdir(parents=True, exist_ok=True)
             self._compiled = self._load_or_build_from_grg(source_path=source_path, artifact_path=self._artifact_path)
         elif source_path.suffix == ".grg_spmv":
@@ -127,7 +141,13 @@ class SpmvGRG:
 
     def _build_and_save_artifact(self, *, source_path: Path, artifact_path: Path) -> CompiledOperatorState:
         grg = pygrgl.load_immutable_grg(str(source_path), load_up_edges=True)
-        compiled = compile_grg(grg, dtype=self._dtype, index_dtype=self._index_dtype)
+        compiled = compile_grg(
+            grg,
+            dtype=self._dtype,
+            index_dtype=self._index_dtype,
+            ordering=self._requested_ordering,
+            intra_block_ordering=self._requested_intra_block_ordering,
+        )
         self._build_init_biases(compiled)
         save_grg_spmv(compiled, artifact_path)
         return compiled
@@ -160,8 +180,7 @@ class SpmvGRG:
     def _build_retained_mem(self) -> OperatorRetainedMem:
         return OperatorRetainedMem(
             level_offsets=self._compiled.level_offsets,
-            sample_perm=self._compiled.sample_perm,
-            inv_sample_perm=self._compiled.inv_sample_perm,
+            sample_rows=self._compiled.sample_rows,
             node_perm=self._compiled.node_perm,
             inv_node_perm=self._compiled.inv_node_perm,
             sample_to_individual=self._compiled.sample_to_individual,
@@ -247,12 +266,16 @@ class SpmvGRG:
         return self._compiled.level_offsets
 
     @property
-    def sample_perm(self):
-        return self._compiled.sample_perm
+    def sample_rows(self):
+        return self._compiled.sample_rows
 
     @property
-    def inv_sample_perm(self):
-        return self._compiled.inv_sample_perm
+    def ordering(self):
+        return self._compiled.ordering
+
+    @property
+    def intra_block_ordering(self):
+        return self._compiled.intra_block_ordering
 
     @property
     def node_perm(self):
@@ -318,6 +341,21 @@ class SpmvGRG:
                     f"Unknown direction: {direction!r}. Expected 'up', 'down', "
                     "pygrgl.TraversalDirection.UP, or pygrgl.TraversalDirection.DOWN"
                 )
+
+    def _parse_ordering(self, ordering: str) -> str:
+        token = str(ordering).strip().lower()
+        if token not in VALID_ORDERINGS:
+            raise ValueError(f"Unknown ordering {ordering!r}; expected one of {sorted(VALID_ORDERINGS)}")
+        return token
+
+    def _parse_intra_block_ordering(self, intra_block_ordering: str) -> str:
+        token = str(intra_block_ordering).strip().lower()
+        if token not in VALID_INTRA_BLOCK_ORDERINGS:
+            raise ValueError(
+                "Unknown intra_block_ordering "
+                f"{intra_block_ordering!r}; expected one of {sorted(VALID_INTRA_BLOCK_ORDERINGS)}"
+            )
+        return token
 
     def _parse_init(self, init: str | np.ndarray | None, rows: int, input_dtype: np.dtype) -> tuple[InitMode, np.ndarray | None]:
         if init is None:

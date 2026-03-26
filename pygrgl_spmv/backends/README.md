@@ -75,6 +75,12 @@ The ledger does not count:
 - opaque library metadata such as CUDA streams, CUDA events, cuSPARSE descriptors, or MKL internal handle overhead
 - allocator reserve, pool slack, or unrelated process RSS
 
+Operator/backend compile-state mappings should stay literal:
+
+- `node_perm` / `inv_node_perm` describe full node relabeling
+- `sample_rows` describes where original sample ids live inside compiled node order
+- there is no separate sample-permutation compatibility layer
+
 ## Derived tree
 
 Human-facing reports call `tree_rows(snapshot, ...)` to derive an additive tree from flat allocations.

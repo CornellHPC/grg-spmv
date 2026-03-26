@@ -21,6 +21,7 @@ This package contains `SpmvGRG`, artifact I/O, and the GRG-to-operator compile p
 For `.grg` input:
 
 - derive an artifact path under `artifact_dir`
+- include `ordering` and `intra_block_ordering` in the artifact filename
 - load the artifact if it exists and is valid
 - otherwise load the GRG, compile it, build init biases, save the artifact, and continue from the compiled state
 
@@ -33,7 +34,7 @@ For `.grg_spmv` input:
 Artifact path derivation is implemented in [artifact.py](artifact.py).
 
 - default artifact root is `./pygrgl_spmv_artifacts`
-- derived paths encode the full source GRG path
+- derived paths encode the full source GRG path plus the compile layout
 - artifacts are stored as standalone `.grg_spmv` files
 
 The artifact stores:
@@ -49,9 +50,10 @@ Compilation is implemented in [compile.py](compile.py).
 
 `compile_grg(...)`:
 
-- extracts down edges and node heights from the input GRG
-- builds height order and level offsets
-- computes per-level permutations
+- extracts down edges from the input GRG
+- computes DAG depth and height explicitly
+- builds either height order or depth-derived reverse-topological order
+- computes within-level permutations (`rcm_mincol` or `none`)
 - builds level-block CSR matrices
 - builds mutation and missingness selectors
 - loads mutation tables and optional coalescence counts
@@ -63,6 +65,7 @@ The result is a `CompiledOperatorState`.
 `CompiledOperatorState` holds:
 
 - level structure and permutations
+- `sample_rows`, the only sample-node mapping used at runtime
 - selector matrices
 - mutation metadata tables
 - optional coalescence counts

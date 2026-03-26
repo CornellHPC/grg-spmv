@@ -152,8 +152,7 @@ class MklBackend(BackendBase):
         "_sel_mut": "dropped",
         "_sel_miss": "dropped",
         "_level_offsets": "borrowed",
-        "_sample_perm": "borrowed",
-        "_inv_sample_perm": "borrowed",
+        "_sample_rows": "borrowed",
         "_coalescence_counts": "borrowed",
         "_xtx_host": "retained",
     }
@@ -533,7 +532,7 @@ class MklBackend(BackendBase):
         self._apply_init_inplace(node_values, mode, init_payload)
 
         if spec.direction == Direction.UP:
-            np.add(node_values[: self._num_samples], x[self._sample_perm], out=node_values[: self._num_samples])
+            node_values[self._sample_rows] += x
         else:
             self._selector_backward_add(x, "mut", node_values)
             if miss_arr is not None:
@@ -595,7 +594,7 @@ class MklBackend(BackendBase):
                 )
             return out_mut, out_miss
 
-        out = node_values[self._inv_sample_perm]
+        out = node_values[self._sample_rows]
 
         if track_wave and level_ms is not None:
             self._log_wavefront_levels(spec.direction, level_ms)

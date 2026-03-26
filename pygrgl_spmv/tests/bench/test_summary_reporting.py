@@ -107,6 +107,8 @@ def test_format_dry_run_line_includes_dtype_and_index_dtype():
         BenchConfig(
             label="x",
             backend_name="mkl",
+            ordering="height",
+            intra_block_ordering="rcm_mincol",
             plan_up_text=str(MklPlan.from_dict({"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1})),
             plan_down_text=None,
             instrumentation=False,
@@ -126,6 +128,8 @@ def test_summarize_config_display_single_config_moves_everything_to_common():
         BenchConfig(
             label="cfg-a",
             backend_name="cusparse",
+            ordering="height",
+            intra_block_ordering="rcm_mincol",
             plan_up_text="[k_hint=2,store=T,fmt=CSC,opA=T]",
             plan_down_text="[k_hint=2,store=T,fmt=CSC,opA=N]",
             instrumentation=False,
@@ -145,6 +149,8 @@ def test_summarize_config_display_shows_only_differences():
         BenchConfig(
             label="cfg-a",
             backend_name="cusparse",
+            ordering="height",
+            intra_block_ordering="rcm_mincol",
             plan_up_text="[k_hint=2,store=T,fmt=CSC,opA=T,algo=CSR_ALG1]",
             plan_down_text="[k_hint=2,store=T,fmt=CSC,opA=N,algo=CSR_ALG1]",
             instrumentation=False,
@@ -153,6 +159,8 @@ def test_summarize_config_display_shows_only_differences():
         BenchConfig(
             label="cfg-b",
             backend_name="cusparse",
+            ordering="height",
+            intra_block_ordering="none",
             plan_up_text="[k_hint=2,store=T,fmt=CSC,opA=N,algo=CSR_ALG1]",
             plan_down_text="[k_hint=2,store=T,fmt=CSC,opA=N,algo=CSR_ALG2]",
             instrumentation=False,
@@ -161,11 +169,12 @@ def test_summarize_config_display_shows_only_differences():
     ]
     common_lines, display_by_label = summarize_config_display(configs)
     assert "backend=cusparse" in common_lines
+    assert "ordering=height" in common_lines
     assert "instrumentation=off" in common_lines
     assert "up[k_hint=2,store=T,fmt=CSC,algo=CSR_ALG1]" in common_lines
     assert "down[k_hint=2,store=T,fmt=CSC,opA=N]" in common_lines
-    assert display_by_label["cfg-a"] == "up[opA=T] down[algo=CSR_ALG1]"
-    assert display_by_label["cfg-b"] == "up[opA=N] down[algo=CSR_ALG2]"
+    assert display_by_label["cfg-a"] == "intra_block_ordering=rcm_mincol up[opA=T] down[algo=CSR_ALG1]"
+    assert display_by_label["cfg-b"] == "intra_block_ordering=none up[opA=N] down[algo=CSR_ALG2]"
 
 
 def test_summarize_config_display_falls_back_to_labels_when_reduced_text_collides():
@@ -173,6 +182,8 @@ def test_summarize_config_display_falls_back_to_labels_when_reduced_text_collide
         BenchConfig(
             label="baseline",
             backend_name="cusparse",
+            ordering="height",
+            intra_block_ordering="rcm_mincol",
             plan_up_text="[k_hint=2,store=T,fmt=CSC,opA=T]",
             plan_down_text="[k_hint=2,store=T,fmt=CSC,opA=N]",
             instrumentation=False,
@@ -181,6 +192,8 @@ def test_summarize_config_display_falls_back_to_labels_when_reduced_text_collide
         BenchConfig(
             label="candidate",
             backend_name="cusparse",
+            ordering="depth",
+            intra_block_ordering="none",
             plan_up_text="[k_hint=2,store=T,fmt=CSC,opA=T]",
             plan_down_text="[k_hint=2,store=T,fmt=CSC,opA=N]",
             instrumentation=False,
@@ -189,8 +202,8 @@ def test_summarize_config_display_falls_back_to_labels_when_reduced_text_collide
     ]
     common_lines, display_by_label = summarize_config_display(configs)
     assert "backend=cusparse" in common_lines
-    assert display_by_label["baseline"] == "baseline"
-    assert display_by_label["candidate"] == "candidate"
+    assert display_by_label["baseline"] == "ordering=height intra_block_ordering=rcm_mincol"
+    assert display_by_label["candidate"] == "ordering=depth intra_block_ordering=none"
 
 
 def test_summarize_config_display_rejects_duplicate_labels():
@@ -198,6 +211,8 @@ def test_summarize_config_display_rejects_duplicate_labels():
         BenchConfig(
             label="dup",
             backend_name="cusparse",
+            ordering="height",
+            intra_block_ordering="rcm_mincol",
             plan_up_text="[k_hint=2,store=T,fmt=CSC,opA=T]",
             plan_down_text=None,
             instrumentation=False,
@@ -206,6 +221,8 @@ def test_summarize_config_display_rejects_duplicate_labels():
         BenchConfig(
             label="dup",
             backend_name="mkl",
+            ordering="height",
+            intra_block_ordering="rcm_mincol",
             plan_up_text="[k_hint=none,store=N,fmt=CSR,n_threads=1]",
             plan_down_text=None,
             instrumentation=False,
@@ -731,6 +748,8 @@ def test_runtime_table_uses_compact_config_display_and_common_banner(capsys):
         BenchConfig(
             label="cfg-a",
             backend_name="mkl",
+            ordering="height",
+            intra_block_ordering="rcm_mincol",
             plan_up_text="[k_hint=none,store=N,fmt=CSR,n_threads=1]",
             plan_down_text=None,
             instrumentation=False,

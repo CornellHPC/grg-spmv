@@ -28,7 +28,13 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(f"Argument error: {exc}") from exc
 
-    configs = expand_triton_configs(common.plan_pair_specs, common.log_level, common.instrumentation)
+    configs = expand_triton_configs(
+        common.plan_pair_specs,
+        common.orderings,
+        common.intra_block_orderings,
+        common.log_level,
+        common.instrumentation,
+    )
     if common.dry_run:
         for entry in configs:
             print(

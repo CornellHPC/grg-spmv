@@ -117,7 +117,7 @@ Retained device leaves include:
 - sparse block index payload
 - shared values
 - selector payload
-- sample-routing arrays
+- per-level sample-id and local-row arrays
 - captured workspaces
 - on-demand workspaces
 - staging buffers

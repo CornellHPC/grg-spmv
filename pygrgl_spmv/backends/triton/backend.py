@@ -163,11 +163,8 @@ class TritonCall:
 
 @dataclass
 class TritonRetained:
-    sample_perm_gpu: torch.Tensor | None = alloc_field(
-        label="sample_perm_gpu", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
-    )
-    inv_sample_perm_gpu: torch.Tensor | None = alloc_field(
-        label="inv_sample_perm_gpu", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
+    sample_rows_gpu: torch.Tensor | None = alloc_field(
+        label="sample_rows_gpu", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
     )
     sel_mut_rows_gpu: torch.Tensor | None = alloc_field(
         label="selector_mut", kind="selector", owner="backend", retention="persistent", activity="always", default=None
@@ -200,8 +197,7 @@ class TritonBackend(BackendBase):
         "_sel_mut": "dropped",
         "_sel_miss": "dropped",
         "_level_offsets": "borrowed",
-        "_sample_perm": "borrowed",
-        "_inv_sample_perm": "borrowed",
+        "_sample_rows": "borrowed",
         "_coalescence_counts": "borrowed",
         "_xtx_host": "dropped",
     }
@@ -237,8 +233,7 @@ class TritonBackend(BackendBase):
         self._blocks_down: list[list[_TritonBlock | None]] = []
         self._ops_up: list[list[_TritonOp]] = []
         self._ops_down: list[list[_TritonOp]] = []
-        self._sample_perm_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
-        self._inv_sample_perm_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
+        self._sample_rows_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
         self._sel_mut_rows_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
         self._sel_mut_cols_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
         self._sel_miss_rows_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
@@ -254,8 +249,7 @@ class TritonBackend(BackendBase):
         self._nvtx = make_torch_tracer("grg.triton", torch) if self._instrumentation else None
         self._install_memory(
             retained=TritonRetained(
-                sample_perm_gpu=None,
-                inv_sample_perm_gpu=None,
+                sample_rows_gpu=None,
                 sel_mut_rows_gpu=None,
                 sel_mut_cols_gpu=None,
                 sel_miss_rows_gpu=None,
@@ -325,8 +319,7 @@ class TritonBackend(BackendBase):
 
     def _sync_retained_root(self) -> None:
         retained = self._retained_mem
-        retained.sample_perm_gpu = self._sample_perm_gpu
-        retained.inv_sample_perm_gpu = self._inv_sample_perm_gpu
+        retained.sample_rows_gpu = self._sample_rows_gpu
         retained.sel_mut_rows_gpu = self._sel_mut_rows_gpu
         retained.sel_mut_cols_gpu = self._sel_mut_cols_gpu
         retained.sel_miss_rows_gpu = self._sel_miss_rows_gpu
@@ -625,7 +618,7 @@ class TritonBackend(BackendBase):
                     raise ValueError(f"Unknown init mode: {init_mode!r}")
 
             if ws.direction == Direction.UP:
-                ws.node_state[: self._num_samples].add_(ws.input_primary.index_select(0, self._sample_perm_gpu))
+                ws.node_state.index_add_(0, self._sample_rows_gpu, ws.input_primary)
             else:
                 if self._sel_mut_rows_gpu.numel() > 0:
                     ws.node_state.index_add_(
@@ -901,7 +894,7 @@ class TritonBackend(BackendBase):
             else:
                 if staging.output_main is None:
                     staging.output_main = self._ensure_staging_tensor(staging, "output_main", (self._num_samples,))
-                staging.output_main.copy_(ws.node_state.index_select(0, self._inv_sample_perm_gpu))
+                staging.output_main.copy_(ws.node_state.index_select(0, self._sample_rows_gpu))
 
     def _tune_once(self, direction: Direction, ws: _DirectionWorkspace, config: CsrKernelConfig | CscKernelConfig) -> None:
         self._prepare_workspace_state(ws, _DirectionStaging(), init_mode=InitMode.NONE, has_miss_input=False)
@@ -1059,8 +1052,7 @@ class TritonBackend(BackendBase):
             self._ops_down = self._build_direction_ops(Direction.DOWN)
             self._scratch_plan_down = self._build_scratch_level_plans(Direction.DOWN)
 
-        self._sample_perm_gpu = torch.from_numpy(np.asarray(self._sample_perm, dtype=np.int64)).to(device=self._device)
-        self._inv_sample_perm_gpu = torch.from_numpy(np.asarray(self._inv_sample_perm, dtype=np.int64)).to(device=self._device)
+        self._sample_rows_gpu = torch.from_numpy(np.asarray(self._sample_rows, dtype=np.int64)).to(device=self._device)
         mut_rows, mut_cols = _selector_index_arrays(self._sel_mut)
         miss_rows, miss_cols = _selector_index_arrays(self._sel_miss)
         self._sel_mut_rows_gpu = torch.from_numpy(mut_rows).to(device=self._device)

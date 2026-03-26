@@ -257,6 +257,62 @@ def test_artifact_path_uses_grg_spmv_suffix(primary_grg_path, tmp_path):
 
 @pytest.mark.mkl
 @MKL_ONLY
+def test_artifact_path_separates_compile_layout_variants(primary_grg_path, tmp_path):
+    dst = tmp_path / "artifact-layout.grg"
+    shutil.copy2(primary_grg_path, dst)
+    artifact_dir = tmp_path / "artifact-root"
+    op_height = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=artifact_dir,
+        ordering="height",
+        intra_block_ordering="rcm_mincol",
+    )
+    op_depth = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=artifact_dir,
+        ordering="depth",
+        intra_block_ordering="none",
+    )
+    assert op_height.artifact_path != op_depth.artifact_path
+    assert ".order-height.intra-rcm_mincol.grg_spmv" in op_height.artifact_path.name
+    assert ".order-depth.intra-none.grg_spmv" in op_depth.artifact_path.name
+
+
+@pytest.mark.mkl
+@MKL_ONLY
+def test_direct_artifact_load_preserves_compile_layout_metadata(primary_grg_path, tmp_path):
+    dst = tmp_path / "artifact-metadata.grg"
+    shutil.copy2(primary_grg_path, dst)
+    artifact_dir = tmp_path / "artifact-root"
+    first = SpmvGRG(
+        dst,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=artifact_dir,
+        ordering="depth",
+        intra_block_ordering="none",
+    )
+    second = SpmvGRG(
+        first.artifact_path,
+        make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=artifact_dir,
+    )
+    assert second.ordering == "depth"
+    assert second.intra_block_ordering == "none"
+    np.testing.assert_array_equal(second.sample_rows, first.sample_rows)
+
+
+@pytest.mark.mkl
+@MKL_ONLY
 def test_direct_artifact_load_skips_grg_loader(primary_grg_path, tmp_path, monkeypatch):
     dst = tmp_path / "direct-artifact.grg"
     shutil.copy2(primary_grg_path, dst)

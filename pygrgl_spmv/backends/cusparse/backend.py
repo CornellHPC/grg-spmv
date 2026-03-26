@@ -14,7 +14,7 @@ objects:
 - ``_CuBlock`` owns one physical sparse block plus the cuSPARSE descriptors
   that alias its immutable payload.
 - ``_CuOp`` is one logical wavefront contribution.
-- ``_SelectorLevels`` and ``_SampleRouting`` hold the only two scatter/gather
+- ``_SelectorLevels`` and ``_SampleLevels`` hold the only two scatter/gather
   schemes needed at the GRG boundary.
 - ``_DirectionWorkspace`` is the reusable device-state cache for one direction
   and one runtime ``k``.
@@ -348,43 +348,35 @@ class _SelectorLevels:
 
 
 @dataclass
-class _SampleRouting:
-    """Forward sample scatter and backward sample gather split by level."""
+class _SampleLevels:
+    """Sample ids and local row ids split by compiled level."""
 
-    fwd_ns: list[int]
-    fwd_src: list[CupyArray | None]
-    bwd_dst: list[CupyArray]
-    bwd_src: list[CupyArray]
+    sample_ids_by_level: list[CupyArray]
+    row_ids_by_level: list[CupyArray]
 
     @classmethod
-    def from_permutations(
+    def from_sample_rows(
         cls,
         *,
         cp: Any,
-        sample_perm: np.ndarray,
-        inv_sample_perm: np.ndarray,
+        sample_rows: np.ndarray,
         level_offsets: np.ndarray,
         H: int,
-        n: int,
-    ) -> _SampleRouting:
-        fwd_ns: list[int] = []
-        fwd_src: list[CupyArray | None] = []
-        bwd_dst: list[CupyArray] = []
-        bwd_src: list[CupyArray] = []
+    ) -> _SampleLevels:
+        sample_rows_arr = np.asarray(sample_rows, dtype=np.int64)
+        sample_ids_by_level: list[CupyArray] = []
+        row_ids_by_level: list[CupyArray] = []
 
         for h in range(H):
             lo = int(level_offsets[h])
             hi = int(level_offsets[h + 1])
+            mask = (sample_rows_arr >= lo) & (sample_rows_arr < hi)
+            sample_ids = np.flatnonzero(mask).astype(np.int32, copy=False)
+            row_ids = (sample_rows_arr[sample_ids] - lo).astype(np.int32, copy=False)
+            sample_ids_by_level.append(cp.asarray(sample_ids))
+            row_ids_by_level.append(cp.asarray(row_ids))
 
-            ns = max(0, min(hi, n) - lo)
-            fwd_ns.append(int(ns))
-            fwd_src.append(cp.asarray(sample_perm[lo : lo + ns], dtype=np.int32) if ns > 0 else None)
-
-            mask = (inv_sample_perm >= lo) & (inv_sample_perm < hi)
-            bwd_dst.append(cp.asarray(np.where(mask)[0], dtype=np.int32))
-            bwd_src.append(cp.asarray(inv_sample_perm[mask] - lo, dtype=np.int32))
-
-        return cls(fwd_ns=fwd_ns, fwd_src=fwd_src, bwd_dst=bwd_dst, bwd_src=bwd_src)
+        return cls(sample_ids_by_level=sample_ids_by_level, row_ids_by_level=row_ids_by_level)
 
     def scatter(
         self,
@@ -395,13 +387,10 @@ class _SampleRouting:
         level_buffers: list[CupyArray],
     ) -> None:
         with stream:
-            for h, ns in enumerate(self.fwd_ns):
-                if ns <= 0:
+            for h, sample_ids in enumerate(self.sample_ids_by_level):
+                if sample_ids.size == 0:
                     continue
-                src = self.fwd_src[h]
-                if src is None:
-                    continue
-                cp.take(x_gpu, src, axis=0, out=level_buffers[h][:ns])
+                level_buffers[h][self.row_ids_by_level[h]] = x_gpu[sample_ids]
 
     def gather(
         self,
@@ -409,19 +398,14 @@ class _SampleRouting:
         cp: Any,
         stream: Any,
         level_buffers: list[CupyArray],
-        sample_gather_tmp: list[CupyArray | None],
         out_gpu: CupyArray,
     ) -> None:
         with stream:
             out_gpu.fill(0)
-            for h, dst in enumerate(self.bwd_dst):
-                if dst.size == 0:
+            for h, sample_ids in enumerate(self.sample_ids_by_level):
+                if sample_ids.size == 0:
                     continue
-                temp = sample_gather_tmp[h]
-                if temp is None:
-                    continue
-                cp.take(level_buffers[h], self.bwd_src[h], axis=0, out=temp)
-                out_gpu[dst] = temp
+                out_gpu[sample_ids] = level_buffers[h][self.row_ids_by_level[h]]
 
 
 @dataclass
@@ -482,7 +466,6 @@ class _DirectionStaging:
     input_miss: CupyArray | None = alloc_field(label="input_miss", kind="input", default=None)
     output_main: CupyArray | None = alloc_field(label="output_main", kind="output", default=None)
     output_miss: CupyArray | None = alloc_field(label="output_miss", kind="output", default=None)
-    sample_gather_tmp: list[CupyArray | None] | None = alloc_field(label="sample_gather_tmp", kind="temporary", default=None)
     init_vector: CupyArray | None = alloc_field(label="init_vector", kind="init", default=None)
     init_matrix: CupyArray | None = alloc_field(label="init_matrix", kind="init", default=None)
     xtx_bias: CupyArray | None = alloc_field(label="xtx_bias", kind="init", default=None)
@@ -533,14 +516,11 @@ class CusparseRetained:
     miss_selector_cols: list[CupyArray] | None = alloc_field(
         label="selector_miss", kind="selector", owner="backend", retention="persistent", activity="always", default=None
     )
-    sample_routing_fwd_src: list[CupyArray | None] | None = alloc_field(
-        label="sample_routing_fwd", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
+    sample_level_ids: list[CupyArray] | None = alloc_field(
+        label="sample_level_ids", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
     )
-    sample_routing_bwd_dst: list[CupyArray] | None = alloc_field(
-        label="sample_routing_bwd_dst", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
-    )
-    sample_routing_bwd_src: list[CupyArray] | None = alloc_field(
-        label="sample_routing_bwd_src", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
+    sample_level_rows: list[CupyArray] | None = alloc_field(
+        label="sample_level_rows", kind="mapping", owner="backend", retention="persistent", activity="always", default=None
     )
     workspaces: _WorkspaceCache = child_field(owner="backend", default_factory=_WorkspaceCache)
     staging_up_by_k: dict[int, _DirectionStaging] = child_field(
@@ -672,8 +652,7 @@ class CusparseBackend(BackendBase):
         "_sel_mut": "dropped",
         "_sel_miss": "dropped",
         "_level_offsets": "borrowed",
-        "_sample_perm": "borrowed",
-        "_inv_sample_perm": "borrowed",
+        "_sample_rows": "borrowed",
         "_coalescence_counts": "borrowed",
         "_xtx_host": "dropped",
     }
@@ -734,7 +713,7 @@ class CusparseBackend(BackendBase):
 
         self._mut_selector: _SelectorLevels | None = None
         self._miss_selector: _SelectorLevels | None = None
-        self._sample_routing: _SampleRouting | None = None
+        self._sample_levels: _SampleLevels | None = None
         self._static_workspace_slots: set[str] = set()
         self._workspaces = _WorkspaceCache()
         self._staging_up_by_k: dict[int, _DirectionStaging] = {}
@@ -753,9 +732,8 @@ class CusparseBackend(BackendBase):
                 mut_selector_cols=None,
                 miss_selector_rows=None,
                 miss_selector_cols=None,
-                sample_routing_fwd_src=None,
-                sample_routing_bwd_dst=None,
-                sample_routing_bwd_src=None,
+                sample_level_ids=None,
+                sample_level_rows=None,
                 workspaces=self._workspaces,
                 staging_up_by_k=self._staging_up_by_k,
                 staging_down_by_k=self._staging_down_by_k,
@@ -827,9 +805,8 @@ class CusparseBackend(BackendBase):
         retained.mut_selector_cols = None if self._mut_selector is None else self._mut_selector.cols_by_level
         retained.miss_selector_rows = None if self._miss_selector is None else self._miss_selector.rows_by_level
         retained.miss_selector_cols = None if self._miss_selector is None else self._miss_selector.cols_by_level
-        retained.sample_routing_fwd_src = None if self._sample_routing is None else self._sample_routing.fwd_src
-        retained.sample_routing_bwd_dst = None if self._sample_routing is None else self._sample_routing.bwd_dst
-        retained.sample_routing_bwd_src = None if self._sample_routing is None else self._sample_routing.bwd_src
+        retained.sample_level_ids = None if self._sample_levels is None else self._sample_levels.sample_ids_by_level
+        retained.sample_level_rows = None if self._sample_levels is None else self._sample_levels.row_ids_by_level
         retained.workspaces = self._workspaces
         retained.staging_up_by_k = self._staging_up_by_k
         retained.staging_down_by_k = self._staging_down_by_k
@@ -1066,13 +1043,11 @@ class CusparseBackend(BackendBase):
             level_offsets=self._level_offsets,
             H=self._H,
         )
-        self._sample_routing = _SampleRouting.from_permutations(
+        self._sample_levels = _SampleLevels.from_sample_rows(
             cp=self._cp,
-            sample_perm=self._sample_perm,
-            inv_sample_perm=self._inv_sample_perm,
+            sample_rows=self._sample_rows,
             level_offsets=self._level_offsets,
             H=self._H,
-            n=self._num_samples,
         )
         self._level_streams = [self._cp.cuda.Stream(non_blocking=True) for _ in range(self._H)]
         self._scratch_streams_up_by_level = (
@@ -1377,10 +1352,7 @@ class CusparseBackend(BackendBase):
         mapping = self._staging_up_by_k if direction == Direction.UP else self._staging_down_by_k
         staging = mapping.get(int(k))
         if staging is None:
-            staging = _DirectionStaging(
-                k=int(k),
-                sample_gather_tmp=[None for _ in range(self._H)] if direction == Direction.DOWN else None,
-            )
+            staging = _DirectionStaging(k=int(k))
             mapping[int(k)] = staging
             self._sync_retained_root()
             self._bump_retained_epoch()
@@ -1401,25 +1373,14 @@ class CusparseBackend(BackendBase):
             self._bump_retained_epoch()
         return value
 
-    def _ensure_sample_gather_tmp(self, staging: _DirectionStaging, h: int, rows: int, k: int):
-        if staging.sample_gather_tmp is None:
-            staging.sample_gather_tmp = [None for _ in range(self._H)]
-            self._bump_retained_epoch()
-        value = staging.sample_gather_tmp[h]
-        if value is None:
-            value = self._cp.zeros((int(rows), int(k)), dtype=self._dtype, order="C")
-            staging.sample_gather_tmp[h] = value
-            self._bump_retained_epoch()
-        return value
-
     def _workspace_slot(self, direction: Direction, *, graph: bool) -> str:
         return f"{'graph' if graph else 'dynamic'}_{direction.value}"
 
     def _build_direction_workspace(self, direction: Direction, k: int, *, use_graph_descs: bool) -> _DirectionWorkspace:
         if self._cuda_dtype is None or self._alpha is None or self._beta_zero is None or self._beta_one is None:
             raise RuntimeError("cuSPARSE runtime constants are uninitialized")
-        if self._sample_routing is None:
-            raise RuntimeError("Sample routing is not initialized")
+        if self._sample_levels is None:
+            raise RuntimeError("Sample levels are not initialized")
         plan = self._require_plan(direction)
         level_sizes = [int(self._level_offsets[h + 1]) - int(self._level_offsets[h]) for h in range(self._H)]
         dense = _build_dense_state(
@@ -1638,7 +1599,7 @@ class CusparseBackend(BackendBase):
         init_mode: InitMode,
         has_miss_input: bool,
     ) -> None:
-        if self._mut_selector is None or self._miss_selector is None or self._sample_routing is None:
+        if self._mut_selector is None or self._miss_selector is None or self._sample_levels is None:
             raise RuntimeError("cuSPARSE backend is not initialized")
 
         with self._capture_stream:
@@ -1646,7 +1607,7 @@ class CusparseBackend(BackendBase):
                 buf.fill(0)
 
         if ws.direction == Direction.UP:
-            self._sample_routing.scatter(
+            self._sample_levels.scatter(
                 cp=self._cp,
                 stream=self._capture_stream,
                 x_gpu=ws.input_primary,
@@ -1709,7 +1670,7 @@ class CusparseBackend(BackendBase):
         *,
         need_miss_output: bool,
     ) -> tuple[np.ndarray, np.ndarray | None] | np.ndarray:
-        if self._mut_selector is None or self._miss_selector is None or self._sample_routing is None:
+        if self._mut_selector is None or self._miss_selector is None or self._sample_levels is None:
             raise RuntimeError("cuSPARSE backend is not initialized")
 
         if ws.direction == Direction.UP:
@@ -1757,17 +1718,10 @@ class CusparseBackend(BackendBase):
                 (self._num_samples, ws.k),
                 order="C",
             )
-        for h, dst in enumerate(self._sample_routing.bwd_dst):
-            if dst.size == 0:
-                continue
-            if staging.sample_gather_tmp is not None and staging.sample_gather_tmp[h] is not None:
-                continue
-            self._ensure_sample_gather_tmp(staging, h, int(dst.size), int(ws.k))
-        self._sample_routing.gather(
+        self._sample_levels.gather(
             cp=self._cp,
             stream=self._capture_stream,
             level_buffers=ws.dense.level_bufs,
-            sample_gather_tmp=staging.sample_gather_tmp,
             out_gpu=staging.output_main,
         )
         tracer = self._nvtx
@@ -2158,8 +2112,6 @@ class CusparseBackend(BackendBase):
                 active_values.append(staging.output_main)
             if direction == Direction.UP and need_miss_output and staging.output_miss is not None:
                 active_values.append(staging.output_miss)
-            if direction == Direction.DOWN and not emit_all_nodes and staging.sample_gather_tmp is not None:
-                active_values.extend(temp for temp in staging.sample_gather_tmp if temp is not None)
             self._publish_call_capture(
                 CallCapture(
                     nonce=self._capture_nonce,
