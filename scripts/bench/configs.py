@@ -19,8 +19,6 @@ _PAIR_LITERAL_RE = re.compile(r"^\[(.*?)\]\[(.*?)\]$")
 class BenchConfig:
     label: str
     backend_name: str
-    ordering: str
-    intra_block_ordering: str
     plan_up_text: str | None
     plan_down_text: str | None
     instrumentation: bool
@@ -66,38 +64,25 @@ def _render_plan_text(plan: str | None) -> str:
     return "<unspecified>" if plan is None else plan
 
 
-def make_config_label(
-    backend_name: str,
-    ordering: str,
-    intra_block_ordering: str,
-    plan_up_text: str | None,
-    plan_down_text: str | None,
-) -> str:
-    return (
-        f"{backend_name}-order={ordering}-intra={intra_block_ordering}-"
-        f"up={_render_plan_text(plan_up_text)}-down={_render_plan_text(plan_down_text)}"
-    )
+def make_config_label(backend_name: str, plan_up_text: str | None, plan_down_text: str | None) -> str:
+    return f"{backend_name}-up={_render_plan_text(plan_up_text)}-down={_render_plan_text(plan_down_text)}"
 
 
 def _bench_config(
     *,
     backend_name: str,
-    ordering: str,
-    intra_block_ordering: str,
     plan_up_text: str | None,
     plan_down_text: str | None,
     log_level: str,
     instrumentation: bool,
     build_backend: Callable[[], BackendBase],
 ) -> BenchConfig:
-    label = make_config_label(backend_name, ordering, intra_block_ordering, plan_up_text, plan_down_text)
+    label = make_config_label(backend_name, plan_up_text, plan_down_text)
     if instrumentation:
         label = f"{label}-instr"
     return BenchConfig(
         label=label,
         backend_name=backend_name,
-        ordering=str(ordering),
-        intra_block_ordering=str(intra_block_ordering),
         plan_up_text=plan_up_text,
         plan_down_text=plan_down_text,
         instrumentation=bool(instrumentation),
@@ -105,38 +90,28 @@ def _bench_config(
     )
 
 
-def expand_mkl_configs(
-    plan_pair_specs: list[PlanPairSpec],
-    orderings: list[str],
-    intra_block_orderings: list[str],
-    log_level: str,
-    instrumentation: bool = False,
-) -> list[BenchConfig]:
+def expand_mkl_configs(plan_pair_specs: list[PlanPairSpec], log_level: str, instrumentation: bool = False) -> list[BenchConfig]:
     from pygrgl_spmv.backends.mkl import MklBackend, MklPlan, MklPlanPair
 
     configs: list[BenchConfig] = []
-    for ordering in orderings:
-        for intra_block_ordering in intra_block_orderings:
-            for up_spec, down_spec in plan_pair_specs:
-                if spec_has_pattern(up_spec) or spec_has_pattern(down_spec):
-                    raise ValueError("MKL benchmark plans must be fully concrete; wildcard/negation expansion is cuSPARSE-only for now")
-                pair = MklPlanPair.from_dicts(up_spec, down_spec)
-                configs.append(
-                    _bench_config(
-                        backend_name="mkl",
-                        ordering=ordering,
-                        intra_block_ordering=intra_block_ordering,
-                        plan_up_text=None if pair.plan_up is None else str(pair.plan_up),
-                        plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
-                        log_level=log_level,
-                        instrumentation=instrumentation,
-                        build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: MklBackend(
-                            pair=pair,
-                            log_level=log_level,
-                            instrumentation=instrumentation,
-                        ),
-                    )
-                )
+    for up_spec, down_spec in plan_pair_specs:
+        if spec_has_pattern(up_spec) or spec_has_pattern(down_spec):
+            raise ValueError("MKL benchmark plans must be fully concrete; wildcard/negation expansion is cuSPARSE-only for now")
+        pair = MklPlanPair.from_dicts(up_spec, down_spec)
+        configs.append(
+            _bench_config(
+                backend_name="mkl",
+                plan_up_text=None if pair.plan_up is None else str(pair.plan_up),
+                plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
+                log_level=log_level,
+                instrumentation=instrumentation,
+                build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: MklBackend(
+                    pair=pair,
+                    log_level=log_level,
+                    instrumentation=instrumentation,
+                ),
+            )
+        )
     return configs
 
 
@@ -156,36 +131,30 @@ def _expand_cusparse_side(spec: PlanSpec | None, *, want_up: bool):
 
 def expand_cusparse_configs(
     plan_pair_specs: list[PlanPairSpec],
-    orderings: list[str],
-    intra_block_orderings: list[str],
     log_level: str,
     instrumentation: bool = False,
 ) -> list[BenchConfig]:
     from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlanPair
 
     configs: list[BenchConfig] = []
-    for ordering in orderings:
-        for intra_block_ordering in intra_block_orderings:
-            for up_spec, down_spec in plan_pair_specs:
-                for plan_up in _expand_cusparse_side(up_spec, want_up=True):
-                    for plan_down in _expand_cusparse_side(down_spec, want_up=False):
-                        pair = CusparsePlanPair(plan_up=plan_up, plan_down=plan_down)
-                        configs.append(
-                            _bench_config(
-                                backend_name="cusparse",
-                                ordering=ordering,
-                                intra_block_ordering=intra_block_ordering,
-                                plan_up_text=None if pair.plan_up is None else str(pair.plan_up),
-                                plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
-                                log_level=log_level,
-                                instrumentation=instrumentation,
-                                build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: CusparseBackend(
-                                    pair=pair,
-                                    log_level=log_level,
-                                    instrumentation=instrumentation,
-                                ),
-                            )
-                        )
+    for up_spec, down_spec in plan_pair_specs:
+        for plan_up in _expand_cusparse_side(up_spec, want_up=True):
+            for plan_down in _expand_cusparse_side(down_spec, want_up=False):
+                pair = CusparsePlanPair(plan_up=plan_up, plan_down=plan_down)
+                configs.append(
+                    _bench_config(
+                        backend_name="cusparse",
+                        plan_up_text=None if pair.plan_up is None else str(pair.plan_up),
+                        plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
+                        log_level=log_level,
+                        instrumentation=instrumentation,
+                        build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: CusparseBackend(
+                            pair=pair,
+                            log_level=log_level,
+                            instrumentation=instrumentation,
+                        ),
+                    )
+                )
     return configs
 
 
@@ -238,36 +207,30 @@ def _expand_triton_side(spec: PlanSpec | None, *, want_up: bool):
 
 def expand_triton_configs(
     plan_pair_specs: list[PlanPairSpec],
-    orderings: list[str],
-    intra_block_orderings: list[str],
     log_level: str,
     instrumentation: bool = False,
 ) -> list[BenchConfig]:
     from pygrgl_spmv.backends.triton import TritonBackend, TritonPlanPair
 
     configs: list[BenchConfig] = []
-    for ordering in orderings:
-        for intra_block_ordering in intra_block_orderings:
-            for up_spec, down_spec in plan_pair_specs:
-                for plan_up in _expand_triton_side(up_spec, want_up=True):
-                    for plan_down in _expand_triton_side(down_spec, want_up=False):
-                        pair = TritonPlanPair(plan_up=plan_up, plan_down=plan_down)
-                        configs.append(
-                            _bench_config(
-                                backend_name="triton",
-                                ordering=ordering,
-                                intra_block_ordering=intra_block_ordering,
-                                plan_up_text=None if pair.plan_up is None else str(pair.plan_up),
-                                plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
-                                log_level=log_level,
-                                instrumentation=instrumentation,
-                                build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: TritonBackend(
-                                    pair=pair,
-                                    log_level=log_level,
-                                    instrumentation=instrumentation,
-                                ),
-                            )
-                        )
+    for up_spec, down_spec in plan_pair_specs:
+        for plan_up in _expand_triton_side(up_spec, want_up=True):
+            for plan_down in _expand_triton_side(down_spec, want_up=False):
+                pair = TritonPlanPair(plan_up=plan_up, plan_down=plan_down)
+                configs.append(
+                    _bench_config(
+                        backend_name="triton",
+                        plan_up_text=None if pair.plan_up is None else str(pair.plan_up),
+                        plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
+                        log_level=log_level,
+                        instrumentation=instrumentation,
+                        build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: TritonBackend(
+                            pair=pair,
+                            log_level=log_level,
+                            instrumentation=instrumentation,
+                        ),
+                    )
+                )
     return configs
 
 
@@ -276,8 +239,6 @@ def format_dry_run_line(entry: BenchConfig, ks: list[int], options: list[str], *
         entry.label,
         f"ks={','.join(str(k) for k in ks)}",
         f"options={','.join(options)}",
-        f"ordering={entry.ordering}",
-        f"intra_block_ordering={entry.intra_block_ordering}",
         f"dtype={np.dtype(dtype).name}",
         f"index_dtype={np.dtype(index_dtype).name}",
         f"instrumentation={'on' if entry.instrumentation else 'off'}",

@@ -59,8 +59,6 @@ def summarize_config_display(configs: list[BenchConfig]) -> tuple[list[str], dic
         raise ValueError(f"Benchmark config labels must be unique, got duplicates: {duplicates}")
 
     backend_common = _common_value([entry.backend_name for entry in configs])
-    ordering_common = _common_value([entry.ordering for entry in configs])
-    intra_common = _common_value([entry.intra_block_ordering for entry in configs])
     instrumentation_common = _common_value([bool(entry.instrumentation) for entry in configs])
     parsed_up = [_parse_plan_text(entry.plan_up_text) for entry in configs]
     parsed_down = [_parse_plan_text(entry.plan_down_text) for entry in configs]
@@ -85,10 +83,6 @@ def summarize_config_display(configs: list[BenchConfig]) -> tuple[list[str], dic
     common_lines: list[str] = []
     if backend_common is not None:
         common_lines.append(f"backend={backend_common}")
-    if ordering_common is not None:
-        common_lines.append(f"ordering={ordering_common}")
-    if intra_common is not None:
-        common_lines.append(f"intra_block_ordering={intra_common}")
     if instrumentation_common is not None:
         common_lines.append(f"instrumentation={'on' if bool(instrumentation_common) else 'off'}")
     if all(plan is None for plan in parsed_up):
@@ -105,10 +99,6 @@ def summarize_config_display(configs: list[BenchConfig]) -> tuple[list[str], dic
         parts: list[str] = []
         if backend_common is None:
             parts.append(f"backend={entry.backend_name}")
-        if ordering_common is None:
-            parts.append(f"ordering={entry.ordering}")
-        if intra_common is None:
-            parts.append(f"intra_block_ordering={entry.intra_block_ordering}")
         if instrumentation_common is None:
             parts.append(f"instr={'on' if entry.instrumentation else 'off'}")
 

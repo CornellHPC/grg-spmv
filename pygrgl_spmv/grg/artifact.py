@@ -6,27 +6,16 @@ from pathlib import Path
 
 import numpy as np
 
-from pygrgl_spmv.grg.compile import (
-    CompiledOperatorState,
-    VALID_INTRA_BLOCK_ORDERINGS,
-    VALID_ORDERINGS,
-    _invert_permutation,
-)
+from pygrgl_spmv.grg.compile import CompiledOperatorState, _invert_permutation
 from pygrgl_spmv.grg.sparse import binary_csr_from_csr_parts
 
 GRG_SPMV_FORMAT_MAGIC = "grg_spmv"
-GRG_SPMV_FORMAT_VERSION = 3
+GRG_SPMV_FORMAT_VERSION = 2
 _FORMAT_MAGIC_KEY = "grg_spmv_magic"
 _FORMAT_VERSION_KEY = "grg_spmv_format_version"
 
 
-def artifact_path_for_grg(
-    grg_path: Path,
-    artifact_root: Path,
-    *,
-    ordering: str,
-    intra_block_ordering: str,
-) -> Path:
+def artifact_path_for_grg(grg_path: Path, artifact_root: Path) -> Path:
     resolved = grg_path.expanduser().resolve()
     if resolved.is_absolute():
         if resolved.drive:
@@ -36,8 +25,7 @@ def artifact_path_for_grg(
             rel_parts = ["_abs", *resolved.parts[1:]]
     else:
         rel_parts = ["_rel", *resolved.parts]
-    suffix = f".order-{ordering}.intra-{intra_block_ordering}.grg_spmv"
-    return artifact_root.joinpath(*rel_parts).with_suffix(suffix)
+    return artifact_root.joinpath(*rel_parts).with_suffix(".grg_spmv")
 
 
 def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
@@ -60,11 +48,9 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         "num_individuals": np.asarray(state.num_individuals, dtype=np.int64),
         "num_edges": np.asarray(state.num_edges, dtype=np.int64),
         "has_missing_data": np.asarray(state.has_missing_data, dtype=bool),
-        "ordering": np.asarray(state.ordering),
-        "intra_block_ordering": np.asarray(state.intra_block_ordering),
         "level_offsets": np.asarray(state.level_offsets, dtype=index_dtype),
+        "sample_perm": np.asarray(state.sample_perm, dtype=index_dtype),
         "node_perm": np.asarray(state.node_perm, dtype=index_dtype),
-        "sample_rows": np.asarray(state.sample_rows, dtype=index_dtype),
         "sample_to_individual": np.asarray(state.sample_to_individual, dtype=index_dtype),
         "mutation_positions": np.asarray(state.mutation_positions, dtype=np.float64),
         "mutation_times": np.asarray(state.mutation_times, dtype=np.float64),
@@ -111,8 +97,8 @@ def _artifact_index_dtype(data: np.lib.npyio.NpzFile) -> np.dtype:
     if dtype not in {np.dtype(np.int32), np.dtype(np.int64)}:
         raise ValueError(f"Unsupported .grg_spmv structural dtype: {dtype}")
     required = (
+        "sample_perm",
         "node_perm",
-        "sample_rows",
         "sample_to_individual",
         "sel_mut_indices",
         "sel_mut_indptr",
@@ -129,12 +115,6 @@ def _artifact_index_dtype(data: np.lib.npyio.NpzFile) -> np.dtype:
             if arr_dtype != dtype:
                 raise ValueError(f"Inconsistent structural dtype for {key}: {arr_dtype}, expected {dtype}")
     return dtype
-
-
-def _load_string_key(data: np.lib.npyio.NpzFile, key: str) -> str:
-    if key not in data.files:
-        raise ValueError(f"Unsupported .grg_spmv artifact: missing {key}")
-    return str(np.asarray(data[key]).item())
 
 
 def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
@@ -160,19 +140,12 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
             f"but SpmvGRG was requested with index_dtype={requested_index_dtype.name}"
         )
 
-    ordering = _load_string_key(data, "ordering")
-    intra_block_ordering = _load_string_key(data, "intra_block_ordering")
-    if ordering not in VALID_ORDERINGS:
-        raise ValueError(f"Unsupported .grg_spmv ordering {ordering!r}")
-    if intra_block_ordering not in VALID_INTRA_BLOCK_ORDERINGS:
-        raise ValueError(f"Unsupported .grg_spmv intra_block_ordering {intra_block_ordering!r}")
-
     num_samples = int(np.asarray(data["num_samples"]).item())
     num_mutations = int(np.asarray(data["num_mutations"]).item())
     num_nodes = int(np.asarray(data["num_nodes"]).item())
     level_offsets = np.asarray(data["level_offsets"], dtype=artifact_index_dtype)
+    sample_perm = np.asarray(data["sample_perm"], dtype=artifact_index_dtype)
     node_perm = np.asarray(data["node_perm"], dtype=artifact_index_dtype)
-    sample_rows = np.asarray(data["sample_rows"], dtype=artifact_index_dtype)
     sample_to_individual = np.asarray(data["sample_to_individual"], dtype=artifact_index_dtype)
     init_vector_up_bias = np.asarray(data["init_vector_up_bias"], dtype=dtype)
     init_vector_down_bias = np.asarray(data["init_vector_down_bias"], dtype=dtype)
@@ -188,6 +161,7 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
         init_xtx_down_bias = np.asarray(data["init_xtx_down_bias"], dtype=dtype)
 
     inv_node_perm = _invert_permutation(node_perm, index_dtype=artifact_index_dtype)
+    inv_sample_perm = _invert_permutation(sample_perm, index_dtype=artifact_index_dtype)
 
     sel_mut = binary_csr_from_csr_parts(
         indices=np.asarray(data["sel_mut_indices"], dtype=artifact_index_dtype),
@@ -225,7 +199,8 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
         level_offsets=level_offsets,
         node_perm=node_perm,
         inv_node_perm=inv_node_perm,
-        sample_rows=sample_rows,
+        sample_perm=sample_perm,
+        inv_sample_perm=inv_sample_perm,
         sel_mut=sel_mut,
         sel_miss=sel_miss,
         num_samples=num_samples,
@@ -235,8 +210,6 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
         num_individuals=int(np.asarray(data["num_individuals"]).item()),
         num_edges=int(np.asarray(data["num_edges"]).item()),
         has_missing_data=bool(np.asarray(data["has_missing_data"]).item()),
-        ordering=ordering,
-        intra_block_ordering=intra_block_ordering,
         sample_to_individual=sample_to_individual,
         mutation_positions=np.asarray(data["mutation_positions"], dtype=np.float64),
         mutation_times=np.asarray(data["mutation_times"], dtype=np.float64),

@@ -42,7 +42,8 @@ class BackendSetup:
     num_nodes: int
     sel_mut: sp.csr_matrix
     sel_miss: sp.csr_matrix
-    sample_rows: np.ndarray
+    sample_perm: np.ndarray
+    inv_sample_perm: np.ndarray
     coalescence_counts: np.ndarray | None
     dtype: np.dtype
 
@@ -135,7 +136,8 @@ class BackendBase:
         "_sel_mut",
         "_sel_miss",
         "_level_offsets",
-        "_sample_rows",
+        "_sample_perm",
+        "_inv_sample_perm",
         "_coalescence_counts",
         "_xtx_host",
     )
@@ -177,7 +179,8 @@ class BackendBase:
         self._level_offsets = np.empty(0, dtype=np.int64)
         self._sel_mut = sp.csr_matrix((0, 0))
         self._sel_miss = sp.csr_matrix((0, 0))
-        self._sample_rows = np.empty(0, dtype=np.int64)
+        self._sample_perm = np.empty(0, dtype=np.int64)
+        self._inv_sample_perm = np.empty(0, dtype=np.int64)
         self._coalescence_counts = None
         self._xtx_host = None
         self._dtype = np.float64
@@ -234,7 +237,8 @@ class BackendBase:
         self._num_mutations = int(setup.num_mutations)
         self._sel_mut = setup.sel_mut
         self._sel_miss = setup.sel_miss
-        self._sample_rows = np.asarray(setup.sample_rows)
+        self._sample_perm = np.asarray(setup.sample_perm)
+        self._inv_sample_perm = np.asarray(setup.inv_sample_perm)
         self._coalescence_counts = (
             None
             if setup.coalescence_counts is None

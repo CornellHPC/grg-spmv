@@ -80,7 +80,8 @@ class ReferenceBackend(BackendBase):
         "_sel_mut": "borrowed",
         "_sel_miss": "borrowed",
         "_level_offsets": "borrowed",
-        "_sample_rows": "borrowed",
+        "_sample_perm": "borrowed",
+        "_inv_sample_perm": "borrowed",
         "_coalescence_counts": "borrowed",
         "_xtx_host": "retained",
     }
@@ -174,7 +175,7 @@ class ReferenceBackend(BackendBase):
 
         node_values = np.zeros((self._num_nodes, k), dtype=self._dtype)
         self._apply_init_inplace(node_values, mode, payload)
-        node_values[self._sample_rows] += X
+        np.add(node_values[: self._num_samples], X[self._sample_perm], out=node_values[: self._num_samples])
         self._propagate_up_inplace(node_values)
 
         if self._sel_mut.nnz == 0:
@@ -235,7 +236,7 @@ class ReferenceBackend(BackendBase):
         if miss_arr is not None and self._sel_miss.nnz > 0:
             node_values += self._sel_miss.T @ miss_arr
         self._propagate_down_inplace(node_values)
-        out = node_values[self._sample_rows]
+        out = node_values[self._inv_sample_perm]
         if self._capture_active:
             call = self._call_mem
             assert isinstance(call, ReferenceCall)
@@ -270,7 +271,7 @@ class ReferenceBackend(BackendBase):
         payload = self._validate_init(mode, init, k)
         node_values = np.zeros((self._num_nodes, k), dtype=self._dtype)
         self._apply_init_inplace(node_values, mode, payload)
-        node_values[self._sample_rows] += X
+        np.add(node_values[: self._num_samples], X[self._sample_perm], out=node_values[: self._num_samples])
         self._propagate_up_inplace(node_values)
         if self._capture_active:
             call = self._call_mem

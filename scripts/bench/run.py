@@ -520,14 +520,7 @@ def run_benchmark_suite(
         progress(f"{'=' * 72}")
         progress(f"loading operator {label}")
         t_load = perf_counter()
-        op = SpmvGRG(
-            grg_path,
-            entry.build_backend(),
-            dtype,
-            index_dtype,
-            ordering=entry.ordering,
-            intra_block_ordering=entry.intra_block_ordering,
-        )
+        op = SpmvGRG(grg_path, entry.build_backend(), dtype, index_dtype)
         progress(f"{label}: operator ready in {(perf_counter() - t_load) * 1000.0:.2f} ms")
 
         cfg_runtime_rows, cfg_memory_rows, cfg_outputs = benchmark_config(

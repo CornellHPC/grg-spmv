@@ -40,7 +40,6 @@ Setup:
 - builds selector row/col index arrays
 - configures MKL sparse-handle hints
 - records per-level call-count and nnz statistics for debug logging
-- borrows the operator `sample_rows` mapping directly
 
 Execution:
 

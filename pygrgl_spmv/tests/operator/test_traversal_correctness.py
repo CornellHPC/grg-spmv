@@ -68,45 +68,6 @@ def test_rcm_backward_path(backend_config, primary_grg_path, gt_small, spmv_cach
     np.testing.assert_allclose(_run_down(op, X), Y_expected, atol=atol, rtol=rtol)
 
 
-@pytest.mark.smoke
-@pytest.mark.parametrize(
-    ("ordering", "intra_block_ordering"),
-    [
-        ("height", "rcm_mincol"),
-        ("height", "none"),
-        ("depth", "rcm_mincol"),
-        ("depth", "none"),
-    ],
-)
-def test_compile_layout_variants_match_ground_truth(
-    backend_config,
-    primary_grg_path,
-    gt_small,
-    spmv_cache_dir,
-    ordering,
-    intra_block_ordering,
-):
-    op = SpmvGRG(
-        primary_grg_path,
-        backend_config,
-        DATA_DTYPE,
-        INDEX_DTYPE,
-        artifact_dir=spmv_cache_dir,
-        ordering=ordering,
-        intra_block_ordering=intra_block_ordering,
-    )
-    assert op.ordering == ordering
-    assert op.intra_block_ordering == intra_block_ordering
-    assert op.sample_rows.shape == (op.num_samples,)
-    assert np.unique(op.sample_rows).size == op.num_samples
-
-    x_up, y_up_expected = gt_small.get("forward", 2, seed=911, dtype=DATA_DTYPE)
-    x_down, y_down_expected = gt_small.get("backward", 2, seed=912, dtype=DATA_DTYPE)
-    atol, rtol = tol(DATA_DTYPE)
-    np.testing.assert_allclose(_run_up(op, x_up), y_up_expected, atol=atol, rtol=rtol)
-    np.testing.assert_allclose(_run_down(op, x_down), y_down_expected, atol=atol, rtol=rtol)
-
-
 def _ones_input(_rng, shape, dtype):
     return np.ones(shape, dtype=dtype)
 

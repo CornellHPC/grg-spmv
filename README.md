@@ -34,8 +34,6 @@ op = SpmvGRG(
     np.float64,
     np.int32,
     artifact_dir="pygrgl_spmv_artifacts",
-    ordering="height",
-    intra_block_ordering="rcm_mincol",
 )
 ```
 
@@ -48,7 +46,7 @@ profiling/observability behavior that may reduce absolute performance.
 
 - `SpmvGRG` stores/loads standalone `.grg_spmv` artifacts under `artifact_dir` when you construct from a `.grg`
 - default artifact root: `./pygrgl_spmv_artifacts`
-- derived artifact paths encode the full GRG path plus compile layout (`ordering`, `intra_block_ordering`)
+- derived artifact paths encode the full GRG path to avoid collisions between GRGs with the same filename in different directories
 - you can also construct `SpmvGRG` directly from a `.grg_spmv` file without the original `.grg`
 
 ## Documentation

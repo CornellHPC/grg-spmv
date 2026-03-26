@@ -114,8 +114,6 @@ Benchmark correctness checks use full-output arrays in memory and do not stop th
 
 - `--grg`
 - `--ks`
-- `--orderings`
-- `--intra-block-orderings`
 - `--trials`
 - `--warmup`
 - `--plan-up-down`
@@ -126,16 +124,6 @@ Benchmark correctness checks use full-output arrays in memory and do not stop th
 - `--index-dtype` (`int32` or `int64`)
 - `--dry-run`
 - `--skip-note`
-
-`--orderings` selects the inter-level node relabeling used during compilation:
-
-- `height`
-- `depth`
-
-`--intra-block-orderings` selects the within-level permutation policy:
-
-- `rcm_mincol`
-- `none`
 
 `--log-level` changes verbosity only. `--instrumentation` is the opt-in switch
 for slower observability/profiling behavior:
@@ -185,8 +173,6 @@ MKL:
 ```bash
 uv run python -m scripts.bench.mkl \
   --grg /pscratch/sd/q/qys/grg/msprime.example.igd.final.grg \
-  --orderings height,depth \
-  --intra-block-orderings rcm_mincol,none \
   --ks 4,16 \
   --warmup 1 --trials 3 \
   --dtype float64 \
@@ -238,8 +224,6 @@ mkdir -p bench_logs/triton/run1
 
 uv run python -m scripts.bench.triton \
   --ks 1 \
-  --orderings height,depth \
-  --intra-block-orderings rcm_mincol,none \
   --warmup 3 \
   --trials 10 \
   --dtype float64 \
@@ -249,8 +233,6 @@ uv run python -m scripts.bench.triton \
 
 uv run python -m scripts.bench.triton \
   --ks 1 \
-  --orderings height,depth \
-  --intra-block-orderings rcm_mincol,none \
   --warmup 3 \
   --trials 10 \
   --dtype float64 \

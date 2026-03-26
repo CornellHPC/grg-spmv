@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import heapq
 
 import numpy as np
 import pygrgl
@@ -12,9 +11,6 @@ from scipy.sparse.csgraph import reverse_cuthill_mckee
 
 from pygrgl_spmv.backends import BackendSetup
 from pygrgl_spmv.grg.sparse import binary_csr_from_coo
-
-VALID_ORDERINGS = frozenset({"height", "depth"})
-VALID_INTRA_BLOCK_ORDERINGS = frozenset({"rcm_mincol", "none"})
 
 
 @dataclass
@@ -25,7 +21,8 @@ class CompiledOperatorState:
     level_offsets: np.ndarray
     node_perm: np.ndarray
     inv_node_perm: np.ndarray
-    sample_rows: np.ndarray
+    sample_perm: np.ndarray
+    inv_sample_perm: np.ndarray
     sel_mut: sp.csr_matrix
     sel_miss: sp.csr_matrix
     num_samples: int
@@ -35,8 +32,6 @@ class CompiledOperatorState:
     num_individuals: int
     num_edges: int
     has_missing_data: bool
-    ordering: str
-    intra_block_ordering: str
     sample_to_individual: np.ndarray
     mutation_positions: np.ndarray
     mutation_times: np.ndarray
@@ -61,27 +56,11 @@ class CompiledOperatorState:
             num_nodes=self.num_nodes,
             sel_mut=self.sel_mut,
             sel_miss=self.sel_miss,
-            sample_rows=self.sample_rows,
+            sample_perm=self.sample_perm,
+            inv_sample_perm=self.inv_sample_perm,
             coalescence_counts=self.coalescence_counts,
             dtype=dtype,
         )
-
-
-def _validate_ordering(ordering: str) -> str:
-    token = str(ordering).strip().lower()
-    if token not in VALID_ORDERINGS:
-        raise ValueError(f"Unknown ordering {ordering!r}; expected one of {sorted(VALID_ORDERINGS)}")
-    return token
-
-
-def _validate_intra_block_ordering(intra_block_ordering: str) -> str:
-    token = str(intra_block_ordering).strip().lower()
-    if token not in VALID_INTRA_BLOCK_ORDERINGS:
-        raise ValueError(
-            "Unknown intra_block_ordering "
-            f"{intra_block_ordering!r}; expected one of {sorted(VALID_INTRA_BLOCK_ORDERINGS)}"
-        )
-    return token
 
 
 def _invert_permutation(perm: np.ndarray, *, index_dtype: np.dtype) -> np.ndarray:
@@ -117,26 +96,19 @@ def _rcm_bipartite(A: sp.spmatrix, index_dtype: np.dtype) -> tuple[np.ndarray, n
     return row_indices.astype(index_dtype, copy=False), col_indices.astype(index_dtype, copy=False)
 
 
-def _extract_edges(
-    grg,
-    K: int,
-    *,
-    index_dtype: np.dtype,
-) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, ...], np.ndarray]:
-    """Extract directed edges and child lists from the GRG."""
+def _extract_edges_and_heights(grg, K: int, *, index_dtype: np.dtype) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract directed edges (parent -> child) and node heights."""
+    heights = np.zeros(K, dtype=np.int64)
     row_chunks: list[np.ndarray] = []
     col_chunks: list[np.ndarray] = []
-    children_by_node: list[np.ndarray] = []
-    indegree = np.zeros(K, dtype=np.int64)
 
     for node_id in range(K):
         children = np.asarray(grg.get_down_edges(node_id), dtype=index_dtype)
-        children_by_node.append(children)
         if children.size == 0:
             continue
         row_chunks.append(np.full(int(children.size), node_id, dtype=index_dtype))
         col_chunks.append(children)
-        np.add.at(indegree, children.astype(np.int64, copy=False), 1)
+        heights[node_id] = int(heights[children].max()) + 1
 
     if row_chunks:
         row_arr = np.concatenate(row_chunks)
@@ -144,75 +116,21 @@ def _extract_edges(
     else:
         row_arr = np.empty(0, dtype=index_dtype)
         col_arr = np.empty(0, dtype=index_dtype)
-    return row_arr, col_arr, tuple(children_by_node), indegree
+    return row_arr, col_arr, heights
 
 
-def _topological_order(children_by_node: tuple[np.ndarray, ...], indegree: np.ndarray) -> np.ndarray:
-    """Return a stable topological order from sources to sinks."""
-    K = len(children_by_node)
-    indegree_work = np.asarray(indegree, dtype=np.int64).copy()
-    frontier = [int(node_id) for node_id in range(K) if int(indegree_work[node_id]) == 0]
-    heapq.heapify(frontier)
+def _build_level_order(heights: np.ndarray, *, index_dtype: np.dtype) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build height-sorted node order and level offsets."""
+    K = int(heights.shape[0])
 
-    topo = np.empty(K, dtype=np.int64)
-    out_idx = 0
-    while frontier:
-        node_id = heapq.heappop(frontier)
-        topo[out_idx] = int(node_id)
-        out_idx += 1
-        for child_id in children_by_node[node_id]:
-            child = int(child_id)
-            indegree_work[child] -= 1
-            if int(indegree_work[child]) == 0:
-                heapq.heappush(frontier, child)
+    perm_height = np.argsort(heights, kind="stable").astype(index_dtype, copy=False)
+    inv_perm_height = np.empty(K, dtype=index_dtype)
+    inv_perm_height[perm_height] = np.arange(K, dtype=index_dtype)
 
-    if out_idx != K:
-        raise RuntimeError(f"Invalid GRG topology: expected a DAG, visited {out_idx}/{K} nodes in topological sort")
-    return topo
-
-
-def _compute_depths_and_heights(
-    children_by_node: tuple[np.ndarray, ...],
-    topo_order: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-node depths and heights from the DAG."""
-    K = len(children_by_node)
-    depths = np.zeros(K, dtype=np.int64)
-    heights = np.zeros(K, dtype=np.int64)
-
-    for node_id in topo_order:
-        parent = int(node_id)
-        child_depth = int(depths[parent]) + 1
-        for child_id in children_by_node[parent]:
-            child = int(child_id)
-            if child_depth > int(depths[child]):
-                depths[child] = child_depth
-
-    for node_id in topo_order[::-1]:
-        node = int(node_id)
-        children = children_by_node[node]
-        if children.size == 0:
-            continue
-        heights[node] = int(heights[children].max()) + 1
-
-    return depths, heights
-
-
-def _build_level_layout(
-    level_values: np.ndarray,
-    *,
-    index_dtype: np.dtype,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Build node order and level offsets from non-decreasing level values."""
-    K = int(level_values.shape[0])
-    node_order = np.argsort(level_values, kind="stable").astype(index_dtype, copy=False)
-    inv_node_order = np.empty(K, dtype=index_dtype)
-    inv_node_order[node_order] = np.arange(K, dtype=index_dtype)
-
-    sorted_levels = level_values[node_order]
-    if np.any(np.diff(sorted_levels) < 0):
-        raise RuntimeError("Level values must be non-decreasing after sorting")
-    changes = np.flatnonzero(np.diff(sorted_levels)) + 1
+    sorted_heights = heights[perm_height]
+    if np.any(np.diff(sorted_heights) < 0):
+        raise RuntimeError("Heights must be non-decreasing after sorting")
+    changes = np.flatnonzero(np.diff(sorted_heights)) + 1
     level_offsets = np.concatenate(
         [
             np.array([0], dtype=index_dtype),
@@ -223,76 +141,73 @@ def _build_level_layout(
 
     num_levels = int(level_offsets.size - 1)
     node_levels = np.empty(K, dtype=np.int32)
-    for level in range(num_levels):
-        lo, hi = int(level_offsets[level]), int(level_offsets[level + 1])
-        node_levels[node_order[lo:hi]] = level
+    for h in range(num_levels):
+        lo, hi = int(level_offsets[h]), int(level_offsets[h + 1])
+        node_levels[perm_height[lo:hi]] = h
 
-    return node_order, inv_node_order, level_offsets, node_levels
+    return perm_height, inv_perm_height, level_offsets, node_levels
 
 
-def _build_intra_level_perms(
+def _build_level_perms(
     rows: np.ndarray,
     cols: np.ndarray,
     *,
-    inv_level_order: np.ndarray,
+    inv_perm_height: np.ndarray,
     level_offsets: np.ndarray,
     dst_levels: np.ndarray,
     src_order: np.ndarray,
     src_offsets: np.ndarray,
     index_dtype: np.dtype,
     dtype: np.dtype,
-    intra_block_ordering: str,
 ) -> list[np.ndarray]:
-    """Compute within-level permutations."""
+    """Compute always-on per-level permutations (RCM + min-column ordering)."""
     num_levels = int(level_offsets.size - 1)
-    perms = [
-        np.arange(int(level_offsets[level + 1] - level_offsets[level]), dtype=index_dtype)
-        for level in range(num_levels)
-    ]
-    if intra_block_ordering == "none":
-        return perms
-    if intra_block_ordering != "rcm_mincol":
-        raise ValueError(f"Unhandled intra_block_ordering {intra_block_ordering!r}")
 
-    for level in range(1, num_levels):
-        lo_e = int(src_offsets[level])
-        hi_e = int(src_offsets[level + 1])
+    level_perms = [
+        np.arange(int(level_offsets[h + 1] - level_offsets[h]), dtype=index_dtype)
+        for h in range(num_levels)
+    ]
+
+    for h in range(1, num_levels):
+        lo_e = int(src_offsets[h])
+        hi_e = int(src_offsets[h + 1])
         if lo_e == hi_e:
             continue
         edge_idx = src_order[lo_e:hi_e]
-        prev_level_edges = edge_idx[dst_levels[edge_idx] == (level - 1)]
-        if prev_level_edges.size == 0:
+        prev_idx = edge_idx[dst_levels[edge_idx] == (h - 1)]
+        if prev_idx.size == 0:
             continue
 
-        row_local = (inv_level_order[rows[prev_level_edges]] - level_offsets[level]).astype(np.int64, copy=False)
-        col_local = (inv_level_order[cols[prev_level_edges]] - level_offsets[level - 1]).astype(np.int64, copy=False)
-        row_size = int(level_offsets[level + 1] - level_offsets[level])
-        col_size = int(level_offsets[level] - level_offsets[level - 1])
+        row_local = (inv_perm_height[rows[prev_idx]] - level_offsets[h]).astype(np.int64, copy=False)
+        col_local = (inv_perm_height[cols[prev_idx]] - level_offsets[h - 1]).astype(np.int64, copy=False)
 
-        if level == 1:
-            block = binary_csr_from_coo(
+        row_size = int(level_offsets[h + 1] - level_offsets[h])
+        col_size = int(level_offsets[h] - level_offsets[h - 1])
+
+        if h == 1:
+            A_block = binary_csr_from_coo(
                 row_local,
                 col_local,
                 shape=(row_size, col_size),
                 dtype=dtype,
             )
-            row_perm, col_perm = _rcm_bipartite(block, index_dtype)
-            perms[1] = row_perm
-            perms[0] = col_perm
+            row_perm, col_perm = _rcm_bipartite(A_block, index_dtype)
+            level_perms[1] = row_perm
+            level_perms[0] = col_perm
             continue
 
         min_col = np.full(row_size, col_size, dtype=np.int64)
         np.minimum.at(min_col, row_local, col_local)
-        perms[level] = np.argsort(min_col, kind="stable").astype(index_dtype, copy=False)
+        level_perms[h] = np.argsort(min_col, kind="stable").astype(index_dtype, copy=False)
 
-    return perms
+    return level_perms
 
 
 def _build_blocks_from_edges(
     rows: np.ndarray,
     cols: np.ndarray,
     *,
-    inv_node_perm: np.ndarray,
+    inv_final_perm: np.ndarray,
     level_offsets: np.ndarray,
     dst_levels: np.ndarray,
     src_order: np.ndarray,
@@ -303,14 +218,14 @@ def _build_blocks_from_edges(
     num_levels = int(level_offsets.size - 1)
     A_blocks: list[list[sp.csr_matrix]] = []
 
-    for level in range(num_levels):
-        row_size = int(level_offsets[level + 1] - level_offsets[level])
+    for h in range(num_levels):
+        row_size = int(level_offsets[h + 1] - level_offsets[h])
         level_blocks = [
-            sp.csr_matrix((row_size, int(level_offsets[src + 1] - level_offsets[src])), dtype=dtype)
-            for src in range(level)
+            sp.csr_matrix((row_size, int(level_offsets[j + 1] - level_offsets[j])), dtype=dtype)
+            for j in range(h)
         ]
-        lo_e = int(src_offsets[level])
-        hi_e = int(src_offsets[level + 1])
+        lo_e = int(src_offsets[h])
+        hi_e = int(src_offsets[h + 1])
         if lo_e == hi_e:
             A_blocks.append(level_blocks)
             continue
@@ -324,18 +239,18 @@ def _build_blocks_from_edges(
         splits = np.flatnonzero(np.diff(dst_sorted)) + 1
         bounds = np.concatenate([np.array([0]), splits, np.array([edge_sorted.size])])
         for b0, b1 in zip(bounds[:-1], bounds[1:]):
-            src_level = int(dst_sorted[int(b0)])
-            if src_level >= level:
+            j = int(dst_sorted[int(b0)])
+            if j >= h:
                 raise RuntimeError(
-                    f"Invalid GRG edge bucket (source level {level}, target level {src_level}); expected target < source"
+                    f"Invalid GRG edge bucket (source level {h}, target level {j}); expected target < source"
                 )
             pair_idx = edge_sorted[int(b0) : int(b1)]
             if pair_idx.size == 0:
                 continue
-            row_local = (inv_node_perm[rows[pair_idx]] - level_offsets[level]).astype(np.int64, copy=False)
-            col_local = (inv_node_perm[cols[pair_idx]] - level_offsets[src_level]).astype(np.int64, copy=False)
-            col_size = int(level_offsets[src_level + 1] - level_offsets[src_level])
-            level_blocks[src_level] = binary_csr_from_coo(
+            row_local = (inv_final_perm[rows[pair_idx]] - level_offsets[h]).astype(np.int64, copy=False)
+            col_local = (inv_final_perm[cols[pair_idx]] - level_offsets[j]).astype(np.int64, copy=False)
+            col_size = int(level_offsets[j + 1] - level_offsets[j])
+            level_blocks[j] = binary_csr_from_coo(
                 row_local,
                 col_local,
                 shape=(row_size, col_size),
@@ -351,7 +266,7 @@ def _build_binary_selector(
     rows: list[int],
     cols_orig: list[int],
     *,
-    inv_node_perm: np.ndarray,
+    inv_final_perm: np.ndarray,
     shape: tuple[int, int],
     index_dtype: np.dtype,
     dtype: np.dtype,
@@ -359,19 +274,11 @@ def _build_binary_selector(
     if not rows:
         return sp.csr_matrix(shape, dtype=dtype)
     row_arr = np.asarray(rows, dtype=index_dtype)
-    col_arr = inv_node_perm[np.asarray(cols_orig, dtype=index_dtype)]
+    col_arr = inv_final_perm[np.asarray(cols_orig, dtype=index_dtype)]
     return binary_csr_from_coo(row_arr, col_arr, shape=shape, dtype=dtype)
 
 
-def _build_selectors(
-    grg,
-    *,
-    inv_node_perm: np.ndarray,
-    m: int,
-    K: int,
-    index_dtype: np.dtype,
-    dtype: np.dtype,
-) -> tuple[sp.csr_matrix, sp.csr_matrix]:
+def _build_selectors(grg, *, inv_final_perm: np.ndarray, m: int, K: int, index_dtype: np.dtype, dtype: np.dtype) -> tuple[sp.csr_matrix, sp.csr_matrix]:
     """Build mutation and missingness selector matrices."""
     mut_rows: list[int] = []
     mut_cols_orig: list[int] = []
@@ -389,7 +296,7 @@ def _build_selectors(
     sel_mut = _build_binary_selector(
         mut_rows,
         mut_cols_orig,
-        inv_node_perm=inv_node_perm,
+        inv_final_perm=inv_final_perm,
         shape=(m, K),
         index_dtype=index_dtype,
         dtype=dtype,
@@ -397,11 +304,12 @@ def _build_selectors(
     sel_miss = _build_binary_selector(
         miss_rows,
         miss_cols_orig,
-        inv_node_perm=inv_node_perm,
+        inv_final_perm=inv_final_perm,
         shape=(m, K),
         index_dtype=index_dtype,
         dtype=dtype,
     )
+
     return sel_mut, sel_miss
 
 
@@ -436,11 +344,16 @@ _NUCLEOTIDE_ENCODE = {"A": 0b00, "T": 0b01, "C": 0b10, "G": 0b11}
 
 
 def _encode_alleles(alleles: list[str]) -> tuple[np.ndarray, np.ndarray]:
-    """Pack variable-length allele strings into a 2-bit-per-nucleotide uint8 buffer with CSR offsets."""
+    """Pack variable-length allele strings into a 2-bit-per-nucleotide uint8 buffer with CSR offsets.
+
+    Returns (data, offsets) where offsets[i]:offsets[i+1] gives the nucleotide
+    range for allele i within the packed data buffer.
+    """
     n = len(alleles)
     offsets = np.empty(n + 1, dtype=np.uint32)
     offsets[0] = 0
 
+    # First pass: validate and compute offsets
     total = 0
     for i, allele_str in enumerate(alleles):
         for ch in allele_str:
@@ -451,6 +364,7 @@ def _encode_alleles(alleles: list[str]) -> tuple[np.ndarray, np.ndarray]:
             raise ValueError(f"Allele offset overflow at index {i}: total nucleotide count {total} exceeds uint32 max")
         offsets[i + 1] = total
 
+    # Second pass: pack 2-bit codes
     buf = np.zeros((total + 3) // 4, dtype=np.uint8)
     pos = 0
     for allele_str in alleles:
@@ -485,45 +399,15 @@ def _build_mutation_table(grg) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.n
     )
 
 
-def _validate_sample_rows(sample_rows: np.ndarray, *, num_samples: int, num_nodes: int) -> np.ndarray:
-    rows = np.asarray(sample_rows)
-    if rows.shape != (num_samples,):
-        raise RuntimeError(f"Invalid sample_rows shape: got {rows.shape}, expected ({num_samples},)")
-    if rows.size == 0:
-        return rows
-    if np.any(rows < 0) or np.any(rows >= num_nodes):
-        raise RuntimeError("sample_rows contains out-of-range compiled node rows")
-    if np.unique(rows).size != rows.size:
-        raise RuntimeError("sample_rows must contain unique compiled node rows")
-    return rows
-
-
-def compile_grg(
-    grg,
-    *,
-    dtype: np.dtype,
-    index_dtype: np.dtype,
-    ordering: str = "height",
-    intra_block_ordering: str = "rcm_mincol",
-) -> CompiledOperatorState:
+def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOperatorState:
     """Compile a GRG object into the normalized sparse traversal layout."""
-    ordering = _validate_ordering(ordering)
-    intra_block_ordering = _validate_intra_block_ordering(intra_block_ordering)
-
     num_samples = int(grg.num_samples)
     num_mutations = int(grg.num_mutations)
     num_nodes = int(grg.num_nodes)
 
-    rows, cols, children_by_node, indegree = _extract_edges(grg, num_nodes, index_dtype=index_dtype)
-    topo_order = _topological_order(children_by_node, indegree)
-    depths, heights = _compute_depths_and_heights(children_by_node, topo_order)
-    if ordering == "height":
-        level_values = heights
-    else:
-        level_values = int(np.max(depths, initial=0)) - depths
-
-    level_order, inv_level_order, level_offsets, node_levels = _build_level_layout(
-        level_values,
+    rows, cols, heights = _extract_edges_and_heights(grg, num_nodes, index_dtype=index_dtype)
+    perm_height, inv_perm_height, level_offsets, node_levels = _build_level_order(
+        heights,
         index_dtype=index_dtype,
     )
     num_levels = int(level_offsets.size - 1)
@@ -539,34 +423,33 @@ def compile_grg(
     src_offsets = np.zeros(num_levels + 1, dtype=np.int64)
     src_offsets[1:] = np.cumsum(src_counts, dtype=np.int64)
 
-    intra_level_perms = _build_intra_level_perms(
+    level_perms = _build_level_perms(
         rows,
         cols,
-        inv_level_order=inv_level_order,
+        inv_perm_height=inv_perm_height,
         level_offsets=level_offsets,
         dst_levels=dst_levels,
         src_order=src_order,
         src_offsets=src_offsets,
         index_dtype=index_dtype,
         dtype=dtype,
-        intra_block_ordering=intra_block_ordering,
     )
 
     within_perm = np.arange(num_nodes, dtype=index_dtype)
-    for level in range(num_levels):
-        lo, hi = int(level_offsets[level]), int(level_offsets[level + 1])
-        perm = intra_level_perms[level]
+    for h in range(num_levels):
+        lo, hi = int(level_offsets[h]), int(level_offsets[h + 1])
+        perm = level_perms[h]
         if perm.shape[0] != (hi - lo):
-            raise RuntimeError(f"Invalid intra-level permutation for level {level}: got {perm.shape[0]}, expected {hi - lo}")
+            raise RuntimeError(f"Invalid level permutation for level {h}: got {perm.shape[0]}, expected {hi - lo}")
         within_perm[lo:hi] = lo + perm
 
-    node_perm = level_order[within_perm]
-    inv_node_perm = _invert_permutation(node_perm, index_dtype=index_dtype)
+    final_perm = perm_height[within_perm]
+    inv_final_perm = _invert_permutation(final_perm, index_dtype=index_dtype)
 
     A_blocks = _build_blocks_from_edges(
         rows,
         cols,
-        inv_node_perm=inv_node_perm,
+        inv_final_perm=inv_final_perm,
         level_offsets=level_offsets,
         dst_levels=dst_levels,
         src_order=src_order,
@@ -574,50 +457,40 @@ def compile_grg(
         dtype=dtype,
     )
 
-    for level in range(num_levels):
-        if len(A_blocks[level]) != level:
-            raise RuntimeError(f"Invalid number of blocks at level {level}: got {len(A_blocks[level])}, expected {level}")
-        for src_level, block in enumerate(A_blocks[level]):
+    for h in range(num_levels):
+        if len(A_blocks[h]) != h:
+            raise RuntimeError(f"Invalid number of blocks at level {h}: got {len(A_blocks[h])}, expected {h}")
+        for j, blk in enumerate(A_blocks[h]):
             expected_shape = (
-                int(level_offsets[level + 1] - level_offsets[level]),
-                int(level_offsets[src_level + 1] - level_offsets[src_level]),
+                int(level_offsets[h + 1] - level_offsets[h]),
+                int(level_offsets[j + 1] - level_offsets[j]),
             )
-            if block.shape != expected_shape:
+            if blk.shape != expected_shape:
                 raise RuntimeError(
-                    f"Invalid block shape for A_blocks[{level}][{src_level}]: got {block.shape}, expected {expected_shape}"
+                    f"Invalid block shape for A_blocks[{h}][{j}]: got {blk.shape}, expected {expected_shape}"
                 )
 
     sel_mut, sel_miss = _build_selectors(
         grg,
-        inv_node_perm=inv_node_perm,
+        inv_final_perm=inv_final_perm,
         m=num_mutations,
         K=num_nodes,
         index_dtype=index_dtype,
         dtype=dtype,
     )
 
-    sample_rows = _validate_sample_rows(
-        inv_node_perm[np.arange(num_samples, dtype=index_dtype)].copy(),
-        num_samples=num_samples,
-        num_nodes=num_nodes,
-    )
     sample_to_individual = np.arange(num_samples, dtype=index_dtype) // max(int(grg.ploidy), 1)
-    coalescence_counts = _build_coalescence_counts(grg, node_perm=node_perm)
-    (
-        mutation_positions,
-        mutation_times,
-        mutation_alleles,
-        mutation_allele_offsets,
-        mutation_ref_alleles,
-        mutation_ref_allele_offsets,
-    ) = _build_mutation_table(grg)
+    coalescence_counts = _build_coalescence_counts(grg, node_perm=final_perm)
+    mutation_positions, mutation_times, mutation_alleles, mutation_allele_offsets, mutation_ref_alleles, mutation_ref_allele_offsets = _build_mutation_table(grg)
 
+    sample_perm = final_perm[:num_samples].copy()
     return CompiledOperatorState(
         A_blocks=A_blocks,
         level_offsets=level_offsets,
-        node_perm=node_perm.copy(),
-        inv_node_perm=inv_node_perm.copy(),
-        sample_rows=sample_rows,
+        node_perm=final_perm.copy(),
+        inv_node_perm=inv_final_perm.copy(),
+        sample_perm=sample_perm,
+        inv_sample_perm=_invert_permutation(sample_perm, index_dtype=index_dtype),
         sel_mut=sel_mut,
         sel_miss=sel_miss,
         num_samples=num_samples,
@@ -627,8 +500,6 @@ def compile_grg(
         num_individuals=int(grg.num_individuals),
         num_edges=int(grg.num_edges),
         has_missing_data=bool(grg.has_missing_data),
-        ordering=ordering,
-        intra_block_ordering=intra_block_ordering,
         sample_to_individual=sample_to_individual,
         mutation_positions=mutation_positions,
         mutation_times=mutation_times,
@@ -639,11 +510,4 @@ def compile_grg(
         coalescence_counts=coalescence_counts,
     )
 
-
-__all__ = [
-    "CompiledOperatorState",
-    "VALID_INTRA_BLOCK_ORDERINGS",
-    "VALID_ORDERINGS",
-    "_invert_permutation",
-    "compile_grg",
-]
+__all__ = ["CompiledOperatorState", "_invert_permutation", "compile_grg"]
