@@ -24,8 +24,6 @@ from pygrgl_spmv.memory import (
 @dataclass
 class OperatorRetainedMem:
     level_offsets: np.ndarray = alloc_field(label="level_offsets", kind="mapping", owner="operator", retention="persistent", activity="always")
-    sample_perm: np.ndarray = alloc_field(label="sample_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
-    inv_sample_perm: np.ndarray = alloc_field(label="inv_sample_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
     node_perm: np.ndarray = alloc_field(label="node_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
     inv_node_perm: np.ndarray = alloc_field(label="inv_node_perm", kind="mapping", owner="operator", retention="persistent", activity="always")
     sample_to_individual: np.ndarray = alloc_field(label="sample_to_individual", kind="mapping", owner="operator", retention="persistent", activity="always")
@@ -126,7 +124,7 @@ class SpmvGRG:
         return self._build_and_save_artifact(source_path=source_path, artifact_path=artifact_path)
 
     def _build_and_save_artifact(self, *, source_path: Path, artifact_path: Path) -> CompiledOperatorState:
-        grg = pygrgl.load_immutable_grg(str(source_path), load_up_edges=True)
+        grg = pygrgl.load_immutable_grg(str(source_path), load_up_edges=False)
         compiled = compile_grg(grg, dtype=self._dtype, index_dtype=self._index_dtype)
         self._build_init_biases(compiled)
         save_grg_spmv(compiled, artifact_path)
@@ -160,8 +158,6 @@ class SpmvGRG:
     def _build_retained_mem(self) -> OperatorRetainedMem:
         return OperatorRetainedMem(
             level_offsets=self._compiled.level_offsets,
-            sample_perm=self._compiled.sample_perm,
-            inv_sample_perm=self._compiled.inv_sample_perm,
             node_perm=self._compiled.node_perm,
             inv_node_perm=self._compiled.inv_node_perm,
             sample_to_individual=self._compiled.sample_to_individual,
@@ -245,14 +241,6 @@ class SpmvGRG:
     @property
     def level_offsets(self):
         return self._compiled.level_offsets
-
-    @property
-    def sample_perm(self):
-        return self._compiled.sample_perm
-
-    @property
-    def inv_sample_perm(self):
-        return self._compiled.inv_sample_perm
 
     @property
     def node_perm(self):

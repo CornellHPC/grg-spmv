@@ -38,7 +38,7 @@ Artifact path derivation is implemented in [artifact.py](artifact.py).
 
 The artifact stores:
 
-- structural arrays such as `level_offsets`, permutations, and selector CSR parts
+- structural arrays such as `level_offsets`, `node_perm`, and selector CSR parts
 - mutation metadata tables
 - retained block structure
 - init-bias vectors and optional XTX init-bias vectors
@@ -49,11 +49,11 @@ Compilation is implemented in [compile.py](compile.py).
 
 `compile_grg(...)`:
 
-- extracts down edges and node heights from the input GRG
-- builds height order and level offsets
-- computes per-level permutations
-- builds level-block CSR matrices
-- builds mutation and missingness selectors
+- supports non-empty immutable GRGs only
+- uses only down edges from the input GRG
+- computes node heights and stable height order
+- builds level-block CSR matrices directly from streamed child lists
+- builds mutation and missingness selectors from sorted mutation rows; repeated `MutationID` rows are allowed when one mutation is attached to multiple nodes, and only missingness selector rows may need duplicate coalescing when those repeated rows share one missingness node
 - loads mutation tables and optional coalescence counts
 
 The result is a `CompiledOperatorState`.
@@ -62,7 +62,7 @@ The result is a `CompiledOperatorState`.
 
 `CompiledOperatorState` holds:
 
-- level structure and permutations
+- level structure and node-order mappings
 - selector matrices
 - mutation metadata tables
 - optional coalescence counts

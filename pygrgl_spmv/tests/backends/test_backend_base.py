@@ -38,9 +38,6 @@ def _make_toy_backend(coalescence_counts: np.ndarray | None = None) -> Reference
         ),
         shape=(2, 4),
     )
-    sample_perm = np.array([0, 1], dtype=np.int64)
-    inv_sample_perm = np.array([0, 1], dtype=np.int64)
-
     backend = ReferenceBackend(
         pair=ReferencePlanPair(
             plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
@@ -56,8 +53,6 @@ def _make_toy_backend(coalescence_counts: np.ndarray | None = None) -> Reference
             num_nodes=4,
             sel_mut=sel_mut,
             sel_miss=sel_miss,
-            sample_perm=sample_perm,
-            inv_sample_perm=inv_sample_perm,
             coalescence_counts=coalescence_counts,
             dtype=np.float64,
         )
@@ -91,8 +86,6 @@ class _DummyBackend(BackendBase):
         "_sel_mut": "borrowed",
         "_sel_miss": "borrowed",
         "_level_offsets": "borrowed",
-        "_sample_perm": "borrowed",
-        "_inv_sample_perm": "borrowed",
         "_coalescence_counts": "borrowed",
         "_xtx_host": "dropped",
     }
@@ -232,8 +225,6 @@ def test_reference_backend_direct_run_does_not_leave_call_memory_live():
             num_nodes=backend._num_nodes,
             sel_mut=backend._sel_mut,
             sel_miss=backend._sel_miss,
-            sample_perm=backend._sample_perm,
-            inv_sample_perm=backend._inv_sample_perm,
             coalescence_counts=backend._coalescence_counts,
             dtype=np.float64,
         )

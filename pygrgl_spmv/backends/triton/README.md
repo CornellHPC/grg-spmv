@@ -44,7 +44,7 @@ Validation:
 Setup:
 
 - uploads sparse structure to device tensors
-- uploads permutation and selector tensors
+- uploads selector tensors
 - autotunes the Triton kernel family for each configured direction
 - creates captured workspaces when the effective `k_hint` is present
 
@@ -78,7 +78,6 @@ When instrumentation is enabled and a plan specifies `k_hint`, the backend warns
 
 Retained device leaves include:
 
-- uploaded permutation/mapping tensors
 - sparse block structure
 - selector tensors
 - captured workspaces

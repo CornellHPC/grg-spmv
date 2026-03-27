@@ -10,7 +10,7 @@ from pygrgl_spmv.grg.compile import CompiledOperatorState, _invert_permutation
 from pygrgl_spmv.grg.sparse import binary_csr_from_csr_parts
 
 GRG_SPMV_FORMAT_MAGIC = "grg_spmv"
-GRG_SPMV_FORMAT_VERSION = 2
+GRG_SPMV_FORMAT_VERSION = 3
 _FORMAT_MAGIC_KEY = "grg_spmv_magic"
 _FORMAT_VERSION_KEY = "grg_spmv_format_version"
 
@@ -49,7 +49,6 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         "num_edges": np.asarray(state.num_edges, dtype=np.int64),
         "has_missing_data": np.asarray(state.has_missing_data, dtype=bool),
         "level_offsets": np.asarray(state.level_offsets, dtype=index_dtype),
-        "sample_perm": np.asarray(state.sample_perm, dtype=index_dtype),
         "node_perm": np.asarray(state.node_perm, dtype=index_dtype),
         "sample_to_individual": np.asarray(state.sample_to_individual, dtype=index_dtype),
         "mutation_positions": np.asarray(state.mutation_positions, dtype=np.float64),
@@ -97,7 +96,6 @@ def _artifact_index_dtype(data: np.lib.npyio.NpzFile) -> np.dtype:
     if dtype not in {np.dtype(np.int32), np.dtype(np.int64)}:
         raise ValueError(f"Unsupported .grg_spmv structural dtype: {dtype}")
     required = (
-        "sample_perm",
         "node_perm",
         "sample_to_individual",
         "sel_mut_indices",
@@ -144,7 +142,6 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
     num_mutations = int(np.asarray(data["num_mutations"]).item())
     num_nodes = int(np.asarray(data["num_nodes"]).item())
     level_offsets = np.asarray(data["level_offsets"], dtype=artifact_index_dtype)
-    sample_perm = np.asarray(data["sample_perm"], dtype=artifact_index_dtype)
     node_perm = np.asarray(data["node_perm"], dtype=artifact_index_dtype)
     sample_to_individual = np.asarray(data["sample_to_individual"], dtype=artifact_index_dtype)
     init_vector_up_bias = np.asarray(data["init_vector_up_bias"], dtype=dtype)
@@ -161,7 +158,6 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
         init_xtx_down_bias = np.asarray(data["init_xtx_down_bias"], dtype=dtype)
 
     inv_node_perm = _invert_permutation(node_perm, index_dtype=artifact_index_dtype)
-    inv_sample_perm = _invert_permutation(sample_perm, index_dtype=artifact_index_dtype)
 
     sel_mut = binary_csr_from_csr_parts(
         indices=np.asarray(data["sel_mut_indices"], dtype=artifact_index_dtype),
@@ -199,8 +195,6 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
         level_offsets=level_offsets,
         node_perm=node_perm,
         inv_node_perm=inv_node_perm,
-        sample_perm=sample_perm,
-        inv_sample_perm=inv_sample_perm,
         sel_mut=sel_mut,
         sel_miss=sel_miss,
         num_samples=num_samples,

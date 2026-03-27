@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from pygrgl_spmv import SpmvGRG
+from pygrgl_spmv.grg.compile import compile_grg
 from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, K_MATRIX, binary_pm1, matmul_expect_k_hint_warning, tol
 
 
@@ -54,18 +55,43 @@ def test_backward_full(op, gt_small, k):
     np.testing.assert_allclose(_run_down(op, X), Y_expected, atol=atol, rtol=rtol)
 
 
-def test_rcm_forward_path(backend_config, primary_grg_path, gt_small, spmv_cache_dir):
+def test_stable_height_order_forward_path(backend_config, primary_grg_path, gt_small, spmv_cache_dir):
     op = SpmvGRG(primary_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
     X, Y_expected = gt_small.get("forward", 4, seed=11, dtype=DATA_DTYPE)
     atol, rtol = tol(DATA_DTYPE)
     np.testing.assert_allclose(_run_up(op, X), Y_expected, atol=atol, rtol=rtol)
 
 
-def test_rcm_backward_path(backend_config, primary_grg_path, gt_small, spmv_cache_dir):
+def test_stable_height_order_backward_path(backend_config, primary_grg_path, gt_small, spmv_cache_dir):
     op = SpmvGRG(primary_grg_path, backend_config, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
     X, Y_expected = gt_small.get("backward", 4, seed=11, dtype=DATA_DTYPE)
     atol, rtol = tol(DATA_DTYPE)
     np.testing.assert_allclose(_run_down(op, X), Y_expected, atol=atol, rtol=rtol)
+
+
+def test_stable_height_order_keeps_sample_prefix(op):
+    np.testing.assert_array_equal(op.node_perm[: op.num_samples], np.arange(op.num_samples, dtype=INDEX_DTYPE))
+    np.testing.assert_array_equal(op.inv_node_perm[: op.num_samples], np.arange(op.num_samples, dtype=INDEX_DTYPE))
+    assert int(op.level_offsets[1]) >= op.num_samples
+
+
+def test_compiled_blocks_have_sorted_unique_columns(primary_grg_path):
+    import pygrgl
+
+    grg = pygrgl.load_immutable_grg(primary_grg_path, load_up_edges=False)
+    state = compile_grg(grg, dtype=DATA_DTYPE, index_dtype=INDEX_DTYPE)
+    assert state.A_blocks is not None
+    for level_blocks in state.A_blocks:
+        for block in level_blocks:
+            indptr = np.asarray(block.indptr)
+            indices = np.asarray(block.indices)
+            for row in range(block.shape[0]):
+                lo = int(indptr[row])
+                hi = int(indptr[row + 1])
+                row_indices = indices[lo:hi]
+                if row_indices.size <= 1:
+                    continue
+                assert np.all(row_indices[1:] > row_indices[:-1])
 
 
 def _ones_input(_rng, shape, dtype):

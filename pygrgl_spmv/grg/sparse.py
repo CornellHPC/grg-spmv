@@ -8,31 +8,6 @@ import numpy as np
 import scipy.sparse as sp
 
 
-def binary_csr_from_coo(
-    rows,
-    cols,
-    *,
-    shape: tuple[int, int],
-    dtype: np.dtype,
-) -> sp.csr_matrix:
-    """Build a CSR matrix with duplicate coordinates merged to binary ones."""
-    row_arr = np.asarray(rows, dtype=np.int64)
-    col_arr = np.asarray(cols, dtype=np.int64)
-    if row_arr.shape != col_arr.shape:
-        raise ValueError(f"COO row/col shapes mismatch: {row_arr.shape} vs {col_arr.shape}")
-    matrix = sp.csr_matrix(
-        (
-            np.ones(int(row_arr.size), dtype=np.dtype(dtype)),
-            (row_arr, col_arr),
-        ),
-        shape=shape,
-    )
-    matrix.sum_duplicates()
-    if matrix.nnz > 0:
-        matrix.data.fill(1)
-    return matrix
-
-
 def binary_csr_from_csr_parts(
     *,
     indices,
@@ -62,4 +37,4 @@ def binary_csr_from_csr_parts(
     return matrix
 
 
-__all__ = ["binary_csr_from_coo", "binary_csr_from_csr_parts"]
+__all__ = ["binary_csr_from_csr_parts"]

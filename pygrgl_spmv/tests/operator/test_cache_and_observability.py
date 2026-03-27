@@ -124,7 +124,7 @@ def test_wavefront_debug_logging_is_quiet_without_instrumentation(primary_grg_pa
 
 @pytest.mark.mkl
 @MKL_ONLY
-def test_cache_miss_build_uses_up_edges_and_fails_on_missing_coals(primary_grg_path, tmp_path, monkeypatch):
+def test_cache_miss_build_uses_down_edges_only_and_fails_on_missing_coals(primary_grg_path, tmp_path, monkeypatch):
     dst = tmp_path / "coal-build.grg"
     shutil.copy2(primary_grg_path, dst)
     cache_dir = tmp_path / "cache"
@@ -166,7 +166,7 @@ def test_cache_miss_build_uses_up_edges_and_fails_on_missing_coals(primary_grg_p
             artifact_dir=cache_dir,
         )
     assert calls["loader"] == 1
-    assert calls["load_up_edges"] == [True]
+    assert calls["load_up_edges"] == [False]
     assert calls["calculate_missing_coals"] == 0
 
 
