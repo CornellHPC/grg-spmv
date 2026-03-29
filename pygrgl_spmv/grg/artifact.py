@@ -163,14 +163,12 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
         indices=np.asarray(data["sel_mut_indices"], dtype=artifact_index_dtype),
         indptr=np.asarray(data["sel_mut_indptr"], dtype=artifact_index_dtype),
         shape=(num_mutations, num_nodes),
-        dtype=dtype,
         index_dtype=artifact_index_dtype,
     )
     sel_miss = binary_csr_from_csr_parts(
         indices=np.asarray(data["sel_miss_indices"], dtype=artifact_index_dtype),
         indptr=np.asarray(data["sel_miss_indptr"], dtype=artifact_index_dtype),
         shape=(num_mutations, num_nodes),
-        dtype=dtype,
         index_dtype=artifact_index_dtype,
     )
 
@@ -184,7 +182,6 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
                     indices=np.asarray(data[f"A_blocks_{dst_level}_{src_level}_indices"], dtype=artifact_index_dtype),
                     indptr=np.asarray(data[f"A_blocks_{dst_level}_{src_level}_indptr"], dtype=artifact_index_dtype),
                     shape=np.asarray(data[f"A_blocks_{dst_level}_{src_level}_shape"], dtype=artifact_index_dtype),
-                    dtype=dtype,
                     index_dtype=artifact_index_dtype,
                 )
             )

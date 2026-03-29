@@ -13,12 +13,12 @@ def test_binary_csr_from_csr_parts_rehydrates_binary_matrix():
         indices=np.array([1, 0, 2], dtype=np.int32),
         indptr=np.array([0, 1, 3], dtype=np.int32),
         shape=(2, 3),
-        dtype=np.float32,
         index_dtype=np.int64,
     )
+    assert matrix.dtype == np.bool_
     np.testing.assert_array_equal(
         matrix.toarray(),
-        np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 1.0]], dtype=np.float32),
+        np.array([[False, True, False], [True, False, True]]),
     )
 
 
@@ -28,6 +28,5 @@ def test_binary_csr_from_csr_parts_validates_shapes():
             indices=np.array([0], dtype=np.int32),
             indptr=np.array([0, 1], dtype=np.int32),
             shape=(1,),
-            dtype=np.float64,
             index_dtype=np.int32,
         )

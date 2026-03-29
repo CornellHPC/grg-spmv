@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import resource
 
 import numpy as np
 import pygrgl
@@ -10,6 +12,24 @@ import scipy.sparse as sp
 
 from pygrgl_spmv.backends import BackendSetup
 from pygrgl_spmv.grg.sparse import binary_csr_from_csr_parts
+
+_RSS_DEBUG: bool = os.getenv("SPMV_DEBUG_RSS") == "1"
+_rss_prev: list[float] = [0.0]
+
+
+def _rss_mb() -> float:
+    """Current process peak RSS in MB (Linux: ru_maxrss is kB)."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def _rss_checkpoint(label: str) -> None:
+    """Print a labelled RSS reading if SPMV_DEBUG_RSS=1."""
+    if not _RSS_DEBUG:
+        return
+    cur = _rss_mb()
+    delta = cur - _rss_prev[0]
+    _rss_prev[0] = cur
+    print(f"[rss] {label:<50s}  {cur:8.1f} MB  Δ{delta:+.1f} MB", flush=True)
 
 
 @dataclass
@@ -124,14 +144,12 @@ def _build_stable_height_order(
 def _empty_binary_csr(
     *,
     shape: tuple[int, int],
-    dtype: np.dtype,
     index_dtype: np.dtype,
 ) -> sp.csr_matrix:
     return binary_csr_from_csr_parts(
         indices=np.empty(0, dtype=index_dtype),
         indptr=np.zeros(shape[0] + 1, dtype=index_dtype),
         shape=shape,
-        dtype=dtype,
         index_dtype=index_dtype,
     )
 
@@ -141,7 +159,6 @@ def _build_level_blocks(
     node_levels: np.ndarray,
     level_offsets: np.ndarray,
     inv_node_perm: np.ndarray,
-    dtype: np.dtype,
     index_dtype: np.dtype,
 ) -> list[list[sp.csr_matrix]]:
     """Build block CSR matrices in two streamed passes with exact-sized arrays."""
@@ -171,6 +188,8 @@ def _build_level_blocks(
                 block_indptrs[parent_level][child_level] = indptr
             indptr[row_local + 1] += int(child_level_counts[child_level])
 
+    _rss_checkpoint("level_blocks: pass1 done (block_indptrs allocated)")
+
     block_indices: list[list[np.ndarray | None]] = [[None] * level for level in range(num_levels)]
     for parent_level in range(num_levels):
         for child_level in range(parent_level):
@@ -179,6 +198,8 @@ def _build_level_blocks(
                 continue
             np.cumsum(indptr, out=indptr)
             block_indices[parent_level][child_level] = np.empty(int(indptr[-1]), dtype=index_dtype)
+
+    _rss_checkpoint("level_blocks: indices allocated (indptrs + indices)")
 
     for parent_id in range(num_nodes):
         parent_level = int(node_levels[parent_id])
@@ -224,6 +245,8 @@ def _build_level_blocks(
                 )
             indices[start:end] = cols_local
 
+    _rss_checkpoint("level_blocks: pass2 done (indices filled)")
+
     A_blocks: list[list[sp.csr_matrix]] = []
     for parent_level in range(num_levels):
         level_blocks: list[sp.csr_matrix] = []
@@ -234,7 +257,6 @@ def _build_level_blocks(
                 level_blocks.append(
                     _empty_binary_csr(
                         shape=(level_sizes[parent_level], level_sizes[child_level]),
-                        dtype=dtype,
                         index_dtype=index_dtype,
                     )
                 )
@@ -244,11 +266,12 @@ def _build_level_blocks(
                     indices=indices,
                     indptr=indptr,
                     shape=(level_sizes[parent_level], level_sizes[child_level]),
-                    dtype=dtype,
                     index_dtype=index_dtype,
                 )
             )
         A_blocks.append(level_blocks)
+
+    _rss_checkpoint("level_blocks: CSR built (+ data arrays, lists dropped)")
     return A_blocks
 
 
@@ -259,7 +282,6 @@ def _build_selectors(
     num_mutations: int,
     num_nodes: int,
     index_dtype: np.dtype,
-    dtype: np.dtype,
 ) -> tuple[sp.csr_matrix, sp.csr_matrix]:
     """Build selectors from sorted mutation rows, allowing contiguous repeated mutation IDs."""
     rows = grg.get_mutation_node_miss()
@@ -315,21 +337,19 @@ def _build_selectors(
         indices=mut_indices[:mut_nnz],
         indptr=mut_indptr,
         shape=(num_mutations, num_nodes),
-        dtype=dtype,
         index_dtype=index_dtype,
     )
     sel_miss = binary_csr_from_csr_parts(
         indices=miss_indices[:miss_nnz],
         indptr=miss_indptr,
         shape=(num_mutations, num_nodes),
-        dtype=dtype,
         index_dtype=index_dtype,
     )
     if row_count > num_mutations and sel_miss.nnz > 0:
         # Repeated mutation rows can legitimately share one missingness node,
         # which produces duplicate coordinates only in the missingness selector.
         sel_miss.sum_duplicates()
-        sel_miss.data.fill(1)
+        sel_miss.data.fill(True)
     return sel_mut, sel_miss
 
 
@@ -449,11 +469,17 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
             f"num_edges={num_edges} exceeds {np.dtype(index_dtype).name} range required for structural arrays"
         )
 
+    _rss_prev[0] = _rss_mb()
+    _rss_checkpoint("compile_grg: start")
+
     node_heights = _compute_node_heights(grg, num_nodes, index_dtype=index_dtype)
+    _rss_checkpoint("compile_grg: after node_heights")
+
     node_perm, inv_node_perm, level_offsets = _build_stable_height_order(
         node_heights,
         index_dtype=index_dtype,
     )
+    _rss_checkpoint("compile_grg: after stable_height_order")
     _validate_sample_prefix(node_perm=node_perm, level_offsets=level_offsets, num_samples=num_samples)
 
     A_blocks = _build_level_blocks(
@@ -461,9 +487,9 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
         node_levels=node_heights,
         level_offsets=level_offsets,
         inv_node_perm=inv_node_perm,
-        dtype=dtype,
         index_dtype=index_dtype,
     )
+    _rss_checkpoint("compile_grg: after level_blocks")
 
     num_levels = int(level_offsets.size - 1)
     for parent_level in range(num_levels):
@@ -488,12 +514,13 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
         num_mutations=num_mutations,
         num_nodes=num_nodes,
         index_dtype=index_dtype,
-        dtype=dtype,
     )
+    _rss_checkpoint("compile_grg: after selectors")
 
     sample_to_individual = np.arange(num_samples, dtype=index_dtype) // max(int(grg.ploidy), 1)
     coalescence_counts = _build_coalescence_counts(grg, node_perm=node_perm)
     mutation_positions, mutation_times, mutation_alleles, mutation_allele_offsets, mutation_ref_alleles, mutation_ref_allele_offsets = _build_mutation_table(grg)
+    _rss_checkpoint("compile_grg: after mutation_table")
 
     return CompiledOperatorState(
         A_blocks=A_blocks,
