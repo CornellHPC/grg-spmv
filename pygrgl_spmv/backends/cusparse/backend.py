@@ -240,6 +240,25 @@ class _CuOp:
 
 
 @dataclass
+class _PinnedBlock:
+    """Sparse block index arrays pre-converted and stored in pinned host memory.
+
+    Pinned memory allows cudaMemcpyAsync to issue a truly async DMA transfer
+    (no CPU-side staging required), enabling H2D copies to overlap with GPU compute
+    on other streams.  Allocated once in setup(); reused across prepare()/finish() cycles.
+    """
+
+    fmt: str
+    nrows: int
+    ncols: int
+    nnz: int
+    h0: np.ndarray  # indptr (CSR/CSC) or row (COO) — view into pinned memory
+    h1: np.ndarray  # indices (CSR/CSC) or col (COO) — view into pinned memory
+    _mem0: Any      # cp.cuda.PinnedMemoryPointer keeping h0 alive
+    _mem1: Any      # cp.cuda.PinnedMemoryPointer keeping h1 alive
+
+
+@dataclass
 class _SharedOnes:
     ptr: int
     logical_nbytes: int
@@ -595,6 +614,7 @@ class CusparseBackend(BackendBase):
         pair: CusparsePlanPair,
         log_level: str = "WARNING",
         instrumentation: bool = False,
+        swap_mode: bool = False,
     ):
         for name, plan in (("UP", pair.plan_up), ("DOWN", pair.plan_down)):
             if plan is not None and not plan.supported:
@@ -613,6 +633,14 @@ class CusparseBackend(BackendBase):
             log_level=log_level,
             instrumentation=instrumentation,
         )
+
+        self._swap_mode: bool = swap_mode
+        self._A_blocks_cpu: list[list[sp.spmatrix]] = []
+        self._pinned_up: list[list[_PinnedBlock | None]] = []
+        self._pinned_down: list[list[_PinnedBlock | None]] = []
+        self._blocks_ready: bool = False
+        self._copy_stream: CupyStream | None = None
+        self._copy_ready_event: CupyEvent | None = None
 
         self._cslib = CuSparseLib()
         runtime_version = cusparse_plan._runtime_cuda_version()
@@ -685,9 +713,10 @@ class CusparseBackend(BackendBase):
         return self._blocks_up if direction == Direction.UP else self._blocks_down
 
     def _operator_matrix(self, direction: Direction, *, dst_level: int, src_level: int) -> sp.spmatrix:
+        blocks = self._A_blocks_cpu if self._swap_mode else self._A_blocks
         if direction == Direction.UP:
-            return self._A_blocks[dst_level][src_level]
-        return self._A_blocks[src_level][dst_level]
+            return blocks[dst_level][src_level]
+        return blocks[src_level][dst_level]
 
     def _destroy_shared_ones(self) -> None:
         values = self._shared_ones
@@ -951,12 +980,29 @@ class CusparseBackend(BackendBase):
         self._beta_one = self._cp.ones(1, dtype=self._dtype)
         self._shared_ones = self._build_shared_ones()
 
-        self._blocks_up = self._build_direction_blocks(direction=Direction.UP)
-        self._blocks_down = self._build_direction_blocks(direction=Direction.DOWN)
-        self._ops_up = self._build_direction_ops(Direction.UP)
-        self._ops_down = self._build_direction_ops(Direction.DOWN)
-        self._scratch_plan_up = self._build_scratch_level_plans(Direction.UP) if self._plan_up is not None else []
-        self._scratch_plan_down = self._build_scratch_level_plans(Direction.DOWN) if self._plan_down is not None else []
+        if self._swap_mode:
+            # Keep scipy matrices on CPU; block GPU upload is deferred to prepare().
+            self._A_blocks_cpu = self._A_blocks
+            self._pinned_up   = self._pin_direction_blocks(Direction.UP)
+            self._pinned_down = self._pin_direction_blocks(Direction.DOWN)
+            self._blocks_up = [[] for _ in range(self._H)]
+            self._blocks_down = [[] for _ in range(self._H)]
+            self._ops_up = [[] for _ in range(self._H)]
+            self._ops_down = [[] for _ in range(self._H)]
+            # Scratch plans must be built (with empty ops → all disabled) so that
+            # _build_scratch_streams can index them by level. Plans are rebuilt in
+            # prepare() once real ops are populated.
+            self._scratch_plan_up = self._build_scratch_level_plans(Direction.UP) if self._plan_up is not None else []
+            self._scratch_plan_down = self._build_scratch_level_plans(Direction.DOWN) if self._plan_down is not None else []
+            self._blocks_ready = False
+            self._copy_ready_event = None
+        else:
+            self._blocks_up = self._build_direction_blocks(direction=Direction.UP)
+            self._blocks_down = self._build_direction_blocks(direction=Direction.DOWN)
+            self._ops_up = self._build_direction_ops(Direction.UP)
+            self._ops_down = self._build_direction_ops(Direction.DOWN)
+            self._scratch_plan_up = self._build_scratch_level_plans(Direction.UP) if self._plan_up is not None else []
+            self._scratch_plan_down = self._build_scratch_level_plans(Direction.DOWN) if self._plan_down is not None else []
 
         self._mut_selector = _SelectorLevels.from_csr(
             cp=self._cp,
@@ -987,29 +1033,42 @@ class CusparseBackend(BackendBase):
         self._sel_miss = sp.csr_matrix((0, 0))
 
         self._logger.info(
-            "CusparseBackend setup: H=%d K=%d n=%d m=%d plan_up=%s plan_down=%s",
+            "CusparseBackend setup: H=%d K=%d n=%d m=%d plan_up=%s plan_down=%s swap_mode=%s",
             self._H,
             self._num_nodes,
             self._num_samples,
             self._num_mutations,
             "<unspecified>" if self._plan_up is None else str(self._plan_up),
             "<unspecified>" if self._plan_down is None else str(self._plan_down),
+            self._swap_mode,
         )
 
         self._workspaces = _WorkspaceCache()
         self._static_workspace_slots = set()
-        for direction in self._configured_directions():
-            plan = self._require_plan(direction)
-            hint = effective_k_hint(instrumentation=self._instrumentation, k_hint=plan.k_hint)
-            if self._instrumentation and plan.k_hint is not None:
-                warn_instrumentation_ignores_k_hint(backend="cuSPARSE", direction=direction, k_hint=int(plan.k_hint))
-            if hint is None:
-                continue
-            slot = self._workspace_slot(direction, graph=True)
-            ws = self._build_direction_workspace(direction, int(hint), use_graph_descs=True)
-            ws.graph = self._capture_wavefront_graph(ws)
-            setattr(self._workspaces, slot, ws)
-            self._static_workspace_slots.add(slot)
+        if not self._swap_mode:
+            for direction in self._configured_directions():
+                plan = self._require_plan(direction)
+                hint = effective_k_hint(instrumentation=self._instrumentation, k_hint=plan.k_hint)
+                if self._instrumentation and plan.k_hint is not None:
+                    warn_instrumentation_ignores_k_hint(backend="cuSPARSE", direction=direction, k_hint=int(plan.k_hint))
+                if hint is None:
+                    continue
+                slot = self._workspace_slot(direction, graph=True)
+                ws = self._build_direction_workspace(direction, int(hint), use_graph_descs=True)
+                ws.graph = self._capture_wavefront_graph(ws)
+                setattr(self._workspaces, slot, ws)
+                self._static_workspace_slots.add(slot)
+        else:
+            for direction in self._configured_directions():
+                plan = self._require_plan(direction)
+                if self._instrumentation and plan.k_hint is not None:
+                    warn_instrumentation_ignores_k_hint(backend="cuSPARSE", direction=direction, k_hint=int(plan.k_hint))
+                if plan.k_hint is not None:
+                    self._logger.warning(
+                        "cuSPARSE %s k_hint=%d ignored: CUDA graph capture is disabled in swap_mode",
+                        direction.value,
+                        int(plan.k_hint),
+                    )
         self._sync_retained_root()
         self._bump_retained_epoch()
         self._assert_setup_memory_contract()
@@ -1043,6 +1102,141 @@ class CusparseBackend(BackendBase):
                 )
             return rows
 
+        owner_direction = (
+            Direction.UP
+            if (self._up_ops_owner if direction == Direction.UP else self._down_ops_owner) == "up"
+            else Direction.DOWN
+        )
+        owner_grid = self._grid_for(owner_direction)
+        for dst_level, src_level, row_index in iter_direction_level_pairs(direction, self._H):
+            owner_dst = dst_level if owner_direction == direction else src_level
+            owner_src = src_level if owner_direction == direction else dst_level
+            owner_row_index = owner_src if owner_direction == Direction.UP else owner_src - owner_dst - 1
+            owner_block = owner_grid[owner_dst][owner_row_index]
+            if owner_block is None:
+                continue
+            matrix = self._operator_matrix(direction, dst_level=dst_level, src_level=src_level)
+            if matrix.nnz == 0:
+                continue
+            nrows, ncols = matrix.shape
+            if plan.store == plan.store.T:
+                nrows, ncols = ncols, nrows
+            rows[dst_level][row_index] = _CuBlock.from_buffers(
+                fmt=plan.fmt.value.lower(),
+                nrows=nrows,
+                ncols=ncols,
+                nnz=owner_block.nnz,
+                index_buffers=owner_block.index_buffers,
+                data_ptr=owner_block.data_ptr,
+                payload_key=owner_block.payload_key,
+                cslib=self._cslib,
+                cuda_dtype_id=self._cuda_dtype,
+            )
+        return rows
+
+    def _pin_direction_blocks(self, direction: Direction) -> list[list[_PinnedBlock | None]]:
+        """Pre-convert and pin block index arrays for one direction.
+
+        Performs the same format conversion as _build_direction_blocks_async() but stores
+        results in CuPy pinned host memory so that subsequent cudaMemcpyAsync calls are
+        truly asynchronous (no CPU-side staging needed).  Called once from setup().
+        """
+        plan = self._plan_for(direction)
+        if plan is None:
+            return [[] for _ in range(self._H)]
+        store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
+        if not store_actual:
+            return [[] for _ in range(self._H)]  # alias direction reuses owner buffers
+
+        rows: list[list[_PinnedBlock | None]] = [
+            [None] * (dst_level if direction == Direction.UP else max(self._H - dst_level - 1, 0))
+            for dst_level in range(self._H)
+        ]
+        for dst_level, src_level, row_index in iter_direction_level_pairs(direction, self._H):
+            matrix = self._operator_matrix(direction, dst_level=dst_level, src_level=src_level)
+            if matrix.nnz == 0:
+                continue
+            stored = matrix if plan.store == plan.store.N else matrix.T.tocsr()
+            fmt = plan.fmt.value.lower()
+            if fmt == "csr":
+                mat = sp.csr_matrix(stored)
+                arr0 = mat.indptr.astype(np.int32, copy=False)
+                arr1 = mat.indices.astype(np.int32, copy=False)
+            elif fmt == "csc":
+                mat = stored.tocsc()
+                arr0 = mat.indptr.astype(np.int32, copy=False)
+                arr1 = mat.indices.astype(np.int32, copy=False)
+            else:  # coo
+                mat = stored.tocoo()
+                arr0 = mat.row.astype(np.int32, copy=False)
+                arr1 = mat.col.astype(np.int32, copy=False)
+            mem0 = self._cp.cuda.alloc_pinned_memory(arr0.nbytes)
+            h0 = np.frombuffer(mem0, dtype=np.int32, count=len(arr0))
+            np.copyto(h0, arr0)
+            mem1 = self._cp.cuda.alloc_pinned_memory(arr1.nbytes)
+            h1 = np.frombuffer(mem1, dtype=np.int32, count=len(arr1))
+            np.copyto(h1, arr1)
+            rows[dst_level][row_index] = _PinnedBlock(
+                fmt=fmt,
+                nrows=int(mat.shape[0]),
+                ncols=int(mat.shape[1]),
+                nnz=int(mat.nnz),
+                h0=h0,
+                h1=h1,
+                _mem0=mem0,
+                _mem1=mem1,
+            )
+        return rows
+
+    def _build_direction_blocks_async(
+        self, *, direction: Direction, stream: CupyStream
+    ) -> list[list[_CuBlock | None]]:
+        """Like _build_direction_blocks but starts H2D index-buffer copies on *stream* asynchronously.
+
+        Descriptor creation is synchronous (it just records the GPU pointer address); actual data
+        only needs to be resident by the time spmm() is called, which is after the copy event fires.
+        """
+        if self._cuda_dtype is None:
+            raise RuntimeError("CUDA dtype not initialized")
+        if self._shared_ones is None and any(
+            int(mat.nnz) > 0 for row in self._A_blocks_cpu for mat in row
+        ):
+            raise RuntimeError("shared ones are not initialized")
+        plan = self._plan_for(direction)
+        if plan is None:
+            return [[] for _ in range(self._H)]
+        rows = [
+            [None] * (dst_level if direction == Direction.UP else max(self._H - dst_level - 1, 0))
+            for dst_level in range(self._H)
+        ]
+        store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
+        if store_actual:
+            pinned_grid = self._pinned_up if direction == Direction.UP else self._pinned_down
+            for dst_level, src_level, row_index in iter_direction_level_pairs(direction, self._H):
+                pinned = pinned_grid[dst_level][row_index]
+                if pinned is None:
+                    continue
+                g0 = self._cp.empty(len(pinned.h0), dtype=np.int32)
+                g1 = self._cp.empty(len(pinned.h1), dtype=np.int32)
+                g0.set(pinned.h0, stream=stream)  # truly async: source is pinned host memory
+                g1.set(pinned.h1, stream=stream)
+                block = _CuBlock(
+                    fmt=pinned.fmt,
+                    nrows=pinned.nrows,
+                    ncols=pinned.ncols,
+                    nnz=pinned.nnz,
+                    index_buffers=(g0, g1),
+                    data_ptr=int(self._shared_ones.ptr),
+                    graph_desc=c_void_p(),
+                    dynamic_desc=c_void_p(),
+                    payload_key=(int(g0.data.ptr), int(g1.data.ptr), int(self._shared_ones.ptr)),
+                )
+                block.graph_desc = block._create_desc(cslib=self._cslib, cuda_dtype_id=self._cuda_dtype)
+                block.dynamic_desc = block._create_desc(cslib=self._cslib, cuda_dtype_id=self._cuda_dtype)
+                rows[dst_level][row_index] = block
+            return rows
+
+        # Alias path: share index_buffers from the owner direction (already uploaded above).
         owner_direction = (
             Direction.UP
             if (self._up_ops_owner if direction == Direction.UP else self._down_ops_owner) == "up"
@@ -1950,6 +2144,8 @@ class CusparseBackend(BackendBase):
         need_miss_output: bool,
         emit_all_nodes: bool,
     ) -> tuple[np.ndarray, np.ndarray | None] | np.ndarray:
+        if self._swap_mode:
+            self._ensure_blocks_ready()
         plan = self._require_plan(direction)
         x, k = self._normalize_primary_input(direction=direction, primary=primary)
         miss_arr = self._normalize_down_miss_input(miss, k=k) if direction == Direction.DOWN else None
@@ -2110,6 +2306,88 @@ class CusparseBackend(BackendBase):
             need_miss_output=False,
             emit_all_nodes=True,
         )
+
+    # ------------------------------------------------------------------
+    # Block-swapping API (only meaningful when swap_mode=True)
+    # ------------------------------------------------------------------
+
+    def prepare(self) -> None:
+        """Start async H2D copy of block index buffers on a dedicated copy stream.
+
+        Returns immediately; the copies run concurrently with other GPU work.
+        CPU copies of the scipy matrices are retained in ``_A_blocks_cpu``.
+        Call ``run_up``/``run_down`` after this — they will insert a stream-level
+        dependency so that level streams wait for the copies before launching SpMM.
+        Only meaningful when the backend was constructed with ``swap_mode=True``.
+        """
+        if not self._swap_mode:
+            return
+        if self._blocks_ready:
+            return
+        if self._copy_stream is None:
+            self._copy_stream = self._cp.cuda.Stream(non_blocking=True)
+
+        self._blocks_up = self._build_direction_blocks_async(direction=Direction.UP, stream=self._copy_stream)
+        self._blocks_down = self._build_direction_blocks_async(direction=Direction.DOWN, stream=self._copy_stream)
+        self._ops_up = self._build_direction_ops(Direction.UP)
+        self._ops_down = self._build_direction_ops(Direction.DOWN)
+        self._scratch_plan_up = self._build_scratch_level_plans(Direction.UP) if self._plan_up is not None else []
+        self._scratch_plan_down = self._build_scratch_level_plans(Direction.DOWN) if self._plan_down is not None else []
+
+        if self._copy_ready_event is None:
+            self._copy_ready_event = self._cp.cuda.Event()
+        self._copy_ready_event.record(self._copy_stream)
+
+        self._blocks_ready = True
+        self._sync_retained_root()
+        self._bump_retained_epoch()
+
+    def _ensure_blocks_ready(self) -> None:
+        """Insert stream-level wait so that level streams start SpMM only after H2D copies finish.
+
+        This is a GPU-side dependency only (``stream.wait_event``); it does not block the CPU.
+        Other GRGs' streams are unaffected because each backend has its own level streams.
+        After the event is consumed it is cleared so subsequent calls incur no overhead.
+        """
+        if not self._blocks_ready:
+            raise RuntimeError("prepare() must be called before run_up/run_down in swap_mode")
+        event = self._copy_ready_event
+        if event is None:
+            return
+        for stream in self._level_streams:
+            stream.wait_event(event)
+        for scratch_streams in self._scratch_streams_up_by_level:
+            for s in scratch_streams:
+                s.wait_event(event)
+        for scratch_streams in self._scratch_streams_down_by_level:
+            for s in scratch_streams:
+                s.wait_event(event)
+        self._copy_ready_event = None  # consumed; don't re-wait on subsequent calls
+
+    def finish(self) -> None:
+        """Free block index buffers and workspaces from GPU.
+
+        The CPU copies of the scipy matrices (``_A_blocks_cpu``) remain intact so
+        that ``prepare()`` can be called again later.  Safe to call even if
+        ``prepare()`` was never called.
+        Only meaningful when the backend was constructed with ``swap_mode=True``.
+        """
+        if not self._swap_mode:
+            return
+        self._destroy_workspace_cache()
+        self._clear_staging()
+        _destroy_block_grid(self._blocks_up, cslib=self._cslib)
+        _destroy_block_grid(self._blocks_down, cslib=self._cslib)
+        self._blocks_up = [[] for _ in range(self._H)]
+        self._blocks_down = [[] for _ in range(self._H)]
+        self._ops_up = [[] for _ in range(self._H)]
+        self._ops_down = [[] for _ in range(self._H)]
+        self._scratch_plan_up = []
+        self._scratch_plan_down = []
+        self._copy_ready_event = None
+        self._blocks_ready = False
+        self._sync_retained_root()
+        self._bump_retained_epoch()
 
     def __del__(self):
         cslib = getattr(self, "_cslib", None)
