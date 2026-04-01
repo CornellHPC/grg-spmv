@@ -13,10 +13,14 @@ def binary_csr_from_csr_parts(
     indices,
     indptr,
     shape: Sequence[int],
-    dtype: np.dtype,
     index_dtype: np.dtype,
 ) -> sp.csr_matrix:
-    """Build a CSR matrix from saved CSR arrays with binary values."""
+    """Build a binary CSR matrix from saved CSR arrays.
+
+    Data values are stored as bool (True = 1), saving 4–8× versus float32/64.
+    All backends either ignore the data array (cuSPARSE, Triton) or convert
+    it themselves (MKL casts to float64; Reference relies on scipy promotion).
+    """
     shape_tuple = tuple(int(v) for v in shape)
     if len(shape_tuple) != 2:
         raise ValueError(f"CSR shape must have 2 dimensions, got {shape_tuple}")
@@ -24,17 +28,14 @@ def binary_csr_from_csr_parts(
     ptr = np.asarray(indptr, dtype=index_dtype)
     if idx.ndim != 1 or ptr.ndim != 1:
         raise ValueError("CSR indices and indptr must be one-dimensional")
-    matrix = sp.csr_matrix(
+    return sp.csr_matrix(
         (
-            np.ones(int(idx.size), dtype=np.dtype(dtype)),
+            np.ones(int(idx.size), dtype=np.bool_),
             idx,
             ptr,
         ),
         shape=shape_tuple,
     )
-    if matrix.nnz > 0:
-        matrix.data.fill(1)
-    return matrix
 
 
 __all__ = ["binary_csr_from_csr_parts"]

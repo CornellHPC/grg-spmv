@@ -13,7 +13,7 @@ import scipy.sparse as sp
 from pygrgl_spmv.backends import BackendBase, ReferenceBackend, ReferencePlanPair
 from pygrgl_spmv.backends.types import Direction, InitMode, parse_direction
 from pygrgl_spmv.grg.artifact import artifact_path_for_grg, load_grg_spmv, save_grg_spmv
-from pygrgl_spmv.grg.compile import CompiledOperatorState, compile_grg
+from pygrgl_spmv.grg.compile import CompiledOperatorState, _rss_checkpoint, compile_grg
 from pygrgl_spmv.memory import (
     MemoryLedger,
     alloc_field,
@@ -125,9 +125,14 @@ class SpmvGRG:
 
     def _build_and_save_artifact(self, *, source_path: Path, artifact_path: Path) -> CompiledOperatorState:
         grg = pygrgl.load_immutable_grg(str(source_path), load_up_edges=False)
+        _rss_checkpoint("artifact: grg loaded / before compile_grg")
         compiled = compile_grg(grg, dtype=self._dtype, index_dtype=self._index_dtype)
+        del grg  # GRG C++ object no longer needed; free ~1-2 GB before init_biases
+        _rss_checkpoint("artifact: after compile_grg (grg freed) / before init_biases")
         self._build_init_biases(compiled)
+        _rss_checkpoint("artifact: after init_biases / before save")
         save_grg_spmv(compiled, artifact_path)
+        _rss_checkpoint("artifact: after save")
         return compiled
 
     def _build_init_biases(self, compiled: CompiledOperatorState) -> None:
