@@ -114,6 +114,8 @@ def make_mkl_backend(
 
 def make_cusparse_backend(
     *,
+    device,
+    stream=0,
     fmt_up="csr",
     fmt_down=None,
     k_hint=None,
@@ -189,6 +191,8 @@ def make_cusparse_backend(
         )
 
     return CusparseBackend(
+        device=device,
+        stream=stream,
         pair=CusparsePlanPair.from_dicts(plan_up, plan_down),
         log_level=log_level,
         instrumentation=instrumentation,
@@ -197,6 +201,8 @@ def make_cusparse_backend(
 
 def make_triton_backend(
     *,
+    device,
+    stream=0,
     fmt_up="csr",
     fmt_down=None,
     k_hint=1,
@@ -228,6 +234,8 @@ def make_triton_backend(
         plan_down = make_triton_plan(k_hint=k_hint, store="T", fmt=transpose_compatible_fmt(fmt_up), scratch=scratch_down)
 
     return TritonBackend(
+        device=device,
+        stream=stream,
         pair=TritonPlanPair.from_dicts(plan_up, plan_down),
         log_level=log_level,
         instrumentation=instrumentation,
@@ -258,6 +266,7 @@ def default_backend_builders(*, log_level="INFO", instrumentation=False):
         [
             pytest.param(
                 ("cusparse", lambda: make_cusparse_backend(
+                    device=0,
                     fmt_up="csr",
                     fmt_down="csc",
                     k_hint=None,
@@ -271,6 +280,7 @@ def default_backend_builders(*, log_level="INFO", instrumentation=False):
             ),
             pytest.param(
                 ("cusparse", lambda: make_cusparse_backend(
+                    device=0,
                     fmt_up="csr",
                     fmt_down="csc",
                     k_hint=4,
@@ -288,6 +298,7 @@ def default_backend_builders(*, log_level="INFO", instrumentation=False):
         params.append(
             pytest.param(
                 ("triton", lambda: make_triton_backend(
+                    device=0,
                     fmt_up="csr",
                     fmt_down="csc",
                     k_hint=1,

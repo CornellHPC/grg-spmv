@@ -13,7 +13,7 @@ import pytest
 
 from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlan, CusparsePlanPair, is_valid_combo
-from pygrgl_spmv.backends.types import Direction
+from pygrgl_spmv.backends.types import Direction, InitMode
 from pygrgl_spmv.memory import alloc_field, capture_snapshot, live_snapshot, tree_rows
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
@@ -37,6 +37,8 @@ _CACHE_DIR = Path(".pytest_cache") / "pygrgl_spmv_npz"
 def _make_op(
     grg_path,
     *,
+    device=0,
+    stream=0,
     fmt_up="csr",
     fmt_down=None,
     k_hint=None,
@@ -52,6 +54,8 @@ def _make_op(
     return SpmvGRG(
         grg_path,
         make_cusparse_backend(
+            device=device,
+            stream=stream,
             fmt_up=fmt_up,
             fmt_down=fmt_down,
             k_hint=k_hint,
@@ -76,6 +80,40 @@ def _run_down(op, X_col_major):
     return op.matmul(X_col_major.T, "down").T
 
 
+def _install_bridge_probe(monkeypatch, backend):
+    counts = {"entered": 0, "exited": 0}
+    original = type(backend)._caller_root_scope
+
+    @contextmanager
+    def _wrapped(self):
+        counts["entered"] += 1
+        with original(self):
+            try:
+                yield
+            finally:
+                counts["exited"] += 1
+
+    monkeypatch.setattr(type(backend), "_caller_root_scope", _wrapped)
+    return counts
+
+
+def _install_scope_depth_probe(monkeypatch, backend):
+    depth = {"value": 0}
+    original = type(backend)._caller_root_scope
+
+    @contextmanager
+    def _wrapped(self):
+        depth["value"] += 1
+        try:
+            with original(self):
+                yield
+        finally:
+            depth["value"] -= 1
+
+    monkeypatch.setattr(type(backend), "_caller_root_scope", _wrapped)
+    return depth
+
+
 def test_cupy_memory_accounting_uses_logical_bytes():
     @dataclass
     class _CupyRoot:
@@ -94,6 +132,57 @@ def test_cupy_memory_accounting_uses_logical_bytes():
     assert snapshot.allocations[0].nbytes == int(arr.nbytes)
 
 
+def test_cusparse_accepts_raw_null_stream():
+    backend = CusparseBackend(
+        device=0,
+        stream=0,
+        pair=CusparsePlanPair.from_dicts(make_cusparse_plan(k_hint=None, store="N", fmt="CSR", op_a="N", op_b="N", order_b="ROW", order_c="ROW", algo="DEFAULT"), None),
+        log_level="WARNING",
+    )
+    try:
+        assert backend._caller_stream_ptr == 0
+    finally:
+        del backend
+
+
+def test_cusparse_accepts_protocol_null_stream():
+    backend = CusparseBackend(
+        device=0,
+        stream=cp.cuda.Stream.null,
+        pair=CusparsePlanPair.from_dicts(make_cusparse_plan(k_hint=None, store="N", fmt="CSR", op_a="N", op_b="N", order_b="ROW", order_c="ROW", algo="DEFAULT"), None),
+        log_level="WARNING",
+    )
+    try:
+        assert backend._caller_stream_ptr == int(cp.cuda.Stream.null.ptr)
+        assert backend._root_stream.ptr != backend._caller_stream_ptr
+    finally:
+        del backend
+
+
+def test_cusparse_rejects_invalid_stream():
+    with pytest.raises(TypeError, match="__cuda_stream__"):
+        CusparseBackend(
+            device=0,
+            stream=object(),
+            pair=CusparsePlanPair.from_dicts(make_cusparse_plan(k_hint=None, store="N", fmt="CSR", op_a="N", op_b="N", order_b="ROW", order_c="ROW", algo="DEFAULT"), None),
+            log_level="WARNING",
+        )
+
+
+def test_cusparse_rejects_foreign_device_stream():
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("requires >=2 CUDA devices")
+    with cp.cuda.Device(1):
+        master = cp.cuda.Stream(non_blocking=True)
+    with pytest.raises(ValueError, match="requested CUDA device 0"):
+        CusparseBackend(
+            device=0,
+            stream=master,
+            pair=CusparsePlanPair.from_dicts(make_cusparse_plan(k_hint=None, store="N", fmt="CSR", op_a="N", op_b="N", order_b="ROW", order_c="ROW", algo="DEFAULT"), None),
+            log_level="WARNING",
+        )
+
+
 @pytest.mark.parametrize(
     "plan_up",
     [
@@ -105,7 +194,7 @@ def test_cupy_memory_accounting_uses_logical_bytes():
 def test_forward_explicit_dense_view_plans(primary_grg_path, gt_small, plan_up):
     op = SpmvGRG(
         primary_grg_path,
-        CusparseBackend(pair=CusparsePlanPair.from_dicts(plan_up, None), log_level="WARNING"),
+        CusparseBackend(device=0, stream=0, pair=CusparsePlanPair.from_dicts(plan_up, None), log_level="WARNING"),
         DATA_DTYPE,
         INDEX_DTYPE,
         artifact_dir=_CACHE_DIR,
@@ -126,7 +215,7 @@ def test_forward_explicit_dense_view_plans(primary_grg_path, gt_small, plan_up):
 def test_backward_explicit_dense_view_plans(primary_grg_path, gt_small, plan_down):
     op = SpmvGRG(
         primary_grg_path,
-        CusparseBackend(pair=CusparsePlanPair.from_dicts(None, plan_down), log_level="WARNING"),
+        CusparseBackend(device=0, stream=0, pair=CusparsePlanPair.from_dicts(None, plan_down), log_level="WARNING"),
         DATA_DTYPE,
         INDEX_DTYPE,
         artifact_dir=_CACHE_DIR,
@@ -227,6 +316,8 @@ def test_csr_alg3_rejects_csr_transpose_path(primary_grg_path):
         SpmvGRG(
             primary_grg_path,
             CusparseBackend(
+                device=0,
+                stream=0,
                 pair=CusparsePlanPair.from_dicts(
                     make_cusparse_plan(
                         k_hint=None,
@@ -343,6 +434,143 @@ def test_graph_workspaces_built_during_setup(primary_grg_path):
         row.path[:4] == ("cuda_live", "retained", "up", "k=4") and row.retention == "captured"
         for row in tree_rows(op.memory.retained)
     )
+
+
+def test_custom_master_stream_keeps_private_cusparse_root(primary_grg_path, gt_small):
+    with cp.cuda.Device(0):
+        master = cp.cuda.Stream(non_blocking=True)
+    op = _make_op(primary_grg_path, stream=master, fmt_up="csr", fmt_down="csc", k_hint=4)
+    backend = op._backend
+    x_up, y_up = gt_small.get("forward", 4, seed=5113, dtype=DATA_DTYPE)
+    atol, rtol = tol(DATA_DTYPE)
+    np.testing.assert_allclose(_run_up(op, x_up), y_up, atol=atol, rtol=rtol)
+    assert backend._caller_stream_ptr == int(master.ptr)
+    assert backend._root_stream.ptr != int(master.ptr)
+    assert backend._workspaces.graph_up is not None
+    assert backend._workspaces.graph_up.graph is not None
+
+
+def test_cusparse_setup_and_run_stay_on_declared_device_after_device_switch(primary_grg_path, gt_small):
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("requires >=2 CUDA devices")
+    with cp.cuda.Device(0):
+        backend = make_cusparse_backend(device=0, fmt_up="csr", fmt_down="csc", k_hint=1)
+    with cp.cuda.Device(1):
+        op = SpmvGRG(
+            primary_grg_path,
+            backend,
+            DATA_DTYPE,
+            INDEX_DTYPE,
+            artifact_dir=_CACHE_DIR,
+        )
+        x_up, y_up = gt_small.get("forward", 1, seed=5114, dtype=DATA_DTYPE)
+        atol, rtol = tol(DATA_DTYPE)
+        np.testing.assert_allclose(_run_up(op, x_up), y_up, atol=atol, rtol=rtol)
+    assert backend._alpha is not None
+    assert int(backend._alpha.device.id) == 0
+    ws = backend._workspaces.graph_up
+    assert ws is not None
+    assert int(ws.input_primary.device.id) == 0
+    assert int(ws.dense.level_bufs[0].device.id) == 0
+
+
+def test_cusparse_setup_gpu_allocations_run_inside_caller_root_scope(primary_grg_path, monkeypatch):
+    backend = make_cusparse_backend(device=0, fmt_up="csr", fmt_down="csc", k_hint=4)
+    depth = _install_scope_depth_probe(monkeypatch, backend)
+    seen = {"blocks": 0, "workspace": 0}
+    original_build_blocks = type(backend)._build_direction_blocks
+    original_alloc_workspace = type(backend)._alloc_workspace
+
+    def _wrapped_build_blocks(self, *, direction):
+        assert depth["value"] > 0
+        seen["blocks"] += 1
+        return original_build_blocks(self, direction=direction)
+
+    def _wrapped_alloc_workspace(self, direction, k, *, captured):
+        assert depth["value"] > 0
+        seen["workspace"] += 1
+        return original_alloc_workspace(self, direction, k, captured=captured)
+
+    monkeypatch.setattr(type(backend), "_build_direction_blocks", _wrapped_build_blocks)
+    monkeypatch.setattr(type(backend), "_alloc_workspace", _wrapped_alloc_workspace)
+
+    op = SpmvGRG(
+        primary_grg_path,
+        backend,
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=_CACHE_DIR,
+    )
+
+    assert seen["blocks"] >= 2
+    assert seen["workspace"] >= 2
+    del op
+
+
+def test_cusparse_run_direction_restores_caller_root_scope_on_missing_graph(primary_grg_path, monkeypatch):
+    op = _make_op(primary_grg_path, fmt_up="csr", fmt_down=None, k_hint=4)
+    backend = op._backend
+    ws = backend._workspaces.graph_up
+    assert ws is not None
+    counts = _install_bridge_probe(monkeypatch, backend)
+    ws.graph = None
+
+    with pytest.raises(RuntimeError, match="Missing captured UP CUDA graph"):
+        backend._run_direction(
+            Direction.UP,
+            np.ones((op.num_samples, 4), dtype=DATA_DTYPE),
+            miss=None,
+            init_mode=InitMode.NONE,
+            init=None,
+            need_miss_output=False,
+            emit_all_nodes=False,
+        )
+
+    assert counts == {"entered": 1, "exited": 1}
+
+
+def test_cusparse_dynamic_workspace_allocates_inside_caller_root_scope(primary_grg_path, gt_small, monkeypatch):
+    op = _make_op(primary_grg_path, fmt_up="csr", k_hint=None)
+    backend = op._backend
+    depth = _install_scope_depth_probe(monkeypatch, backend)
+    calls = {"count": 0}
+    original = type(backend)._alloc_workspace
+
+    def _wrapped(self, direction, k, *, captured):
+        calls["count"] += 1
+        assert depth["value"] > 0
+        return original(self, direction, k, captured=captured)
+
+    monkeypatch.setattr(type(backend), "_alloc_workspace", _wrapped)
+
+    X, _ = gt_small.get("forward", 1, seed=5006, dtype=DATA_DTYPE)
+    _ = _run_up(op, X)
+
+    assert calls == {"count": 1}
+
+
+def test_cusparse_build_wavefront_graph_restores_caller_root_scope_on_capture_failure(primary_grg_path, monkeypatch):
+    op = _make_op(primary_grg_path, fmt_up="csr", fmt_down=None, k_hint=4)
+    backend = op._backend
+    with backend._root_stream:
+        ws = backend._alloc_workspace(Direction.UP, 4, captured=True)
+    counts = _install_bridge_probe(monkeypatch, backend)
+    original = backend._launch_wavefront
+    calls = {"count": 0}
+
+    def _boom(ws):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("capture enqueue failed")
+        return original(ws)
+
+    monkeypatch.setattr(backend, "_launch_wavefront", _boom)
+
+    with pytest.raises(RuntimeError, match="capture enqueue failed"):
+        backend._build_wavefront_graph(ws)
+
+    assert counts == {"entered": 1, "exited": 1}
+    ws.destroy(cslib=backend._cslib)
 
 
 def test_graph_workspace_keeps_optional_buffers_lazy(primary_grg_path):
@@ -478,7 +706,7 @@ def test_transpose_compatible_storage_aliases_payload_but_not_descriptors(primar
     )
     op = SpmvGRG(
         primary_grg_path,
-        CusparseBackend(pair=CusparsePlanPair.from_dicts(up, down), log_level="WARNING"),
+        CusparseBackend(device=0, stream=0, pair=CusparsePlanPair.from_dicts(up, down), log_level="WARNING"),
         DATA_DTYPE,
         INDEX_DTYPE,
         artifact_dir=_CACHE_DIR,
@@ -866,6 +1094,8 @@ def test_runtime_logging_reports_versions_and_warns_for_non_doc_cuda(caplog, mon
     try:
         with caplog.at_level(logging.INFO):
             backend = cusparse_backend.CusparseBackend(
+                device=0,
+                stream=0,
                 pair=cusparse_backend.CusparsePlanPair.from_dicts(
                     make_cusparse_plan(
                         k_hint=None,
@@ -899,6 +1129,8 @@ def test_runtime_logging_skips_warning_for_doc_cuda(caplog, monkeypatch):
     try:
         with caplog.at_level(logging.INFO):
             backend = cusparse_backend.CusparseBackend(
+                device=0,
+                stream=0,
                 pair=cusparse_backend.CusparsePlanPair.from_dicts(
                     make_cusparse_plan(
                         k_hint=None,
@@ -930,8 +1162,8 @@ def test_cusparse_buffer_size_warning_on_plan_disagreement(primary_grg_path, mon
     monkeypatch.setattr(type(backend._plan_up), "need_buffer", property(lambda self: False))
     monkeypatch.setattr(backend._cslib, "spmm_buffer_size", lambda *args: 8)
     monkeypatch.setattr(backend._cslib, "spmm_preprocess", lambda *args: None)
-    with caplog.at_level(logging.WARNING):
-        ws = backend._build_direction_workspace(Direction.UP, 1, use_graph_descs=False)
+    with caplog.at_level(logging.WARNING), backend._root_stream:
+        ws = backend._alloc_workspace(Direction.UP, 1, captured=False)
     try:
         messages = [rec.getMessage() for rec in caplog.records]
         assert any("bufferSize disagrees with plan.need_buffer" in msg for msg in messages)
@@ -946,7 +1178,8 @@ def test_cusparse_skips_preprocess_when_plan_disables_it(primary_grg_path, monke
     monkeypatch.setattr(backend._cslib, "spmm_buffer_size", lambda *args: 8)
     calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(backend._cslib, "spmm_preprocess", lambda *args: calls.append(args))
-    ws = backend._build_direction_workspace(Direction.UP, 1, use_graph_descs=False)
+    with backend._root_stream:
+        ws = backend._alloc_workspace(Direction.UP, 1, captured=False)
     try:
         assert calls == []
     finally:

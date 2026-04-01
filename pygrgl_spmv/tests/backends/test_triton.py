@@ -6,13 +6,14 @@ from contextlib import contextmanager
 import logging
 import numpy as np
 import pytest
+import warnings
 
 from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.backends.triton import TritonBackend, TritonPlanPair
 from pygrgl_spmv.backends import iter_direction_level_pairs
 from pygrgl_spmv.backends.triton.backend import _AUTOTUNE_CACHE
 from pygrgl_spmv.backends.triton.kernel import CscKernelConfig, CsrKernelConfig
-from pygrgl_spmv.backends.types import Direction
+from pygrgl_spmv.backends.types import Direction, InitMode
 from pygrgl_spmv.memory import live_snapshot
 from pygrgl_spmv.tests.conftest import DATA_DTYPE, HAS_TRITON_RUNTIME, INDEX_DTYPE, make_triton_backend, make_triton_plan
 
@@ -24,10 +25,20 @@ if not torch.cuda.is_available():
 pytestmark = [pytest.mark.gpu, pytest.mark.triton]
 
 
+class _ProtocolStream:
+    def __init__(self, ptr: int) -> None:
+        self._ptr = int(ptr)
+
+    def __cuda_stream__(self) -> tuple[int, int]:
+        return 0, self._ptr
+
+
 def _make_op(
     grg_path,
     *,
     cache_dir,
+    device=0,
+    stream=0,
     fmt_up="csr",
     fmt_down="csc",
     k_hint=1,
@@ -40,6 +51,8 @@ def _make_op(
     return SpmvGRG(
         grg_path,
         make_triton_backend(
+            device=device,
+            stream=stream,
             fmt_up=fmt_up,
             fmt_down=fmt_down,
             k_hint=k_hint,
@@ -63,6 +76,103 @@ def _first_present_block(grid):
     raise AssertionError("expected at least one non-empty Triton block")
 
 
+def _install_bridge_probe(monkeypatch, backend):
+    counts = {"entered": 0, "exited": 0}
+    original = type(backend)._caller_root_scope
+
+    @contextmanager
+    def _wrapped(self):
+        counts["entered"] += 1
+        with original(self):
+            try:
+                yield
+            finally:
+                counts["exited"] += 1
+
+    monkeypatch.setattr(type(backend), "_caller_root_scope", _wrapped)
+    return counts
+
+
+def _install_scope_depth_probe(monkeypatch, backend):
+    depth = {"value": 0}
+    original = type(backend)._caller_root_scope
+
+    @contextmanager
+    def _wrapped(self):
+        depth["value"] += 1
+        try:
+            with original(self):
+                yield
+        finally:
+            depth["value"] -= 1
+
+    monkeypatch.setattr(type(backend), "_caller_root_scope", _wrapped)
+    return depth
+
+
+def test_triton_accepts_raw_null_stream():
+    backend = TritonBackend(
+        device=0,
+        stream=0,
+        pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+        log_level="WARNING",
+    )
+    assert backend._caller_stream_ptr == 0
+    assert backend._caller_stream_keepalive is None
+
+
+def test_triton_accepts_protocol_null_stream_and_retains_owner():
+    stream = _ProtocolStream(0)
+    backend = TritonBackend(
+        device=0,
+        stream=stream,
+        pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+        log_level="WARNING",
+    )
+    assert backend._caller_stream_ptr == 0
+    assert backend._caller_stream_keepalive is stream
+
+
+def test_triton_accepts_torch_stream_and_retains_owner():
+    with torch.cuda.device(0):
+        master = torch.cuda.Stream()
+    if not hasattr(master, "__cuda_stream__"):
+        pytest.skip("torch.cuda.Stream() does not expose __cuda_stream__() in this build")
+    backend = TritonBackend(
+        device=0,
+        stream=master,
+        pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+        log_level="WARNING",
+    )
+    assert backend._caller_stream_keepalive is master
+
+
+def test_triton_rejects_invalid_stream():
+    with pytest.raises(TypeError, match="__cuda_stream__"):
+        TritonBackend(
+            device=0,
+            stream=object(),
+            pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+            log_level="WARNING",
+        )
+
+
+def test_triton_rejects_foreign_device_stream():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires >=2 CUDA devices")
+    with torch.cuda.device(1):
+        master = torch.cuda.Stream()
+    if not hasattr(master, "__cuda_stream__"):
+        pytest.skip("torch.cuda.Stream() does not expose __cuda_stream__() in this build")
+    with pytest.raises(ValueError, match="requested CUDA device 0"):
+        TritonBackend(
+            device=0,
+            stream=master,
+            pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+            log_level="WARNING",
+        )
+
+
 @pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
 def test_triton_graphs_created_after_setup(primary_grg_path, spmv_cache_dir):
     op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir)
@@ -71,6 +181,46 @@ def test_triton_graphs_created_after_setup(primary_grg_path, spmv_cache_dir):
     assert backend._workspaces.graph_down is not None
     assert backend._workspaces.graph_up.graph is not None
     assert backend._workspaces.graph_down.graph is not None
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_accepts_foreign_cupy_stream_and_keeps_private_root(primary_grg_path, gt_small, spmv_cache_dir):
+    cp = pytest.importorskip("cupy")
+
+    with cp.cuda.Device(0):
+        master = cp.cuda.Stream(non_blocking=True)
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, stream=master)
+    backend = op._backend
+    x_up, y_up = gt_small.get("forward", 1, seed=128, dtype=DATA_DTYPE)
+    np.testing.assert_allclose(op.matmul(x_up.T, "up").T, y_up, atol=1e-5, rtol=1e-5)
+    assert backend._workspaces.graph_up is not None
+    assert backend._caller_stream_ptr == int(master.ptr)
+    assert backend._caller_stream_keepalive is master
+    assert int(backend._root_stream.cuda_stream) != int(master.ptr)
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_setup_and_run_stay_on_declared_device_after_device_switch(primary_grg_path, gt_small, spmv_cache_dir):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires >=2 CUDA devices")
+    with torch.cuda.device(0):
+        backend = make_triton_backend(device=0, fmt_up="csr", fmt_down="csc", k_hint=1)
+    with torch.cuda.device(1):
+        op = SpmvGRG(
+            primary_grg_path,
+            backend,
+            DATA_DTYPE,
+            INDEX_DTYPE,
+            artifact_dir=spmv_cache_dir,
+        )
+        x_up, y_up = gt_small.get("forward", 1, seed=129, dtype=DATA_DTYPE)
+        np.testing.assert_allclose(op.matmul(x_up.T, "up").T, y_up, atol=1e-5, rtol=1e-5)
+    assert backend._sel_mut_rows_gpu.device.index == 0
+    assert backend._sel_mut_cols_gpu.device.index == 0
+    ws = backend._workspaces.graph_up
+    assert ws is not None
+    assert ws.node_state.device.index == 0
+    assert ws.input_primary.device.index == 0
 
 
 @pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
@@ -174,12 +324,180 @@ def test_triton_incompatible_formats_do_not_alias_block_tensors(primary_grg_path
 def test_triton_capture_failure_is_hard_error(primary_grg_path, spmv_cache_dir, monkeypatch):
     from pygrgl_spmv.backends.triton import TritonBackend
 
-    def _boom(self, direction, ws, config):
-        raise RuntimeError(f"capture failed for {direction.value}")
+    def _boom(self, ws, config):
+        raise RuntimeError(f"capture failed for {ws.direction.value}")
 
-    monkeypatch.setattr(TritonBackend, "_capture_wavefront_graph", _boom)
+    monkeypatch.setattr(TritonBackend, "_build_wavefront_graph", _boom)
     with pytest.raises(RuntimeError, match="capture failed"):
         _ = _make_op(primary_grg_path, cache_dir=spmv_cache_dir)
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_setup_gpu_allocations_run_inside_caller_root_scope(primary_grg_path, spmv_cache_dir, monkeypatch):
+    backend = make_triton_backend(device=0, fmt_up="csr", fmt_down="csc", k_hint=1)
+    depth = _install_scope_depth_probe(monkeypatch, backend)
+    seen = {"blocks": 0, "workspace": 0}
+    original_build_blocks = type(backend)._build_direction_blocks
+    original_alloc_workspace = type(backend)._alloc_workspace
+
+    def _wrapped_build_blocks(self, direction):
+        assert depth["value"] > 0
+        seen["blocks"] += 1
+        return original_build_blocks(self, direction)
+
+    def _wrapped_alloc_workspace(self, direction):
+        assert depth["value"] > 0
+        seen["workspace"] += 1
+        return original_alloc_workspace(self, direction)
+
+    monkeypatch.setattr(type(backend), "_build_direction_blocks", _wrapped_build_blocks)
+    monkeypatch.setattr(type(backend), "_alloc_workspace", _wrapped_alloc_workspace)
+
+    _ = SpmvGRG(
+        primary_grg_path,
+        backend,
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=spmv_cache_dir,
+    )
+
+    assert seen["blocks"] >= 2
+    assert seen["workspace"] >= 4
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_tune_once_restores_caller_root_scope_on_failure(primary_grg_path, spmv_cache_dir, monkeypatch):
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, fmt_up="csr", fmt_down=None, infer_missing=False)
+    backend = op._backend
+    with torch.cuda.stream(backend._root_stream):
+        ws = backend._alloc_workspace(Direction.UP)
+    counts = _install_bridge_probe(monkeypatch, backend)
+
+    def _boom(ws, *, config):
+        raise RuntimeError("wavefront failed")
+
+    monkeypatch.setattr(backend, "_launch_wavefront", _boom)
+
+    with pytest.raises(RuntimeError, match="wavefront failed"):
+        backend._tune_once(ws, backend._config_up)
+
+    assert counts == {"entered": 1, "exited": 1}
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_tune_direction_restores_caller_root_scope_on_upload_failure(primary_grg_path, spmv_cache_dir, monkeypatch):
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, fmt_up="csr", fmt_down=None, infer_missing=False)
+    backend = op._backend
+    with torch.cuda.stream(backend._root_stream):
+        ws = backend._alloc_workspace(Direction.UP)
+    counts = _install_bridge_probe(monkeypatch, backend)
+    _AUTOTUNE_CACHE.clear()
+
+    class _BrokenCopy:
+        def copy_(self, other):
+            raise RuntimeError("upload failed")
+
+    ws.input_primary = _BrokenCopy()
+
+    with pytest.raises(RuntimeError, match="upload failed"):
+        backend._tune_direction(Direction.UP, ws)
+
+    assert counts == {"entered": 1, "exited": 1}
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_build_wavefront_graph_restores_caller_root_scope_on_capture_failure(primary_grg_path, spmv_cache_dir, monkeypatch):
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, fmt_up="csr", fmt_down=None, infer_missing=False)
+    backend = op._backend
+    with torch.cuda.stream(backend._root_stream):
+        ws = backend._alloc_workspace(Direction.UP)
+    counts = _install_bridge_probe(monkeypatch, backend)
+    original = backend._launch_wavefront
+    calls = {"count": 0}
+
+    def _boom(ws, *, config):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("capture enqueue failed")
+        return original(ws, config=config)
+
+    monkeypatch.setattr(backend, "_launch_wavefront", _boom)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="The CUDA Graph is empty.*", category=UserWarning)
+        with pytest.raises(RuntimeError, match="capture enqueue failed"):
+            backend._build_wavefront_graph(ws, backend._config_up)
+
+    assert counts == {"entered": 2, "exited": 2}
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_run_column_restores_caller_root_scope_on_missing_graph(primary_grg_path, spmv_cache_dir, monkeypatch):
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir)
+    backend = op._backend
+    ws = backend._workspaces.graph_up
+    assert ws is not None
+    counts = _install_bridge_probe(monkeypatch, backend)
+    ws.graph = None
+
+    with pytest.raises(RuntimeError, match="Missing Triton graph workspace"):
+        backend._run_column(
+            Direction.UP,
+            primary_col=np.ones((op.num_samples,), dtype=DATA_DTYPE),
+            miss_col=None,
+            init_mode=InitMode.NONE,
+            init_value=None,
+            need_miss_output=False,
+            emit_all_nodes=False,
+        )
+
+    assert counts == {"entered": 1, "exited": 1}
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_run_column_restores_caller_root_scope_on_gather_failure(primary_grg_path, spmv_cache_dir, monkeypatch):
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, k_hint=None)
+    backend = op._backend
+    counts = _install_bridge_probe(monkeypatch, backend)
+
+    def _boom(ws, staging, *, need_miss_output):
+        raise RuntimeError("gather failed")
+
+    monkeypatch.setattr(backend, "_enqueue_output_gather", _boom)
+
+    with pytest.raises(RuntimeError, match="gather failed"):
+        backend._run_column(
+            Direction.UP,
+            primary_col=np.ones((op.num_samples,), dtype=DATA_DTYPE),
+            miss_col=None,
+            init_mode=InitMode.NONE,
+            init_value=None,
+            need_miss_output=False,
+            emit_all_nodes=False,
+        )
+
+    assert counts == {"entered": 1, "exited": 1}
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_dynamic_workspace_allocates_inside_caller_root_scope(primary_grg_path, spmv_cache_dir, monkeypatch):
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, k_hint=None)
+    backend = op._backend
+    depth = _install_scope_depth_probe(monkeypatch, backend)
+    calls = {"count": 0}
+    original = type(backend)._alloc_workspace
+
+    def _wrapped(self, direction):
+        calls["count"] += 1
+        assert depth["value"] > 0
+        return original(self, direction)
+
+    monkeypatch.setattr(type(backend), "_alloc_workspace", _wrapped)
+
+    x_up = np.ones((1, op.num_samples), dtype=DATA_DTYPE)
+    _ = op.matmul(x_up, "up")
+
+    assert calls == {"count": 1}
 
 
 @pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
@@ -228,8 +546,12 @@ def test_triton_scratch_buffers_allocated_for_enabled_levels(primary_grg_path, s
     ws_up = backend._workspaces.graph_up
     ws_down = backend._workspaces.graph_down
     assert ws_up is not None and ws_down is not None
+    assert not hasattr(ws_up, "level_streams")
+    assert not hasattr(ws_up, "scratch_streams_by_level")
+    assert len(backend._level_streams) == len(backend._level_offsets) - 1
+    assert len(backend._scratch_streams_up_by_level[1]) == len(backend._ops_up[1])
+    assert len(backend._scratch_streams_down_by_level[0]) == len(backend._ops_down[0])
     assert len(ws_up.scratch_views_by_level[1]) == len(backend._ops_up[1]) > 0
-    assert len(ws_up.scratch_streams_by_level[1]) == len(backend._ops_up[1])
     assert len(ws_up.scratch_done_events_by_level[1]) == len(backend._ops_up[1])
     assert ws_up.scratch_views_by_level[0] == []
     assert len(ws_down.scratch_views_by_level[0]) == len(backend._ops_down[0]) > 0

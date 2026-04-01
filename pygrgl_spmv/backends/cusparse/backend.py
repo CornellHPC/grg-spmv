@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from contextlib import contextmanager
 from ctypes import c_void_p
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -42,6 +43,12 @@ from pygrgl_spmv.backends import (
     selector_rows_unique_from_csr_indptr,
     warn_instrumentation_ignores_k_hint,
     warn_k_hint_mismatch,
+)
+from pygrgl_spmv.backends._cuda_stream import (
+    CudaStreamToken,
+    _cuda_stream_device,
+    parse_cuda_device,
+    parse_cuda_stream,
 )
 from pygrgl_spmv.backends._nvtx import make_cupy_tracer
 from pygrgl_spmv.backends.cusparse.ffi import (
@@ -363,10 +370,10 @@ class _DirectionWorkspace:
 
     direction: Direction = ignore_field()
     k: int = ignore_field()
-    use_graph_descs: bool = ignore_field()
+    captured: bool = ignore_field()
     dense: _DenseState = child_field()
-    fork_event: CupyEvent = ignore_field()
-    ready_events: list[CupyEvent] = ignore_field()
+    launch_event: CupyEvent = ignore_field()
+    level_done_events: list[CupyEvent] = ignore_field()
     spmm_ext_by_level: list[list[CupyArray | None]] = alloc_field(label="spmm_ext", kind="auxiliary")
     scratch_views_by_level: list[list[CupyArray]] = alloc_field(label="scratch_views", kind="scratch")
     scratch_dst_descs_by_level: list[list[c_void_p]] = ignore_field()
@@ -526,14 +533,6 @@ def _build_dense_state(
         )
     return _DenseState(level_bufs=level_bufs, dst_descs=dst_descs, src_descs=src_descs, src_bufs=src_bufs)
 
-
-def _dense_state_nbytes(dense: _DenseState) -> int:
-    total = int(sum(int(buf.nbytes) for buf in dense.level_bufs))
-    if dense.src_bufs is not None:
-        total += int(sum(int(buf.nbytes) for buf in dense.src_bufs))
-    return total
-
-
 def _iter_unique_blocks(*grids: list[list[_CuBlock | None]]) -> Any:
     seen: set[tuple[int, int, int, str, int, int]] = set()
     for grid in grids:
@@ -592,6 +591,8 @@ class CusparseBackend(BackendBase):
     def __init__(
         self,
         *,
+        device: int,
+        stream: object,
         pair: CusparsePlanPair,
         log_level: str = "WARNING",
         instrumentation: bool = False,
@@ -617,7 +618,20 @@ class CusparseBackend(BackendBase):
         self._cslib = CuSparseLib()
         runtime_version = cusparse_plan._runtime_cuda_version()
         runtime_token = ".".join(str(part) for part in runtime_version)
-        self._capture_stream: CupyStream = self._cp.cuda.Stream(non_blocking=True)
+        self._device_id = parse_cuda_device(device)
+        self._cuda_device = self._cp.cuda.Device(self._device_id)
+        self._caller_stream_ptr, self._caller_stream_keepalive = parse_cuda_stream(stream)
+        if self._caller_stream_ptr != 0:
+            stream_device = _cuda_stream_device(self._caller_stream_ptr)
+            if stream_device != self._device_id:
+                raise ValueError(
+                    f"CUDA stream device {stream_device} does not match requested CUDA device {self._device_id}"
+                )
+        with self._cuda_device:
+            self._caller_stream: CupyStream = self._make_caller_stream()
+            self._caller_to_root_event: CupyEvent = self._cp.cuda.Event()
+            self._root_to_caller_event: CupyEvent = self._cp.cuda.Event()
+            self._root_stream: CupyStream = self._cp.cuda.Stream(non_blocking=True)
         self._level_streams: list[CupyStream] = []
         self._scratch_streams_up_by_level: list[list[CupyStream]] = []
         self._scratch_streams_down_by_level: list[list[CupyStream]] = []
@@ -645,7 +659,6 @@ class CusparseBackend(BackendBase):
 
         self._mut_selector: _SelectorLevels | None = None
         self._miss_selector: _SelectorLevels | None = None
-        self._static_workspace_slots: set[str] = set()
         self._workspaces = _WorkspaceCache()
         self._staging_up_by_k: dict[int, _DirectionStaging] = {}
         self._staging_down_by_k: dict[int, _DirectionStaging] = {}
@@ -738,13 +751,37 @@ class CusparseBackend(BackendBase):
         retained.staging_up_by_k = self._staging_up_by_k
         retained.staging_down_by_k = self._staging_down_by_k
 
+    def _make_caller_stream(self) -> CupyStream:
+        if self._caller_stream_ptr == 0:
+            return self._cp.cuda.Stream.null
+        if hasattr(self._cp.cuda.Stream, "from_external"):
+            token = self._caller_stream_keepalive
+            if token is None:
+                token = CudaStreamToken(self._caller_stream_ptr)
+                self._caller_stream_keepalive = token
+            return self._cp.cuda.Stream.from_external(token)
+        return self._cp.cuda.ExternalStream(self._caller_stream_ptr, device_id=self._device_id)
+
+    @contextmanager
+    def _caller_root_scope(self):
+        with self._cuda_device:
+            with self._caller_stream:
+                self._caller_to_root_event.record(self._caller_stream)
+            self._root_stream.wait_event(self._caller_to_root_event)
+            try:
+                yield
+            finally:
+                with self._root_stream:
+                    self._root_to_caller_event.record(self._root_stream)
+                self._caller_stream.wait_event(self._root_to_caller_event)
+
     def _max_block_nnz(self) -> int:
         return max((int(block.nnz) for row in self._A_blocks for block in row), default=0)
 
     def _build_materialized_shared_ones(self, max_nnz: int) -> _SharedOnes:
-        with self._capture_stream:
+        with self._root_stream:
             arr = self._cp.ones((int(max_nnz),), dtype=self._dtype)
-        self._capture_stream.synchronize()
+        self._root_stream.synchronize()
         return _SharedOnes(
             ptr=int(arr.data.ptr),
             logical_nbytes=int(arr.nbytes),
@@ -775,9 +812,9 @@ class CusparseBackend(BackendBase):
             init_mem = self._cp.cuda.UnownedMemory(vaddr, tile_nbytes, init_owner, device_id)
             init_ptr = self._cp.cuda.MemoryPointer(init_mem, 0)
             init_tile = self._cp.ndarray((tile_nbytes // itemsize,), dtype=self._dtype, memptr=init_ptr)
-            with self._capture_stream:
+            with self._root_stream:
                 init_tile.fill(1)
-            self._capture_stream.synchronize()
+            self._root_stream.synchronize()
             return _SharedOnes(
                 ptr=vaddr,
                 logical_nbytes=logical_nbytes,
@@ -816,7 +853,7 @@ class CusparseBackend(BackendBase):
         logical_nbytes = int(max_nnz) * itemsize
         try:
             driver = CudaVmmDriver()
-            device_id = int(self._cp.cuda.Device().id)
+            device_id = self._device_id
             current_context = driver.current_context()
             if current_context is None:
                 values = self._build_materialized_shared_ones(max_nnz)
@@ -946,37 +983,41 @@ class CusparseBackend(BackendBase):
 
         if self._cuda_dtype is None:
             raise RuntimeError("CUDA dtype not initialized")
-        self._alpha = self._cp.ones(1, dtype=self._dtype)
-        self._beta_zero = self._cp.zeros(1, dtype=self._dtype)
-        self._beta_one = self._cp.ones(1, dtype=self._dtype)
-        self._shared_ones = self._build_shared_ones()
+        with self._caller_root_scope():
+            with self._root_stream:
+                self._alpha = self._cp.ones(1, dtype=self._dtype)
+                self._beta_zero = self._cp.zeros(1, dtype=self._dtype)
+                self._beta_one = self._cp.ones(1, dtype=self._dtype)
+                self._shared_ones = self._build_shared_ones()
 
-        self._blocks_up = self._build_direction_blocks(direction=Direction.UP)
-        self._blocks_down = self._build_direction_blocks(direction=Direction.DOWN)
-        self._ops_up = self._build_direction_ops(Direction.UP)
-        self._ops_down = self._build_direction_ops(Direction.DOWN)
-        self._scratch_plan_up = self._build_scratch_level_plans(Direction.UP) if self._plan_up is not None else []
-        self._scratch_plan_down = self._build_scratch_level_plans(Direction.DOWN) if self._plan_down is not None else []
+                self._blocks_up = self._build_direction_blocks(direction=Direction.UP)
+                self._blocks_down = self._build_direction_blocks(direction=Direction.DOWN)
 
-        self._mut_selector = _SelectorLevels.from_csr(
-            cp=self._cp,
-            selector=self._sel_mut,
-            level_offsets=self._level_offsets,
-            H=self._H,
-        )
-        self._miss_selector = _SelectorLevels.from_csr(
-            cp=self._cp,
-            selector=self._sel_miss,
-            level_offsets=self._level_offsets,
-            H=self._H,
-        )
-        self._level_streams = [self._cp.cuda.Stream(non_blocking=True) for _ in range(self._H)]
-        self._scratch_streams_up_by_level = (
-            self._build_scratch_streams(Direction.UP) if self._plan_up is not None else [[] for _ in range(self._H)]
-        )
-        self._scratch_streams_down_by_level = (
-            self._build_scratch_streams(Direction.DOWN) if self._plan_down is not None else [[] for _ in range(self._H)]
-        )
+                self._mut_selector = _SelectorLevels.from_csr(
+                    cp=self._cp,
+                    selector=self._sel_mut,
+                    level_offsets=self._level_offsets,
+                    H=self._H,
+                )
+                self._miss_selector = _SelectorLevels.from_csr(
+                    cp=self._cp,
+                    selector=self._sel_miss,
+                    level_offsets=self._level_offsets,
+                    H=self._H,
+                )
+
+            self._ops_up = self._build_direction_ops(Direction.UP)
+            self._ops_down = self._build_direction_ops(Direction.DOWN)
+            self._scratch_plan_up = self._build_scratch_level_plans(Direction.UP) if self._plan_up is not None else []
+            self._scratch_plan_down = self._build_scratch_level_plans(Direction.DOWN) if self._plan_down is not None else []
+        with self._cuda_device:
+            self._level_streams = [self._cp.cuda.Stream(non_blocking=True) for _ in range(self._H)]
+            self._scratch_streams_up_by_level = (
+                self._build_scratch_streams(Direction.UP) if self._plan_up is not None else [[] for _ in range(self._H)]
+            )
+            self._scratch_streams_down_by_level = (
+                self._build_scratch_streams(Direction.DOWN) if self._plan_down is not None else [[] for _ in range(self._H)]
+            )
 
         for direction in self._configured_directions():
             self._log_block_memory(direction)
@@ -997,7 +1038,6 @@ class CusparseBackend(BackendBase):
         )
 
         self._workspaces = _WorkspaceCache()
-        self._static_workspace_slots = set()
         for direction in self._configured_directions():
             plan = self._require_plan(direction)
             hint = effective_k_hint(instrumentation=self._instrumentation, k_hint=plan.k_hint)
@@ -1005,11 +1045,14 @@ class CusparseBackend(BackendBase):
                 warn_instrumentation_ignores_k_hint(backend="cuSPARSE", direction=direction, k_hint=int(plan.k_hint))
             if hint is None:
                 continue
-            slot = self._workspace_slot(direction, graph=True)
-            ws = self._build_direction_workspace(direction, int(hint), use_graph_descs=True)
-            ws.graph = self._capture_wavefront_graph(ws)
-            setattr(self._workspaces, slot, ws)
-            self._static_workspace_slots.add(slot)
+            with self._caller_root_scope():
+                with self._root_stream:
+                    ws = self._alloc_workspace(direction, int(hint), captured=True)
+            ws.graph = self._build_wavefront_graph(ws)
+            if direction == Direction.UP:
+                self._workspaces.graph_up = ws
+            else:
+                self._workspaces.graph_down = ws
         self._sync_retained_root()
         self._bump_retained_epoch()
         self._assert_setup_memory_contract()
@@ -1188,16 +1231,15 @@ class CusparseBackend(BackendBase):
     def _scratch_streams_for(self, direction: Direction) -> list[list[CupyStream]]:
         return self._scratch_streams_up_by_level if direction == Direction.UP else self._scratch_streams_down_by_level
 
-    def _await_direction_streams(self, direction: Direction) -> None:
-        # Host-visible output collection must wait for all streams participating in a traversal,
-        # not just the capture stream that launches the final gather/copy.
-        self._capture_stream.synchronize()
-        for stream in self._level_streams:
-            stream.synchronize()
-        for scratch_streams in self._scratch_streams_for(direction):
-            for stream in scratch_streams:
+    def _await_worker_streams(self, direction: Direction) -> None:
+        with self._cuda_device:
+            self._root_stream.synchronize()
+            for stream in self._level_streams:
                 stream.synchronize()
-        self._capture_stream.synchronize()
+            for scratch_streams in self._scratch_streams_for(direction):
+                for stream in scratch_streams:
+                    stream.synchronize()
+            self._root_stream.synchronize()
 
     def _resolve_scratch_levels(self, direction: Direction) -> frozenset[int]:
         plan = self._require_plan(direction)
@@ -1226,12 +1268,13 @@ class CusparseBackend(BackendBase):
         return plans
 
     def _build_scratch_streams(self, direction: Direction) -> list[list[CupyStream]]:
-        return [
-            [self._cp.cuda.Stream(non_blocking=True) for _ in self._ops_for(direction)[dst_level]]
-            if self._scratch_plans_for(direction)[dst_level].enabled
-            else []
-            for dst_level in range(self._H)
-        ]
+        with self._cuda_device:
+            return [
+                [self._cp.cuda.Stream(non_blocking=True) for _ in self._ops_for(direction)[dst_level]]
+                if self._scratch_plans_for(direction)[dst_level].enabled
+                else []
+                for dst_level in range(self._H)
+            ]
 
     def _destroy_workspace_cache(self) -> None:
         had_workspace = any(
@@ -1256,7 +1299,6 @@ class CusparseBackend(BackendBase):
             except Exception:
                 pass
         self._workspaces = _WorkspaceCache()
-        self._static_workspace_slots.clear()
         self._sync_retained_root()
         if had_workspace:
             self._bump_retained_epoch()
@@ -1294,10 +1336,7 @@ class CusparseBackend(BackendBase):
             self._bump_retained_epoch()
         return value
 
-    def _workspace_slot(self, direction: Direction, *, graph: bool) -> str:
-        return f"{'graph' if graph else 'dynamic'}_{direction.value}"
-
-    def _build_direction_workspace(self, direction: Direction, k: int, *, use_graph_descs: bool) -> _DirectionWorkspace:
+    def _alloc_workspace(self, direction: Direction, k: int, *, captured: bool) -> _DirectionWorkspace:
         if self._cuda_dtype is None or self._alpha is None or self._beta_zero is None or self._beta_one is None:
             raise RuntimeError("cuSPARSE runtime constants are uninitialized")
         plan = self._require_plan(direction)
@@ -1351,7 +1390,7 @@ class CusparseBackend(BackendBase):
             row: list[CupyArray | None] = []
             scratch_enabled = scratch_plans[dst_level].enabled
             for op_idx, op in enumerate(ops):
-                sp_desc = op.block.graph_desc if use_graph_descs else op.block.dynamic_desc
+                sp_desc = op.block.graph_desc if captured else op.block.dynamic_desc
                 dst_desc = (
                     scratch_dst_descs_by_level[dst_level][op_idx]
                     if scratch_enabled
@@ -1419,7 +1458,7 @@ class CusparseBackend(BackendBase):
                 "cuSPARSE bufferSize disagrees with plan.need_buffer dir=%s k=%d graph_descs=%s mismatches=%d first=%s",
                 direction.value,
                 k,
-                use_graph_descs,
+                captured,
                 len(buffer_mismatches),
                 buffer_mismatches[0],
             )
@@ -1428,7 +1467,7 @@ class CusparseBackend(BackendBase):
                 "cuSPARSE preprocess rejected null ext buffer dir=%s k=%d graph_descs=%s fallbacks=%d",
                 direction.value,
                 k,
-                use_graph_descs,
+                captured,
                 preprocess_null_fallbacks,
             )
 
@@ -1436,32 +1475,38 @@ class CusparseBackend(BackendBase):
         ws = _DirectionWorkspace(
             direction=direction,
             k=int(k),
-            use_graph_descs=bool(use_graph_descs),
+            captured=bool(captured),
             dense=dense,
-            fork_event=self._cp.cuda.Event(),
-            ready_events=[self._cp.cuda.Event() for _ in range(self._H)],
+            launch_event=self._cp.cuda.Event(),
+            level_done_events=[self._cp.cuda.Event() for _ in range(self._H)],
             spmm_ext_by_level=spmm_ext_by_level,
             scratch_views_by_level=scratch_views_by_level,
             scratch_dst_descs_by_level=scratch_dst_descs_by_level,
             scratch_done_events_by_level=scratch_done_events_by_level,
             input_primary=self._cp.zeros((input_len, k), dtype=self._dtype, order="C"),
         )
-        self._logger.debug("workspace ready dir=%s k=%d graph_descs=%s", direction.value, k, use_graph_descs)
+        self._logger.debug("workspace ready dir=%s k=%d captured=%s", direction.value, k, captured)
         return ws
 
-    def _workspace_for(self, direction: Direction, k: int, *, graph: bool) -> _DirectionWorkspace:
-        slot = self._workspace_slot(direction, graph=graph)
-        ws = getattr(self._workspaces, slot)
-        if graph:
+    def _ensure_workspace(self, direction: Direction, k: int, *, captured: bool) -> _DirectionWorkspace:
+        if direction == Direction.UP:
+            ws = self._workspaces.graph_up if captured else self._workspaces.dynamic_up
+        else:
+            ws = self._workspaces.graph_down if captured else self._workspaces.dynamic_down
+        if captured:
             if ws is None or int(ws.k) != int(k):
-                raise RuntimeError(f"Missing prebuilt cuSPARSE {slot} workspace for k={k}")
+                mode = "graph_up" if direction == Direction.UP else "graph_down"
+                raise RuntimeError(f"Missing prebuilt cuSPARSE {mode} workspace for k={k}")
             return ws
         if ws is None or int(ws.k) != int(k):
             if ws is not None:
-                self._static_workspace_slots.discard(slot)
                 ws.destroy(cslib=self._cslib)
-            ws = self._build_direction_workspace(direction, int(k), use_graph_descs=False)
-            setattr(self._workspaces, slot, ws)
+            with self._root_stream:
+                ws = self._alloc_workspace(direction, int(k), captured=False)
+            if direction == Direction.UP:
+                self._workspaces.dynamic_up = ws
+            else:
+                self._workspaces.dynamic_down = ws
             self._sync_retained_root()
             self._bump_retained_epoch()
         return ws
@@ -1476,7 +1521,7 @@ class CusparseBackend(BackendBase):
         init_mode: InitMode,
         init_payload: np.ndarray | None,
     ) -> None:
-        ws.input_primary.set(x, stream=self._capture_stream)
+        ws.input_primary.set(x, stream=self._root_stream)
         if miss_arr is not None:
             if staging.input_miss is None:
                 staging.input_miss = self._ensure_staging_array(
@@ -1485,7 +1530,7 @@ class CusparseBackend(BackendBase):
                     (self._num_mutations, ws.k),
                     order="C",
                 )
-            staging.input_miss.set(miss_arr, stream=self._capture_stream)
+            staging.input_miss.set(miss_arr, stream=self._root_stream)
 
         match init_mode:
             case InitMode.NONE | InitMode.XTX:
@@ -1495,7 +1540,7 @@ class CusparseBackend(BackendBase):
                     raise ValueError("init vector payload is required for init_mode=vector")
                 if staging.init_vector is None:
                     staging.init_vector = self._ensure_staging_array(staging, "init_vector", (1, ws.k), order="C")
-                staging.init_vector[0].set(init_payload, stream=self._capture_stream)
+                staging.init_vector[0].set(init_payload, stream=self._root_stream)
             case InitMode.MATRIX:
                 if init_payload is None:
                     raise ValueError("init matrix payload is required for init_mode=matrix")
@@ -1506,7 +1551,7 @@ class CusparseBackend(BackendBase):
                         (self._num_nodes, ws.k),
                         order="C",
                     )
-                staging.init_matrix.set(init_payload, stream=self._capture_stream)
+                staging.init_matrix.set(init_payload, stream=self._root_stream)
             case _:
                 raise ValueError(f"Unknown init mode: {init_mode!r}")
 
@@ -1521,17 +1566,17 @@ class CusparseBackend(BackendBase):
         if self._mut_selector is None or self._miss_selector is None:
             raise RuntimeError("cuSPARSE backend is not initialized")
 
-        with self._capture_stream:
+        with self._root_stream:
             for buf in ws.dense.level_bufs:
                 buf.fill(0)
 
         if ws.direction == Direction.UP:
-            with self._capture_stream:
+            with self._root_stream:
                 ws.dense.level_bufs[0][: self._num_samples] += ws.input_primary
         else:
             self._mut_selector.scatter_add(
                 cp=self._cp,
-                stream=self._capture_stream,
+                stream=self._root_stream,
                 level_buffers=ws.dense.level_bufs,
                 x_gpu=ws.input_primary,
             )
@@ -1540,7 +1585,7 @@ class CusparseBackend(BackendBase):
                     raise RuntimeError("Missing DOWN miss buffer while has_miss_input=True")
                 self._miss_selector.scatter_add(
                     cp=self._cp,
-                    stream=self._capture_stream,
+                    stream=self._root_stream,
                     level_buffers=ws.dense.level_bufs,
                     x_gpu=staging.input_miss,
                 )
@@ -1548,7 +1593,7 @@ class CusparseBackend(BackendBase):
         if init_mode == InitMode.NONE:
             return
 
-        with self._capture_stream:
+        with self._root_stream:
             match init_mode:
                 case InitMode.XTX:
                     if staging.xtx_bias is None:
@@ -1598,7 +1643,7 @@ class CusparseBackend(BackendBase):
                 )
             self._mut_selector.gather(
                 cp=self._cp,
-                stream=self._capture_stream,
+                stream=self._root_stream,
                 level_buffers=ws.dense.level_bufs,
                 out_gpu=staging.output_main,
             )
@@ -1612,16 +1657,16 @@ class CusparseBackend(BackendBase):
                     )
                 self._miss_selector.gather(
                     cp=self._cp,
-                    stream=self._capture_stream,
+                    stream=self._root_stream,
                     level_buffers=ws.dense.level_bufs,
                     out_gpu=staging.output_miss,
                 )
             tracer = self._nvtx
             if tracer is not None:
                 with tracer.range("await_outputs", dir=ws.direction.value):
-                    self._await_direction_streams(ws.direction)
+                    self._await_worker_streams(ws.direction)
             else:
-                self._await_direction_streams(ws.direction)
+                self._await_worker_streams(ws.direction)
             out_main = staging.output_main.get()
             out_aux = staging.output_miss.get() if need_miss_output and staging.output_miss is not None else None
             return out_main, out_aux
@@ -1633,23 +1678,23 @@ class CusparseBackend(BackendBase):
                 (self._num_samples, ws.k),
                 order="C",
             )
-        with self._capture_stream:
+        with self._root_stream:
             self._cp.copyto(staging.output_main, ws.dense.level_bufs[0][: self._num_samples])
         tracer = self._nvtx
         if tracer is not None:
             with tracer.range("await_outputs", dir=ws.direction.value):
-                self._await_direction_streams(ws.direction)
+                self._await_worker_streams(ws.direction)
         else:
-            self._await_direction_streams(ws.direction)
+            self._await_worker_streams(ws.direction)
         return staging.output_main.get()
 
     def _copy_node_outputs_to_host(self, ws: _DirectionWorkspace) -> np.ndarray:
         tracer = self._nvtx
         if tracer is not None:
             with tracer.range("await_outputs", dir=ws.direction.value):
-                self._await_direction_streams(ws.direction)
+                self._await_worker_streams(ws.direction)
         else:
-            self._await_direction_streams(ws.direction)
+            self._await_worker_streams(ws.direction)
         out = np.empty((self._num_nodes, ws.k), dtype=self._dtype)
         offset = 0
         for buf in ws.dense.level_bufs:
@@ -1658,7 +1703,12 @@ class CusparseBackend(BackendBase):
             offset += rows
         return out
 
-    def _enqueue_wavefront(self, ws: _DirectionWorkspace) -> None:
+    def _join_wavefront_to_root(self, ws: _DirectionWorkspace) -> None:
+        with self._root_stream:
+            for event in ws.level_done_events:
+                self._root_stream.wait_event(event)
+
+    def _launch_wavefront_plain(self, ws: _DirectionWorkspace) -> None:
         if self._alpha is None or self._beta_zero is None or self._beta_one is None or self._cuda_dtype is None:
             raise RuntimeError("cuSPARSE runtime constants are uninitialized")
 
@@ -1673,19 +1723,19 @@ class CusparseBackend(BackendBase):
             seed_level = self._H - 1
             level_iter = range(self._H - 2, -1, -1)
 
-        with self._capture_stream:
-            ws.fork_event.record(self._capture_stream)
+        with self._root_stream:
+            ws.launch_event.record(self._root_stream)
         for stream in self._level_streams:
-            stream.wait_event(ws.fork_event)
+            stream.wait_event(ws.launch_event)
         for scratch_streams in scratch_streams_by_level:
             for stream in scratch_streams:
-                stream.wait_event(ws.fork_event)
+                stream.wait_event(ws.launch_event)
 
         if self._H > 0:
             seed_stream = self._level_streams[seed_level]
             with seed_stream:
                 _publish_level_source_view(cp=self._cp, dense=ws.dense, plan=plan, level=seed_level)
-                ws.ready_events[seed_level].record(seed_stream)
+                ws.level_done_events[seed_level].record(seed_stream)
 
         for dst_level in level_iter:
             stream = self._level_streams[dst_level]
@@ -1699,8 +1749,8 @@ class CusparseBackend(BackendBase):
                 for op_idx, op in enumerate(ops):
                     helper_stream = scratch_streams[op_idx]
                     with helper_stream:
-                        helper_stream.wait_event(ws.ready_events[op.src_level])
-                        sp_desc = op.block.graph_desc if ws.use_graph_descs else op.block.dynamic_desc
+                        helper_stream.wait_event(ws.level_done_events[op.src_level])
+                        sp_desc = op.block.graph_desc if ws.captured else op.block.dynamic_desc
                         ext = ws.spmm_ext_by_level[dst_level][op_idx]
                         self._cslib.set_stream(helper_stream.ptr)
                         self._cslib.spmm(
@@ -1721,13 +1771,13 @@ class CusparseBackend(BackendBase):
                         stream.wait_event(scratch_done_events[op_idx])
                         ws.dense.level_bufs[dst_level] += scratch_views[op_idx]
                     _publish_level_source_view(cp=self._cp, dense=ws.dense, plan=plan, level=dst_level)
-                    ws.ready_events[dst_level].record(stream)
+                    ws.level_done_events[dst_level].record(stream)
                 continue
 
             with stream:
                 for op_idx, op in enumerate(ops):
-                    stream.wait_event(ws.ready_events[op.src_level])
-                    sp_desc = op.block.graph_desc if ws.use_graph_descs else op.block.dynamic_desc
+                    stream.wait_event(ws.level_done_events[op.src_level])
+                    sp_desc = op.block.graph_desc if ws.captured else op.block.dynamic_desc
                     ext = ws.spmm_ext_by_level[dst_level][op_idx]
                     self._cslib.set_stream(stream.ptr)
                     self._cslib.spmm(
@@ -1743,13 +1793,11 @@ class CusparseBackend(BackendBase):
                         0 if ext is None else ext.data.ptr,
                     )
                 _publish_level_source_view(cp=self._cp, dense=ws.dense, plan=plan, level=dst_level)
-                ws.ready_events[dst_level].record(stream)
+                ws.level_done_events[dst_level].record(stream)
 
-        with self._capture_stream:
-            for event in ws.ready_events:
-                self._capture_stream.wait_event(event)
+        self._join_wavefront_to_root(ws)
 
-    def _enqueue_wavefront_nvtx(self, ws: _DirectionWorkspace) -> None:
+    def _launch_wavefront_traced(self, ws: _DirectionWorkspace) -> None:
         tracer = self._nvtx
         if tracer is None:
             raise RuntimeError("cuSPARSE NVTX tracer is not initialized")
@@ -1768,21 +1816,21 @@ class CusparseBackend(BackendBase):
             level_iter = range(self._H - 2, -1, -1)
 
         with tracer.range("wavefront", dir=ws.direction.value):
-            with self._capture_stream:
-                ws.fork_event.record(self._capture_stream)
+            with self._root_stream:
+                ws.launch_event.record(self._root_stream)
                 tracer.mark("event.record_fork", dir=ws.direction.value)
             for stream in self._level_streams:
-                stream.wait_event(ws.fork_event)
+                stream.wait_event(ws.launch_event)
             for scratch_streams in scratch_streams_by_level:
                 for stream in scratch_streams:
-                    stream.wait_event(ws.fork_event)
+                    stream.wait_event(ws.launch_event)
 
             if self._H > 0:
                 seed_stream = self._level_streams[seed_level]
                 with seed_stream:
                     with tracer.range("seed", dir=ws.direction.value, level=seed_level):
                         _publish_level_source_view(cp=self._cp, dense=ws.dense, plan=plan, level=seed_level)
-                        ws.ready_events[seed_level].record(seed_stream)
+                        ws.level_done_events[seed_level].record(seed_stream)
                         tracer.mark("event.record_ready", dir=ws.direction.value, level=seed_level)
 
             for dst_level in level_iter:
@@ -1805,7 +1853,7 @@ class CusparseBackend(BackendBase):
                             helper_stream = scratch_streams[op_idx]
                             with helper_stream:
                                 tracer.mark("wait_ready", dir=ws.direction.value, dst=dst_level, src=op.src_level)
-                                helper_stream.wait_event(ws.ready_events[op.src_level])
+                                helper_stream.wait_event(ws.level_done_events[op.src_level])
                                 with tracer.range(
                                     "helper_launch",
                                     dir=ws.direction.value,
@@ -1813,7 +1861,7 @@ class CusparseBackend(BackendBase):
                                     src=op.src_level,
                                     helper=op_idx,
                                 ):
-                                    sp_desc = op.block.graph_desc if ws.use_graph_descs else op.block.dynamic_desc
+                                    sp_desc = op.block.graph_desc if ws.captured else op.block.dynamic_desc
                                     self._cslib.set_stream(helper_stream.ptr)
                                     with tracer.range(
                                         "launch",
@@ -1868,15 +1916,15 @@ class CusparseBackend(BackendBase):
                                     ws.dense.level_bufs[dst_level] += scratch_views[op_idx]
                             with tracer.range("publish_level", dir=ws.direction.value, level=dst_level):
                                 _publish_level_source_view(cp=self._cp, dense=ws.dense, plan=plan, level=dst_level)
-                            ws.ready_events[dst_level].record(stream)
+                            ws.level_done_events[dst_level].record(stream)
                             tracer.mark("event.record_ready", dir=ws.direction.value, level=dst_level)
                         continue
 
                     with stream:
                         for op_idx, op in enumerate(ops):
                             tracer.mark("wait_ready", dir=ws.direction.value, dst=dst_level, src=op.src_level)
-                            stream.wait_event(ws.ready_events[op.src_level])
-                            sp_desc = op.block.graph_desc if ws.use_graph_descs else op.block.dynamic_desc
+                            stream.wait_event(ws.level_done_events[op.src_level])
+                            sp_desc = op.block.graph_desc if ws.captured else op.block.dynamic_desc
                             ext = ws.spmm_ext_by_level[dst_level][op_idx]
                             self._cslib.set_stream(stream.ptr)
                             with tracer.range(
@@ -1903,40 +1951,39 @@ class CusparseBackend(BackendBase):
                                 )
                         with tracer.range("publish_level", dir=ws.direction.value, level=dst_level):
                             _publish_level_source_view(cp=self._cp, dense=ws.dense, plan=plan, level=dst_level)
-                        ws.ready_events[dst_level].record(stream)
+                        ws.level_done_events[dst_level].record(stream)
                         tracer.mark("event.record_ready", dir=ws.direction.value, level=dst_level)
 
             with tracer.range("join_ready", dir=ws.direction.value):
-                with self._capture_stream:
-                    for event in ws.ready_events:
-                        self._capture_stream.wait_event(event)
+                self._join_wavefront_to_root(ws)
 
-    def _run_wavefront(self, ws: _DirectionWorkspace) -> None:
+    def _launch_wavefront(self, ws: _DirectionWorkspace) -> None:
         if self._instrumentation:
-            self._enqueue_wavefront_nvtx(ws)
+            self._launch_wavefront_traced(ws)
             return
-        self._enqueue_wavefront(ws)
+        self._launch_wavefront_plain(ws)
 
-    def _capture_wavefront_graph(self, ws: _DirectionWorkspace) -> CupyGraph:
-        with self._capture_stream:
-            for buf in ws.dense.level_bufs:
-                buf.fill(0)
-        self._enqueue_wavefront(ws)
-        self._await_direction_streams(ws.direction)
+    def _build_wavefront_graph(self, ws: _DirectionWorkspace) -> CupyGraph:
+        with self._caller_root_scope():
+            with self._root_stream:
+                for buf in ws.dense.level_bufs:
+                    buf.fill(0)
+            self._launch_wavefront(ws)
+            self._await_worker_streams(ws.direction)
 
-        self._capture_stream.begin_capture()
-        try:
-            self._enqueue_wavefront(ws)
-            graph = self._capture_stream.end_capture()
-        except Exception:
+            self._root_stream.begin_capture()
             try:
-                self._capture_stream.end_capture()
+                self._launch_wavefront(ws)
+                graph = self._root_stream.end_capture()
             except Exception:
-                pass
-            raise
+                try:
+                    self._root_stream.end_capture()
+                except Exception:
+                    pass
+                raise
 
-        graph.upload(self._capture_stream)
-        self._await_direction_streams(ws.direction)
+            graph.upload(self._root_stream)
+        self._await_worker_streams(ws.direction)
         return graph
 
     def _run_direction(
@@ -1964,46 +2011,47 @@ class CusparseBackend(BackendBase):
                 runtime_k=int(k),
                 k_hint=int(hint),
             )
-        ws = self._workspace_for(direction, int(k), graph=use_graph)
-        staging = self._staging_for(direction, int(k))
-        self._stage_inputs(
-            ws,
-            staging,
-            x,
-            miss_arr=miss_arr,
-            init_mode=mode,
-            init_payload=init_payload,
-        )
-
-        tracer = self._nvtx
-        if tracer is not None:
-            exec_mode = "instrumented"
-            with tracer.range("run_direction", dir=direction.value):
-                with tracer.range("seed_direction", dir=direction.value):
-                    self._seed_workspace(ws, staging, init_mode=mode, has_miss_input=miss_arr is not None)
-                self._run_wavefront(ws)
-                with tracer.range("collect_outputs", dir=direction.value):
-                    outputs = (
-                        self._copy_node_outputs_to_host(ws)
-                        if emit_all_nodes
-                        else self._collect_outputs(ws, staging, need_miss_output=need_miss_output)
-                    )
-        else:
-            self._seed_workspace(ws, staging, init_mode=mode, has_miss_input=miss_arr is not None)
-            if use_graph:
-                exec_mode = "graph"
-                if ws.graph is None:
-                    raise RuntimeError(f"Missing captured {direction.value.upper()} CUDA graph for configured k_hint")
-                with self._capture_stream:
-                    ws.graph.launch(self._capture_stream)
-            else:
-                exec_mode = "dynamic"
-                self._run_wavefront(ws)
-            outputs = (
-                self._copy_node_outputs_to_host(ws)
-                if emit_all_nodes
-                else self._collect_outputs(ws, staging, need_miss_output=need_miss_output)
+        with self._caller_root_scope():
+            ws = self._ensure_workspace(direction, int(k), captured=use_graph)
+            staging = self._staging_for(direction, int(k))
+            self._stage_inputs(
+                ws,
+                staging,
+                x,
+                miss_arr=miss_arr,
+                init_mode=mode,
+                init_payload=init_payload,
             )
+
+            tracer = self._nvtx
+            if tracer is not None:
+                exec_mode = "instrumented"
+                with tracer.range("run_direction", dir=direction.value):
+                    with tracer.range("seed_direction", dir=direction.value):
+                        self._seed_workspace(ws, staging, init_mode=mode, has_miss_input=miss_arr is not None)
+                    self._launch_wavefront(ws)
+                    with tracer.range("collect_outputs", dir=direction.value):
+                        outputs = (
+                            self._copy_node_outputs_to_host(ws)
+                            if emit_all_nodes
+                            else self._collect_outputs(ws, staging, need_miss_output=need_miss_output)
+                        )
+            else:
+                self._seed_workspace(ws, staging, init_mode=mode, has_miss_input=miss_arr is not None)
+                if use_graph:
+                    exec_mode = "graph"
+                    if ws.graph is None:
+                        raise RuntimeError(f"Missing captured {direction.value.upper()} CUDA graph for configured k_hint")
+                    with self._root_stream:
+                        ws.graph.launch(self._root_stream)
+                else:
+                    exec_mode = "dynamic"
+                    self._launch_wavefront(ws)
+                outputs = (
+                    self._copy_node_outputs_to_host(ws)
+                    if emit_all_nodes
+                    else self._collect_outputs(ws, staging, need_miss_output=need_miss_output)
+                )
 
         if self._capture_active:
             call = self._call_mem

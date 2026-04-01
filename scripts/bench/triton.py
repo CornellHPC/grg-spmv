@@ -16,6 +16,7 @@ from .run import run_benchmark_suite
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark SpmvGRG matmul for the Triton backend")
     add_common_bench_args(parser)
+    parser.add_argument("--device", type=int, required=True, help="CUDA device ordinal")
     return parser.parse_args()
 
 
@@ -28,7 +29,7 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(f"Argument error: {exc}") from exc
 
-    configs = expand_triton_configs(common.plan_pair_specs, common.log_level, common.instrumentation)
+    configs = expand_triton_configs(common.plan_pair_specs, int(args.device), common.log_level, common.instrumentation)
     if common.dry_run:
         for entry in configs:
             print(

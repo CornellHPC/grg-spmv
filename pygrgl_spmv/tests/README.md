@@ -52,7 +52,7 @@ Memory-ledger rule covered by the suite:
 
 ## CLI Options
 
-- `--backend {all,mkl,cusparse}`
+- `--backend {all,mkl,cusparse,triton}`
 - `--smoke`
 - `--grg <path>`: primary GRG used by traversal/backend tests
 - `--missing-grg <path>`: missingness GRG used by missingness tests

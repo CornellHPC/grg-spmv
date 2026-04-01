@@ -35,6 +35,36 @@ Either side of a plan pair may be omitted.
 
 `instrumentation` enables slower observability behavior. Each backend decides how that affects execution, but the flag is runtime configuration, not plan state.
 
+GPU backends also require mandatory `device` and `stream` constructor arguments:
+
+- CUDA device ordinal such as `0`
+- raw `cudaStream_t` handle, including `0`
+- any object implementing `__cuda_stream__()`
+
+Typical null-stream call sites use `device=0, stream=0` in internal
+tests/benchmarks or `device=0, stream=cupy.cuda.Stream.null` in user code.
+
+## GPU stream model
+
+GPU backends use four stream roles:
+
+- caller stream: the supplied `stream=` handle on the declared `device=`
+- root stream: one backend-owned stream per backend instance
+- level streams: backend-owned worker streams
+- scratch streams: backend-owned helper streams for scratch-enabled levels
+
+`stream=0` means the null stream on the declared device. Non-null external
+streams must resolve to that same device at backend construction time.
+
+Setup-time GPU allocation/upload, staging, graph warmup/capture/replay, and
+root-side gathers run on the root stream.
+
+Level and scratch work run on the backend-owned worker streams.
+
+Each wavefront joins per-level completion back onto root before return, so any
+root-stream wait or synchronize is also the boundary for the worker work from
+that launch.
+
 ## Memory ledger
 
 `SpmvGRG.memory` is the public memory-accounting surface.

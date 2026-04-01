@@ -131,6 +131,7 @@ def _expand_cusparse_side(spec: PlanSpec | None, *, want_up: bool):
 
 def expand_cusparse_configs(
     plan_pair_specs: list[PlanPairSpec],
+    device: int,
     log_level: str,
     instrumentation: bool = False,
 ) -> list[BenchConfig]:
@@ -148,7 +149,9 @@ def expand_cusparse_configs(
                         plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
                         log_level=log_level,
                         instrumentation=instrumentation,
-                        build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: CusparseBackend(
+                        build_backend=lambda pair=pair, device=device, log_level=log_level, instrumentation=instrumentation: CusparseBackend(
+                            device=device,
+                            stream=0,
                             pair=pair,
                             log_level=log_level,
                             instrumentation=instrumentation,
@@ -207,6 +210,7 @@ def _expand_triton_side(spec: PlanSpec | None, *, want_up: bool):
 
 def expand_triton_configs(
     plan_pair_specs: list[PlanPairSpec],
+    device: int,
     log_level: str,
     instrumentation: bool = False,
 ) -> list[BenchConfig]:
@@ -224,7 +228,9 @@ def expand_triton_configs(
                         plan_down_text=None if pair.plan_down is None else str(pair.plan_down),
                         log_level=log_level,
                         instrumentation=instrumentation,
-                        build_backend=lambda pair=pair, log_level=log_level, instrumentation=instrumentation: TritonBackend(
+                        build_backend=lambda pair=pair, device=device, log_level=log_level, instrumentation=instrumentation: TritonBackend(
+                            device=device,
+                            stream=0,
                             pair=pair,
                             log_level=log_level,
                             instrumentation=instrumentation,

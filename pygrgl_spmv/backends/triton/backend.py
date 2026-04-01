@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha1
 import logging
 from typing import Any
-import warnings
 
 import numpy as np
 import scipy.sparse as sp
@@ -20,6 +20,11 @@ from pygrgl_spmv.backends.base import (
     effective_k_hint,
     iter_direction_level_pairs,
     warn_instrumentation_ignores_k_hint,
+)
+from pygrgl_spmv.backends._cuda_stream import (
+    _cuda_stream_device,
+    parse_cuda_device,
+    parse_cuda_stream,
 )
 from pygrgl_spmv.backends._nvtx import make_torch_tracer
 from pygrgl_spmv.memory import alloc_field, child_field, ignore_field
@@ -113,20 +118,16 @@ class _TritonOp:
 @dataclass(frozen=True)
 class _TritonScratchLevelPlan:
     enabled: bool
-    helper_op_indices: tuple[int, ...]
     reduce_order: tuple[int, ...]
 
 
 @dataclass
 class _DirectionWorkspace:
     direction: Direction = ignore_field()
-    capture_stream: torch.cuda.Stream = ignore_field()
-    level_streams: list[torch.cuda.Stream] = ignore_field()
-    fork_event: torch.cuda.Event = ignore_field()
-    ready_events: list[torch.cuda.Event] = ignore_field()
+    launch_event: torch.cuda.Event = ignore_field()
+    level_done_events: list[torch.cuda.Event] = ignore_field()
     node_state: torch.Tensor = alloc_field(label="node_state", kind="state")
     level_views: list[torch.Tensor] = alloc_field(label="level_view", kind="state")
-    scratch_streams_by_level: list[list[torch.cuda.Stream]] = ignore_field()
     scratch_done_events_by_level: list[list[torch.cuda.Event]] = ignore_field()
     scratch_views_by_level: list[list[torch.Tensor]] = alloc_field(label="scratch_views", kind="scratch")
     input_primary: torch.Tensor = alloc_field(label="input_primary", kind="input")
@@ -210,6 +211,8 @@ class TritonBackend(BackendBase):
     def __init__(
         self,
         *,
+        device: int,
+        stream: object,
         pair: TritonPlanPair,
         log_level: str = "WARNING",
         instrumentation: bool = False,
@@ -223,18 +226,35 @@ class TritonBackend(BackendBase):
             log_level=log_level,
             instrumentation=instrumentation,
         )
-        self._device = torch.device("cuda")
+        self._device_id = parse_cuda_device(device)
+        self._torch_device = torch.device("cuda", self._device_id)
+        self._caller_stream_ptr, self._caller_stream_keepalive = parse_cuda_stream(stream)
+        if self._caller_stream_ptr != 0:
+            stream_device = _cuda_stream_device(self._caller_stream_ptr)
+            if stream_device != self._device_id:
+                raise ValueError(
+                    f"CUDA stream device {stream_device} does not match requested CUDA device {self._device_id}"
+                )
+        # PyTorch wraps the raw handle only, so protocol-backed stream owners
+        # must stay alive on the backend for the wrapped stream to remain valid.
+        with torch.cuda.device(self._torch_device):
+            self._caller_stream = torch.cuda.get_stream_from_external(self._caller_stream_ptr, device=self._torch_device)
+            self._root_stream = torch.cuda.Stream()
+            self._caller_to_root_event = torch.cuda.Event()
+            self._root_to_caller_event = torch.cuda.Event()
+        self._level_streams: list[torch.cuda.Stream] = []
+        self._scratch_streams_up_by_level: list[list[torch.cuda.Stream]] = []
+        self._scratch_streams_down_by_level: list[list[torch.cuda.Stream]] = []
         self._torch_dtype = torch.float64
         self._blocks_up: list[list[_TritonBlock | None]] = []
         self._blocks_down: list[list[_TritonBlock | None]] = []
         self._ops_up: list[list[_TritonOp]] = []
         self._ops_down: list[list[_TritonOp]] = []
-        self._sel_mut_rows_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
-        self._sel_mut_cols_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
-        self._sel_miss_rows_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
-        self._sel_miss_cols_gpu = torch.empty(0, device=self._device, dtype=torch.int64)
+        self._sel_mut_rows_gpu = torch.empty(0, device=self._torch_device, dtype=torch.int64)
+        self._sel_mut_cols_gpu = torch.empty(0, device=self._torch_device, dtype=torch.int64)
+        self._sel_miss_rows_gpu = torch.empty(0, device=self._torch_device, dtype=torch.int64)
+        self._sel_miss_cols_gpu = torch.empty(0, device=self._torch_device, dtype=torch.int64)
         self._workspaces = _WorkspaceCache()
-        self._static_workspace_slots: set[str] = set()
         self._staging_up: _DirectionStaging | None = None
         self._staging_down: _DirectionStaging | None = None
         self._config_up: CsrKernelConfig | CscKernelConfig | None = None
@@ -269,6 +289,9 @@ class TritonBackend(BackendBase):
     def _ops_for(self, direction: Direction) -> list[list[_TritonOp]]:
         return self._ops_up if direction == Direction.UP else self._ops_down
 
+    def _scratch_streams_for(self, direction: Direction) -> list[list[torch.cuda.Stream]]:
+        return self._scratch_streams_up_by_level if direction == Direction.UP else self._scratch_streams_down_by_level
+
     def _config_for(self, direction: Direction) -> CsrKernelConfig | CscKernelConfig:
         config = self._config_up if direction == Direction.UP else self._config_down
         if config is None:
@@ -278,27 +301,33 @@ class TritonBackend(BackendBase):
     def _scratch_plan_for(self, direction: Direction) -> list[_TritonScratchLevelPlan]:
         return self._scratch_plan_up if direction == Direction.UP else self._scratch_plan_down
 
-    def _workspace_slot(self, direction: Direction, *, graph: bool) -> str:
-        return f"{'graph' if graph else 'dynamic'}_{direction.value}"
-
-    def _workspace_for(self, direction: Direction, *, graph: bool) -> _DirectionWorkspace:
-        key = self._workspace_slot(direction, graph=graph)
-        ws = getattr(self._workspaces, key)
+    def _ensure_workspace(self, direction: Direction, *, graph: bool) -> _DirectionWorkspace:
+        if direction == Direction.UP:
+            ws = self._workspaces.graph_up if graph else self._workspaces.dynamic_up
+        else:
+            ws = self._workspaces.graph_down if graph else self._workspaces.dynamic_down
         if ws is None:
             if graph:
-                raise RuntimeError(f"Triton {key} workspace is not initialized")
-            ws = self._build_direction_workspace(direction)
-            setattr(self._workspaces, key, ws)
+                mode = "graph_up" if direction == Direction.UP else "graph_down"
+                raise RuntimeError(f"Triton {mode} workspace is not initialized")
+            with torch.cuda.stream(self._root_stream):
+                ws = self._alloc_workspace(direction)
+            if direction == Direction.UP:
+                self._workspaces.dynamic_up = ws
+            else:
+                self._workspaces.dynamic_down = ws
             self._sync_retained_root()
             self._bump_retained_epoch()
         return ws
 
     def _staging_for(self, direction: Direction) -> _DirectionStaging:
-        attr = "_staging_up" if direction == Direction.UP else "_staging_down"
-        staging = getattr(self, attr)
+        staging = self._staging_up if direction == Direction.UP else self._staging_down
         if staging is None:
             staging = _DirectionStaging()
-            setattr(self, attr, staging)
+            if direction == Direction.UP:
+                self._staging_up = staging
+            else:
+                self._staging_down = staging
             self._sync_retained_root()
             self._bump_retained_epoch()
         return staging
@@ -333,10 +362,23 @@ class TritonBackend(BackendBase):
         retained.staging_up = self._staging_up
         retained.staging_down = self._staging_down
 
+    @contextmanager
+    def _caller_root_scope(self):
+        with torch.cuda.device(self._torch_device):
+            with torch.cuda.stream(self._caller_stream):
+                self._caller_to_root_event.record(self._caller_stream)
+            self._root_stream.wait_event(self._caller_to_root_event)
+            try:
+                yield
+            finally:
+                with torch.cuda.stream(self._root_stream):
+                    self._root_to_caller_event.record(self._root_stream)
+                self._caller_stream.wait_event(self._root_to_caller_event)
+
     def _ensure_staging_tensor(self, staging: _DirectionStaging, attr: str, shape: tuple[int, ...]) -> torch.Tensor:
         value = getattr(staging, attr)
         if value is None:
-            value = torch.zeros(shape, device=self._device, dtype=self._torch_dtype)
+            value = torch.zeros(shape, device=self._torch_device, dtype=self._torch_dtype)
             setattr(staging, attr, value)
             self._bump_retained_epoch()
         return value
@@ -363,8 +405,8 @@ class TritonBackend(BackendBase):
             case _:
                 raise ValueError(f"Unsupported Triton sparse format: {fmt.value}")
         return _TritonBlock(
-            indices=torch.from_numpy(indices).to(device=self._device),
-            indptr=torch.from_numpy(indptr).to(device=self._device),
+            indices=torch.from_numpy(indices).to(device=self._torch_device),
+            indptr=torch.from_numpy(indptr).to(device=self._torch_device),
             nrows=int(nrows),
             ncols=int(ncols),
             nnz=int(sparse.nnz),
@@ -495,75 +537,74 @@ class TritonBackend(BackendBase):
                 plans.append(
                     _TritonScratchLevelPlan(
                         enabled=False,
-                        helper_op_indices=(),
                         reduce_order=(),
                     )
                 )
                 continue
-            helper_op_indices = tuple(range(len(ops)))
             reduce_order = tuple(
                 sorted(
-                    helper_op_indices,
+                    range(len(ops)),
                     key=lambda idx: (int(ops[idx].nnz), int(ops[idx].src_level)),
                 )
             )
             plans.append(
                 _TritonScratchLevelPlan(
                     enabled=True,
-                    helper_op_indices=helper_op_indices,
                     reduce_order=reduce_order,
                 )
             )
         return plans
 
-    def _build_direction_workspace(self, direction: Direction) -> _DirectionWorkspace:
+    def _build_scratch_streams(self, direction: Direction) -> list[list[torch.cuda.Stream]]:
+        with torch.cuda.device(self._torch_device):
+            return [
+                [torch.cuda.Stream() for _ in self._ops_for(direction)[dst_level]]
+                if self._scratch_plan_for(direction)[dst_level].enabled
+                else []
+                for dst_level in range(len(self._level_offsets) - 1)
+            ]
+
+    def _alloc_workspace(self, direction: Direction) -> _DirectionWorkspace:
         if self._torch_dtype not in {torch.float32, torch.float64}:
             raise ValueError(f"Unsupported Triton dtype: {self._torch_dtype}")
 
-        H = len(self._level_offsets) - 1
-        capture_stream = torch.cuda.Stream()
-        level_streams = [torch.cuda.Stream() for _ in range(H)]
-        scratch_plans = self._scratch_plan_for(direction)
-        level_offsets = [int(v) for v in self._level_offsets]
-        node_state = torch.zeros((self._num_nodes,), device=self._device, dtype=self._torch_dtype)
-        level_views = [node_state[level_offsets[h] : level_offsets[h + 1]] for h in range(H)]
-        scratch_streams_by_level: list[list[torch.cuda.Stream]] = []
-        scratch_done_events_by_level: list[list[torch.cuda.Event]] = []
-        scratch_views_by_level: list[list[torch.Tensor]] = []
-        for h in range(H):
-            if h >= len(scratch_plans) or not scratch_plans[h].enabled:
-                scratch_streams_by_level.append([])
-                scratch_done_events_by_level.append([])
-                scratch_views_by_level.append([])
-                continue
-            level_size = level_views[h].shape[0]
-            count = len(scratch_plans[h].helper_op_indices)
-            scratch_streams_by_level.append([torch.cuda.Stream() for _ in range(count)])
-            scratch_done_events_by_level.append([torch.cuda.Event() for _ in range(count)])
-            scratch_views_by_level.append(
-                [
-                    torch.zeros((level_size,), device=self._device, dtype=self._torch_dtype)
-                    for _ in range(count)
-                ]
+        with torch.cuda.device(self._torch_device):
+            H = len(self._level_offsets) - 1
+            scratch_plans = self._scratch_plan_for(direction)
+            ops_by_level = self._ops_for(direction)
+            level_offsets = [int(v) for v in self._level_offsets]
+            node_state = torch.zeros((self._num_nodes,), device=self._torch_device, dtype=self._torch_dtype)
+            level_views = [node_state[level_offsets[h] : level_offsets[h + 1]] for h in range(H)]
+            scratch_done_events_by_level: list[list[torch.cuda.Event]] = []
+            scratch_views_by_level: list[list[torch.Tensor]] = []
+            for h in range(H):
+                if h >= len(scratch_plans) or not scratch_plans[h].enabled:
+                    scratch_done_events_by_level.append([])
+                    scratch_views_by_level.append([])
+                    continue
+                level_size = level_views[h].shape[0]
+                count = len(ops_by_level[h])
+                scratch_done_events_by_level.append([torch.cuda.Event() for _ in range(count)])
+                scratch_views_by_level.append(
+                    [
+                        torch.zeros((level_size,), device=self._torch_device, dtype=self._torch_dtype)
+                        for _ in range(count)
+                    ]
+                )
+            input_len = self._num_samples if direction == Direction.UP else self._num_mutations
+            return _DirectionWorkspace(
+                direction=direction,
+                launch_event=torch.cuda.Event(),
+                level_done_events=[torch.cuda.Event() for _ in range(H)],
+                node_state=node_state,
+                level_views=level_views,
+                scratch_done_events_by_level=scratch_done_events_by_level,
+                scratch_views_by_level=scratch_views_by_level,
+                input_primary=torch.zeros((input_len,), device=self._torch_device, dtype=self._torch_dtype),
             )
-        input_len = self._num_samples if direction == Direction.UP else self._num_mutations
-        output_len = self._num_mutations if direction == Direction.UP else self._num_samples
-        return _DirectionWorkspace(
-            direction=direction,
-            capture_stream=capture_stream,
-            level_streams=level_streams,
-            fork_event=torch.cuda.Event(),
-            ready_events=[torch.cuda.Event() for _ in range(H)],
-            node_state=node_state,
-            level_views=level_views,
-            scratch_streams_by_level=scratch_streams_by_level,
-            scratch_done_events_by_level=scratch_done_events_by_level,
-            scratch_views_by_level=scratch_views_by_level,
-            input_primary=torch.zeros((input_len,), device=self._device, dtype=self._torch_dtype),
-        )
 
     def _autotune_key(self, direction: Direction) -> tuple[object, ...]:
-        device = torch.cuda.get_device_properties(self._device)
+        device = torch.cuda.get_device_properties(self._torch_device)
         plan = self._require_plan(direction)
         ops_by_level = self._ops_for(direction)
         return (
@@ -577,7 +618,7 @@ class TritonBackend(BackendBase):
             _structure_signature(ops_by_level),
         )
 
-    def _prepare_workspace_state(
+    def _seed_workspace(
         self,
         ws: _DirectionWorkspace,
         staging: _DirectionStaging,
@@ -585,7 +626,7 @@ class TritonBackend(BackendBase):
         init_mode: InitMode,
         has_miss_input: bool,
     ) -> None:
-        with torch.cuda.stream(ws.capture_stream):
+        with torch.cuda.stream(self._root_stream):
             ws.node_state.zero_()
             match init_mode:
                 case InitMode.NONE:
@@ -596,7 +637,7 @@ class TritonBackend(BackendBase):
                             raise ValueError("init_mode=xtx requires GRG coalescence counts")
                         staging.xtx_bias = torch.from_numpy(
                             (2.0 * self._coalescence_counts.astype(self._dtype, copy=False)).reshape(self._num_nodes)
-                        ).to(device=self._device, dtype=self._torch_dtype)
+                        ).to(device=self._torch_device, dtype=self._torch_dtype)
                         self._bump_retained_epoch()
                     ws.node_state.add_(staging.xtx_bias)
                 case InitMode.VECTOR:
@@ -645,7 +686,12 @@ class TritonBackend(BackendBase):
             fp64_acc=self._torch_dtype == torch.float64,
         )
 
-    def _enqueue_wavefront(
+    def _join_wavefront_to_root(self, ws: _DirectionWorkspace) -> None:
+        with torch.cuda.stream(self._root_stream):
+            for event in ws.level_done_events:
+                self._root_stream.wait_event(event)
+
+    def _launch_wavefront_plain(
         self,
         ws: _DirectionWorkspace,
         *,
@@ -654,6 +700,7 @@ class TritonBackend(BackendBase):
         H = len(self._level_offsets) - 1
         ops_by_level = self._ops_for(ws.direction)
         scratch_plans = self._scratch_plan_for(ws.direction)
+        scratch_streams_by_level = self._scratch_streams_for(ws.direction)
         if ws.direction == Direction.UP:
             seed_level = 0
             level_iter = range(1, H)
@@ -661,33 +708,32 @@ class TritonBackend(BackendBase):
             seed_level = H - 1
             level_iter = range(H - 2, -1, -1)
 
-        with torch.cuda.stream(ws.capture_stream):
-            ws.fork_event.record(ws.capture_stream)
-        for stream in ws.level_streams:
-            stream.wait_event(ws.fork_event)
-        for scratch_streams in ws.scratch_streams_by_level:
+        with torch.cuda.stream(self._root_stream):
+            ws.launch_event.record(self._root_stream)
+        for stream in self._level_streams:
+            stream.wait_event(ws.launch_event)
+        for scratch_streams in scratch_streams_by_level:
             for stream in scratch_streams:
-                stream.wait_event(ws.fork_event)
+                stream.wait_event(ws.launch_event)
 
         if H > 0:
-            seed_stream = ws.level_streams[seed_level]
+            seed_stream = self._level_streams[seed_level]
             with torch.cuda.stream(seed_stream):
-                ws.ready_events[seed_level].record(seed_stream)
+                ws.level_done_events[seed_level].record(seed_stream)
 
         for dst_level in level_iter:
-            stream = ws.level_streams[dst_level]
+            stream = self._level_streams[dst_level]
             ops = ops_by_level[dst_level]
             scratch_plan = scratch_plans[dst_level]
             if scratch_plan.enabled:
-                scratch_streams = ws.scratch_streams_by_level[dst_level]
+                scratch_streams = scratch_streams_by_level[dst_level]
                 scratch_done_events = ws.scratch_done_events_by_level[dst_level]
                 scratch_views = ws.scratch_views_by_level[dst_level]
-                for helper_idx, op_idx in enumerate(scratch_plan.helper_op_indices):
-                    op = ops[op_idx]
+                for helper_idx, op in enumerate(ops):
                     helper_stream = scratch_streams[helper_idx]
                     helper_view = scratch_views[helper_idx]
                     with torch.cuda.stream(helper_stream):
-                        helper_stream.wait_event(ws.ready_events[op.src_level])
+                        helper_stream.wait_event(ws.level_done_events[op.src_level])
                         helper_view.zero_()
                         self._launch_op(op, x=ws.level_views[op.src_level], y=helper_view, config=config)
                         scratch_done_events[helper_idx].record(helper_stream)
@@ -695,20 +741,18 @@ class TritonBackend(BackendBase):
                     for helper_idx in scratch_plan.reduce_order:
                         stream.wait_event(scratch_done_events[helper_idx])
                         ws.level_views[dst_level].add_(scratch_views[helper_idx])
-                    ws.ready_events[dst_level].record(stream)
+                    ws.level_done_events[dst_level].record(stream)
                 continue
 
             with torch.cuda.stream(stream):
                 for op in ops:
-                    stream.wait_event(ws.ready_events[op.src_level])
+                    stream.wait_event(ws.level_done_events[op.src_level])
                     self._launch_op(op, x=ws.level_views[op.src_level], y=ws.level_views[dst_level], config=config)
-                ws.ready_events[dst_level].record(stream)
+                ws.level_done_events[dst_level].record(stream)
 
-        with torch.cuda.stream(ws.capture_stream):
-            for event in ws.ready_events:
-                ws.capture_stream.wait_event(event)
+        self._join_wavefront_to_root(ws)
 
-    def _enqueue_wavefront_nvtx(
+    def _launch_wavefront_traced(
         self,
         ws: _DirectionWorkspace,
         *,
@@ -721,6 +765,7 @@ class TritonBackend(BackendBase):
         H = len(self._level_offsets) - 1
         ops_by_level = self._ops_for(ws.direction)
         scratch_plans = self._scratch_plan_for(ws.direction)
+        scratch_streams_by_level = self._scratch_streams_for(ws.direction)
         if ws.direction == Direction.UP:
             seed_level = 0
             level_iter = range(1, H)
@@ -729,23 +774,23 @@ class TritonBackend(BackendBase):
             level_iter = range(H - 2, -1, -1)
 
         with tracer.range("wavefront", dir=ws.direction.value):
-            with torch.cuda.stream(ws.capture_stream):
-                ws.fork_event.record(ws.capture_stream)
+            with torch.cuda.stream(self._root_stream):
+                ws.launch_event.record(self._root_stream)
                 tracer.mark("event.record_fork", dir=ws.direction.value)
-            for stream in ws.level_streams:
-                stream.wait_event(ws.fork_event)
-            for scratch_streams in ws.scratch_streams_by_level:
+            for stream in self._level_streams:
+                stream.wait_event(ws.launch_event)
+            for scratch_streams in scratch_streams_by_level:
                 for stream in scratch_streams:
-                    stream.wait_event(ws.fork_event)
+                    stream.wait_event(ws.launch_event)
 
             if H > 0:
-                seed_stream = ws.level_streams[seed_level]
+                seed_stream = self._level_streams[seed_level]
                 with torch.cuda.stream(seed_stream):
-                    ws.ready_events[seed_level].record(seed_stream)
+                    ws.level_done_events[seed_level].record(seed_stream)
                     tracer.mark("event.record_ready", dir=ws.direction.value, level=seed_level)
 
             for dst_level in level_iter:
-                stream = ws.level_streams[dst_level]
+                stream = self._level_streams[dst_level]
                 ops = ops_by_level[dst_level]
                 scratch_plan = scratch_plans[dst_level]
                 with tracer.range(
@@ -756,11 +801,10 @@ class TritonBackend(BackendBase):
                     scratch=scratch_plan.enabled,
                 ):
                     if scratch_plan.enabled:
-                        scratch_streams = ws.scratch_streams_by_level[dst_level]
+                        scratch_streams = scratch_streams_by_level[dst_level]
                         scratch_done_events = ws.scratch_done_events_by_level[dst_level]
                         scratch_views = ws.scratch_views_by_level[dst_level]
-                        for helper_idx, op_idx in enumerate(scratch_plan.helper_op_indices):
-                            op = ops[op_idx]
+                        for helper_idx, op in enumerate(ops):
                             helper_stream = scratch_streams[helper_idx]
                             helper_view = scratch_views[helper_idx]
                             with torch.cuda.stream(helper_stream):
@@ -770,7 +814,7 @@ class TritonBackend(BackendBase):
                                     dst=dst_level,
                                     src=op.src_level,
                                 )
-                                helper_stream.wait_event(ws.ready_events[op.src_level])
+                                helper_stream.wait_event(ws.level_done_events[op.src_level])
                                 with tracer.range(
                                     "helper_launch",
                                     dir=ws.direction.value,
@@ -801,8 +845,7 @@ class TritonBackend(BackendBase):
                                     )
                         with torch.cuda.stream(stream):
                             for helper_idx in scratch_plan.reduce_order:
-                                op_idx = scratch_plan.helper_op_indices[helper_idx]
-                                src_level = ops[op_idx].src_level
+                                src_level = ops[helper_idx].src_level
                                 tracer.mark(
                                     "wait_scratch_done",
                                     dir=ws.direction.value,
@@ -819,7 +862,7 @@ class TritonBackend(BackendBase):
                                     helper=helper_idx,
                                 ):
                                     ws.level_views[dst_level].add_(scratch_views[helper_idx])
-                            ws.ready_events[dst_level].record(stream)
+                            ws.level_done_events[dst_level].record(stream)
                             tracer.mark("event.record_ready", dir=ws.direction.value, level=dst_level)
                         continue
 
@@ -831,7 +874,7 @@ class TritonBackend(BackendBase):
                                 dst=dst_level,
                                 src=op.src_level,
                             )
-                            stream.wait_event(ws.ready_events[op.src_level])
+                            stream.wait_event(ws.level_done_events[op.src_level])
                             with tracer.range(
                                 "launch",
                                 dir=ws.direction.value,
@@ -843,27 +886,25 @@ class TritonBackend(BackendBase):
                                 nnz=op.nnz,
                             ):
                                 self._launch_op(op, x=ws.level_views[op.src_level], y=ws.level_views[dst_level], config=config)
-                        ws.ready_events[dst_level].record(stream)
+                        ws.level_done_events[dst_level].record(stream)
                         tracer.mark("event.record_ready", dir=ws.direction.value, level=dst_level)
 
             with tracer.range("join_ready", dir=ws.direction.value):
-                with torch.cuda.stream(ws.capture_stream):
-                    for event in ws.ready_events:
-                        ws.capture_stream.wait_event(event)
+                self._join_wavefront_to_root(ws)
 
-    def _run_wavefront(
+    def _launch_wavefront(
         self,
         ws: _DirectionWorkspace,
         *,
         config: CsrKernelConfig | CscKernelConfig,
     ) -> None:
         if self._instrumentation:
-            self._enqueue_wavefront_nvtx(ws, config=config)
+            self._launch_wavefront_traced(ws, config=config)
             return
-        self._enqueue_wavefront(ws, config=config)
+        self._launch_wavefront_plain(ws, config=config)
 
     def _enqueue_output_gather(self, ws: _DirectionWorkspace, staging: _DirectionStaging, *, need_miss_output: bool) -> None:
-        with torch.cuda.stream(ws.capture_stream):
+        with torch.cuda.stream(self._root_stream):
             if ws.direction == Direction.UP:
                 if staging.output_main is None:
                     staging.output_main = self._ensure_staging_tensor(staging, "output_main", (self._num_mutations,))
@@ -889,10 +930,12 @@ class TritonBackend(BackendBase):
                     staging.output_main = self._ensure_staging_tensor(staging, "output_main", (self._num_samples,))
                 staging.output_main.copy_(ws.node_state[: self._num_samples])
 
-    def _tune_once(self, direction: Direction, ws: _DirectionWorkspace, config: CsrKernelConfig | CscKernelConfig) -> None:
-        self._prepare_workspace_state(ws, _DirectionStaging(), init_mode=InitMode.NONE, has_miss_input=False)
-        self._enqueue_wavefront(ws, config=config)
-        ws.capture_stream.synchronize()
+    def _tune_once(self, ws: _DirectionWorkspace, config: CsrKernelConfig | CscKernelConfig) -> None:
+        with self._caller_root_scope():
+            self._seed_workspace(ws, _DirectionStaging(), init_mode=InitMode.NONE, has_miss_input=False)
+            self._launch_wavefront(ws, config=config)
+        with torch.cuda.device(self._torch_device):
+            self._root_stream.synchronize()
 
     def _tune_direction(self, direction: Direction, ws: _DirectionWorkspace) -> CsrKernelConfig | CscKernelConfig:
         key = self._autotune_key(direction)
@@ -901,21 +944,23 @@ class TritonBackend(BackendBase):
             self._logger.info("Reusing cached Triton autotune config for %s: %s", direction.value, format_config(cached))
             return cached
 
-        tune_input = torch.randn(
-            (self._num_samples if direction == Direction.UP else self._num_mutations,),
-            device=self._device,
-            dtype=self._torch_dtype,
-        )
-        with torch.cuda.stream(ws.capture_stream):
-            ws.input_primary.copy_(tune_input)
-        ws.capture_stream.synchronize()
+        with self._caller_root_scope():
+            with torch.cuda.stream(self._root_stream):
+                tune_input = torch.randn(
+                    (self._num_samples if direction == Direction.UP else self._num_mutations,),
+                    device=self._torch_device,
+                    dtype=self._torch_dtype,
+                )
+                ws.input_primary.copy_(tune_input)
+        with torch.cuda.device(self._torch_device):
+            self._root_stream.synchronize()
 
         results: list[tuple[CsrKernelConfig | CscKernelConfig, float]] = []
         for config in self._configured_kernel_configs(direction):
-            self._tune_once(direction, ws, config)
+            self._tune_once(ws, config)
             timing_ms = float(
                 triton.testing.do_bench(
-                    lambda config=config: self._tune_once(direction, ws, config),
+                    lambda config=config: self._tune_once(ws, config),
                     warmup=_TUNE_WARMUP_MS,
                     rep=_TUNE_REP_MS,
                 )
@@ -932,16 +977,19 @@ class TritonBackend(BackendBase):
         )
         return best_config
 
-    def _capture_wavefront_graph(self, direction: Direction, ws: _DirectionWorkspace, config: CsrKernelConfig | CscKernelConfig) -> torch.cuda.CUDAGraph:
+    def _build_wavefront_graph(self, ws: _DirectionWorkspace, config: CsrKernelConfig | CscKernelConfig) -> torch.cuda.CUDAGraph:
         # Warm up outside capture so Triton compilation is not part of the graph.
-        self._prepare_workspace_state(ws, _DirectionStaging(), init_mode=InitMode.NONE, has_miss_input=False)
-        self._enqueue_wavefront(ws, config=config)
-        ws.capture_stream.synchronize()
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=ws.capture_stream):
-            self._enqueue_wavefront(ws, config=config)
-        ws.capture_stream.synchronize()
+        with self._caller_root_scope():
+            self._seed_workspace(ws, _DirectionStaging(), init_mode=InitMode.NONE, has_miss_input=False)
+            self._launch_wavefront(ws, config=config)
+        with torch.cuda.device(self._torch_device):
+            self._root_stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+        with self._caller_root_scope():
+            with torch.cuda.graph(graph, stream=self._root_stream):
+                self._launch_wavefront(ws, config=config)
+        with torch.cuda.device(self._torch_device):
+            self._root_stream.synchronize()
         return graph
 
     def _run_column(
@@ -958,8 +1006,6 @@ class TritonBackend(BackendBase):
         config = self._config_for(direction)
         hint = effective_k_hint(instrumentation=self._instrumentation, k_hint=self._require_plan(direction).k_hint)
         use_graph = bool(not self._instrumentation and hint is not None)
-        ws = self._workspace_for(direction, graph=use_graph)
-        staging = self._staging_for(direction)
         primary_cpu = torch.from_numpy(np.ascontiguousarray(primary_col)).to(dtype=self._torch_dtype)
         miss_cpu = None if miss_col is None else torch.from_numpy(np.ascontiguousarray(miss_col)).to(dtype=self._torch_dtype)
         init_matrix_cpu = None
@@ -967,45 +1013,53 @@ class TritonBackend(BackendBase):
             assert init_value is not None
             init_matrix_cpu = torch.from_numpy(np.ascontiguousarray(init_value)).to(dtype=self._torch_dtype)
 
-        with torch.cuda.stream(ws.capture_stream):
-            ws.input_primary.copy_(primary_cpu)
-            if miss_cpu is not None:
-                if staging.input_miss is None:
-                    staging.input_miss = self._ensure_staging_tensor(staging, "input_miss", (self._num_mutations,))
-                staging.input_miss.copy_(miss_cpu)
-            if init_mode == InitMode.VECTOR:
-                assert init_value is not None
-                if staging.init_vector is None:
-                    staging.init_vector = self._ensure_staging_tensor(staging, "init_vector", (1,))
-                staging.init_vector.fill_(float(np.asarray(init_value).reshape(())))
-            if init_matrix_cpu is not None:
-                if staging.init_matrix is None:
-                    staging.init_matrix = self._ensure_staging_tensor(staging, "init_matrix", (self._num_nodes,))
-                staging.init_matrix.copy_(init_matrix_cpu)
-
         tracer = self._nvtx
-        if tracer is not None:
-            with tracer.range("execute_singleton", dir=direction.value):
-                with tracer.range("prepare_state", dir=direction.value):
-                    self._prepare_workspace_state(ws, staging, init_mode=init_mode, has_miss_input=miss_col is not None)
-                self._run_wavefront(ws, config=config)
-                if not emit_all_nodes:
-                    with tracer.range("gather_outputs", dir=direction.value):
-                        self._enqueue_output_gather(ws, staging, need_miss_output=need_miss_output)
-                with tracer.range("await_outputs", dir=direction.value):
-                    ws.capture_stream.synchronize()
-        else:
-            self._prepare_workspace_state(ws, staging, init_mode=init_mode, has_miss_input=miss_col is not None)
-            if use_graph:
-                if ws.graph is None:
-                    raise RuntimeError(f"Missing Triton graph workspace for {direction.value}")
-                with torch.cuda.stream(ws.capture_stream):
-                    ws.graph.replay()
+        with self._caller_root_scope():
+            ws = self._ensure_workspace(direction, graph=use_graph)
+            staging = self._staging_for(direction)
+            with torch.cuda.stream(self._root_stream):
+                ws.input_primary.copy_(primary_cpu)
+                if miss_cpu is not None:
+                    if staging.input_miss is None:
+                        staging.input_miss = self._ensure_staging_tensor(staging, "input_miss", (self._num_mutations,))
+                    staging.input_miss.copy_(miss_cpu)
+                if init_mode == InitMode.VECTOR:
+                    assert init_value is not None
+                    if staging.init_vector is None:
+                        staging.init_vector = self._ensure_staging_tensor(staging, "init_vector", (1,))
+                    staging.init_vector.fill_(float(np.asarray(init_value).reshape(())))
+                if init_matrix_cpu is not None:
+                    if staging.init_matrix is None:
+                        staging.init_matrix = self._ensure_staging_tensor(staging, "init_matrix", (self._num_nodes,))
+                    staging.init_matrix.copy_(init_matrix_cpu)
+
+            if tracer is not None:
+                with tracer.range("execute_singleton", dir=direction.value):
+                    with tracer.range("prepare_state", dir=direction.value):
+                        self._seed_workspace(ws, staging, init_mode=init_mode, has_miss_input=miss_col is not None)
+                    self._launch_wavefront(ws, config=config)
+                    if not emit_all_nodes:
+                        with tracer.range("gather_outputs", dir=direction.value):
+                            self._enqueue_output_gather(ws, staging, need_miss_output=need_miss_output)
             else:
-                self._run_wavefront(ws, config=config)
-            if not emit_all_nodes:
-                self._enqueue_output_gather(ws, staging, need_miss_output=need_miss_output)
-            ws.capture_stream.synchronize()
+                self._seed_workspace(ws, staging, init_mode=init_mode, has_miss_input=miss_col is not None)
+                if use_graph:
+                    if ws.graph is None:
+                        raise RuntimeError(f"Missing Triton graph workspace for {direction.value}")
+                    with torch.cuda.stream(self._root_stream):
+                        ws.graph.replay()
+                else:
+                    self._launch_wavefront(ws, config=config)
+                if not emit_all_nodes:
+                    self._enqueue_output_gather(ws, staging, need_miss_output=need_miss_output)
+
+        if tracer is not None:
+            with tracer.range("await_outputs", dir=direction.value):
+                with torch.cuda.device(self._torch_device):
+                    self._root_stream.synchronize()
+        else:
+            with torch.cuda.device(self._torch_device):
+                self._root_stream.synchronize()
 
         if emit_all_nodes:
             return ws.node_state.cpu().numpy().copy()
@@ -1020,6 +1074,8 @@ class TritonBackend(BackendBase):
         return staging.output_main.cpu().numpy().copy()
 
     def setup(self, setup: BackendSetup) -> None:
+        self._workspaces = _WorkspaceCache()
+        self._clear_staging()
         self._apply_setup_state(setup)
         if np.dtype(setup.dtype) == np.float64:
             self._torch_dtype = torch.float64
@@ -1034,60 +1090,60 @@ class TritonBackend(BackendBase):
         self._ops_up = [[] for _ in range(H)]
         self._ops_down = [[] for _ in range(H)]
 
-        if self._plan_up is not None:
-            self._blocks_up = self._build_direction_blocks(Direction.UP)
-        if self._plan_down is not None:
-            self._blocks_down = self._build_direction_blocks(Direction.DOWN)
-        if self._plan_up is not None:
-            self._ops_up = self._build_direction_ops(Direction.UP)
-            self._scratch_plan_up = self._build_scratch_level_plans(Direction.UP)
-        if self._plan_down is not None:
-            self._ops_down = self._build_direction_ops(Direction.DOWN)
-            self._scratch_plan_down = self._build_scratch_level_plans(Direction.DOWN)
+        with self._caller_root_scope():
+            with torch.cuda.stream(self._root_stream):
+                if self._plan_up is not None:
+                    self._blocks_up = self._build_direction_blocks(Direction.UP)
+                if self._plan_down is not None:
+                    self._blocks_down = self._build_direction_blocks(Direction.DOWN)
+                mut_rows, mut_cols = _selector_index_arrays(self._sel_mut)
+                miss_rows, miss_cols = _selector_index_arrays(self._sel_miss)
+                self._sel_mut_rows_gpu = torch.from_numpy(mut_rows).to(device=self._torch_device)
+                self._sel_mut_cols_gpu = torch.from_numpy(mut_cols).to(device=self._torch_device)
+                self._sel_miss_rows_gpu = torch.from_numpy(miss_rows).to(device=self._torch_device)
+                self._sel_miss_cols_gpu = torch.from_numpy(miss_cols).to(device=self._torch_device)
+            if self._plan_up is not None:
+                self._ops_up = self._build_direction_ops(Direction.UP)
+                self._scratch_plan_up = self._build_scratch_level_plans(Direction.UP)
+            if self._plan_down is not None:
+                self._ops_down = self._build_direction_ops(Direction.DOWN)
+                self._scratch_plan_down = self._build_scratch_level_plans(Direction.DOWN)
 
-        mut_rows, mut_cols = _selector_index_arrays(self._sel_mut)
-        miss_rows, miss_cols = _selector_index_arrays(self._sel_miss)
-        self._sel_mut_rows_gpu = torch.from_numpy(mut_rows).to(device=self._device)
-        self._sel_mut_cols_gpu = torch.from_numpy(mut_cols).to(device=self._device)
-        self._sel_miss_rows_gpu = torch.from_numpy(miss_rows).to(device=self._device)
-        self._sel_miss_cols_gpu = torch.from_numpy(miss_cols).to(device=self._device)
+        with torch.cuda.device(self._torch_device):
+            self._level_streams = [torch.cuda.Stream() for _ in range(H)]
+            self._scratch_streams_up_by_level = self._build_scratch_streams(Direction.UP) if self._plan_up is not None else [[] for _ in range(H)]
+            self._scratch_streams_down_by_level = self._build_scratch_streams(Direction.DOWN) if self._plan_down is not None else [[] for _ in range(H)]
         for direction in self._configured_directions():
             self._log_block_memory(direction)
         self._xtx_host = None
 
-        self._workspaces = _WorkspaceCache()
-        self._static_workspace_slots = set()
-        self._clear_staging()
-
         if self._plan_up is not None:
-            tune_up = self._build_direction_workspace(Direction.UP)
+            with self._caller_root_scope():
+                with torch.cuda.stream(self._root_stream):
+                    tune_up = self._alloc_workspace(Direction.UP)
             self._config_up = self._tune_direction(Direction.UP, tune_up)
             hint = effective_k_hint(instrumentation=self._instrumentation, k_hint=self._plan_up.k_hint)
             if self._instrumentation and self._plan_up.k_hint is not None:
                 warn_instrumentation_ignores_k_hint(backend="Triton", direction=Direction.UP, k_hint=int(self._plan_up.k_hint))
             if hint is not None:
-                self._workspaces.graph_up = self._build_direction_workspace(Direction.UP)
-                self._workspaces.graph_up.graph = self._capture_wavefront_graph(
-                    Direction.UP,
-                    self._workspaces.graph_up,
-                    self._config_up,
-                )
-                self._static_workspace_slots.add("graph_up")
+                with self._caller_root_scope():
+                    with torch.cuda.stream(self._root_stream):
+                        self._workspaces.graph_up = self._alloc_workspace(Direction.UP)
+                self._workspaces.graph_up.graph = self._build_wavefront_graph(self._workspaces.graph_up, self._config_up)
 
         if self._plan_down is not None:
-            tune_down = self._build_direction_workspace(Direction.DOWN)
+            with self._caller_root_scope():
+                with torch.cuda.stream(self._root_stream):
+                    tune_down = self._alloc_workspace(Direction.DOWN)
             self._config_down = self._tune_direction(Direction.DOWN, tune_down)
             hint = effective_k_hint(instrumentation=self._instrumentation, k_hint=self._plan_down.k_hint)
             if self._instrumentation and self._plan_down.k_hint is not None:
                 warn_instrumentation_ignores_k_hint(backend="Triton", direction=Direction.DOWN, k_hint=int(self._plan_down.k_hint))
             if hint is not None:
-                self._workspaces.graph_down = self._build_direction_workspace(Direction.DOWN)
-                self._workspaces.graph_down.graph = self._capture_wavefront_graph(
-                    Direction.DOWN,
-                    self._workspaces.graph_down,
-                    self._config_down,
-                )
-                self._static_workspace_slots.add("graph_down")
+                with self._caller_root_scope():
+                    with torch.cuda.stream(self._root_stream):
+                        self._workspaces.graph_down = self._alloc_workspace(Direction.DOWN)
+                self._workspaces.graph_down.graph = self._build_wavefront_graph(self._workspaces.graph_down, self._config_down)
 
         # Release host sparse structures after upload so host memory accounting matches retained state.
         self._A_blocks = []
@@ -1151,7 +1207,7 @@ class TritonBackend(BackendBase):
                     assert miss_col is not None
                     out_miss[:, col] = miss_col
 
-        ws = self._workspace_for(direction, graph=use_graph)
+        ws = self._ensure_workspace(direction, graph=use_graph)
         staging = self._staging_for(direction)
         if self._capture_active:
             call = self._call_mem

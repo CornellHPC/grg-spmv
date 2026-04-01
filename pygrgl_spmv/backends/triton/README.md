@@ -12,6 +12,19 @@ Exports from [__init__.py](__init__.py):
 - `TritonPlan`
 - `TritonPlanPair`
 
+`TritonBackend` requires mandatory `device=` and `stream=` constructor
+arguments.
+
+- `device`: visible CUDA ordinal such as `0`
+- `stream`: accepted forms are:
+  - raw `cudaStream_t` integer handle such as `0`
+  - any CUDA Stream Protocol object such as `cupy.cuda.Stream.null`
+
+Protocol-backed stream objects are retained by the backend for its lifetime.
+Raw integer handles are treated as non-owning.
+`stream=0` means the null stream on the declared device. Non-null external
+streams must belong to that same device.
+
 ## Plans
 
 `TritonPlan` is defined in [plan.py](plan.py).
@@ -55,6 +68,21 @@ Execution:
 - launches level-wise sparse kernels
 - uses helper streams and scratch buffers on levels enabled by the `scratch` plan field
 - gathers endpoint outputs through retained staging buffers
+
+The supplied `stream=` is the caller stream on the declared `device=`.
+
+The backend owns:
+
+- one root stream per backend instance
+- backend-owned level streams
+- backend-owned scratch streams
+
+Setup-time GPU allocation/upload, staging, autotune uploads, graph
+warmup/capture/replay, and root-side gathers run on root.
+
+Triton wavefront work runs on the level and scratch streams.
+
+Each wavefront joins per-level completion back onto root before return.
 
 `level_views` share storage with `node_state`; they collapse onto the same physical allocation row and only add an extra logical role.
 

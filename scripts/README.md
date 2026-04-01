@@ -14,6 +14,11 @@ then prints separate runtime and memory summary tables.
 All entrypoints call the same shared benchmark runner and therefore execute
 the same stress/correctness workflow (intra-case + cross-config diagnostics).
 
+Benchmark GPU entrypoints require an explicit CUDA device ordinal via
+`--device` and instantiate GPU backends with the null stream on that device
+(`stream=0`). There is still no benchmark CLI flag for custom master streams in
+this repo.
+
 Before the tables, the runner also prints a compact `Common config:` banner.
 Shared config fields are factored there once, and the `Config` column in both
 tables shows only the per-config differences. When a benchmark run has exactly
@@ -125,6 +130,10 @@ Benchmark correctness checks use full-output arrays in memory and do not stop th
 - `--dry-run`
 - `--skip-note`
 
+GPU-only flag:
+
+- `--device` (required for `scripts.bench.cusparse` and `scripts.bench.triton`)
+
 `--log-level` changes verbosity only. `--instrumentation` is the opt-in switch
 for slower observability/profiling behavior:
 
@@ -154,12 +163,14 @@ One-sided dry-run examples:
 
 ```bash
 uv run python -m scripts.bench.triton \
+  --device 0 \
   --dry-run \
   --ks 1 \
   --matmul-options baseline \
   --plan-up-down="[k_hint=1,store=*,fmt=*][]"
 
 uv run python -m scripts.bench.triton \
+  --device 0 \
   --dry-run \
   --ks 1 \
   --matmul-options baseline \
@@ -187,6 +198,7 @@ cuSPARSE dry run of the full executable search space on `k=1`:
 module load cudatoolkit/12.9
 
 uv run python -m scripts.bench.cusparse \
+  --device 0 \
   --dry-run \
   --ks 1 \
   --plan-up-down="[k_hint=none,store=*,fmt=*,opA=*,opB=*,orderB=*,orderC=*,algo=*][k_hint=none,store=*,fmt=*,opA=*,opB=*,orderB=*,orderC=*,algo=*]" \
@@ -197,6 +209,7 @@ Negation and empty-side examples:
 
 ```bash
 uv run python -m scripts.bench.cusparse \
+  --device 0 \
   --dry-run \
   --ks 1 \
   --plan-up-down="[][k_hint=1,store=*,fmt=!COO,opA=*,opB=*,orderB=*,orderC=*,algo=*]"
@@ -208,6 +221,7 @@ Concrete cuSPARSE search command to find the fastest executable plans for `k=1`:
 module load cudatoolkit/12.9
 
 uv run python -m scripts.bench.cusparse \
+  --device 0 \
   --matmul-options baseline \
   --ks 1 \
   --trials 30 \
@@ -223,6 +237,7 @@ Triton logged benchmark examples:
 mkdir -p bench_logs/triton/run1
 
 uv run python -m scripts.bench.triton \
+  --device 0 \
   --ks 1 \
   --warmup 3 \
   --trials 10 \
@@ -232,6 +247,7 @@ uv run python -m scripts.bench.triton \
   2>&1 | tee bench_logs/triton/run1/fp64_up.log
 
 uv run python -m scripts.bench.triton \
+  --device 0 \
   --ks 1 \
   --warmup 3 \
   --trials 10 \

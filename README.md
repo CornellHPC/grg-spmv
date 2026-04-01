@@ -39,6 +39,16 @@ op = SpmvGRG(
 
 Set either side of the plan pair to `None` to build a one-sided operator.
 
+GPU backends (`CusparseBackend`, `TritonBackend`) additionally require
+mandatory `device=` and `stream=` constructor arguments.
+
+- `device` is a visible CUDA ordinal such as `0`
+- `stream` is either a raw `cudaStream_t` handle such as `0`, or a CUDA Stream
+  Protocol object such as `cupy.cuda.Stream.null`
+
+`stream=0` means the null stream on the declared `device`. Non-null external
+streams must belong to that same device.
+
 `log_level` controls verbosity only. Set `instrumentation=True` when you want
 profiling/observability behavior that may reduce absolute performance.
 
