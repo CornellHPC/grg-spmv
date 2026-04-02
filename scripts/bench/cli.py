@@ -69,7 +69,7 @@ def add_common_bench_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="WARNING",
         choices=list(LOG_LEVEL_CHOICES),
-        help="Log level passed to SpmvGRG and backend",
+        help="Root log level for benchmark, operator, and backend loggers",
     )
     parser.add_argument(
         "--instrumentation",

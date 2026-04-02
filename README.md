@@ -49,8 +49,12 @@ mandatory `device=` and `stream=` constructor arguments.
 `stream=0` means the null stream on the declared `device`. Non-null external
 streams must belong to that same device.
 
-`log_level` controls verbosity only. Set `instrumentation=True` when you want
-profiling/observability behavior that may reduce absolute performance.
+Backend `log_level` controls backend verbosity. `SpmvGRG` itself has no
+`log_level=` parameter and follows normal Python logger inheritance. Cache-miss
+`.grg` builds emit INFO-level RSS checkpoints through the
+`pygrgl_spmv.grg.compile` logger when the root logger is configured
+accordingly. Set `instrumentation=True` when you want profiling/observability
+behavior that may reduce absolute performance.
 
 ## Artifact behavior
 
@@ -58,6 +62,9 @@ profiling/observability behavior that may reduce absolute performance.
 - default artifact root: `./pygrgl_spmv_artifacts`
 - derived artifact paths encode the full GRG path to avoid collisions between GRGs with the same filename in different directories
 - you can also construct `SpmvGRG` directly from a `.grg_spmv` file without the original `.grg`
+- binary sparse structure is stored as bool-backed CSR on the host to reduce RAM
+- non-empty `A_blocks` reuse one shared read-only zero-stride bool payload
+- selectors remain ordinary bool-backed CSR matrices
 
 ## Documentation
 

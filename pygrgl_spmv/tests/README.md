@@ -30,7 +30,9 @@ Implementation paths exercised by these tests:
 
 Observability rule covered by the suite:
 
-- `log_level` changes verbosity only
+- `log_level` controls logger verbosity
+- operator build logs follow normal Python/root logger inheritance
+- compile RSS checkpoints are emitted on the `pygrgl_spmv.grg.compile` logger
 - `instrumentation` is the opt-in flag for slower profiling/observability behavior
 
 Memory-ledger rule covered by the suite:

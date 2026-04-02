@@ -11,6 +11,7 @@ import pytest
 
 from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.backends import ReferenceBackend, ReferencePlanPair
+from pygrgl_spmv.grg.artifact import load_grg_spmv
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
     HAS_MKL_RUNTIME,
@@ -120,6 +121,69 @@ def test_wavefront_debug_logging_is_quiet_without_instrumentation(primary_grg_pa
         _ = op.matmul(x, pygrgl.TraversalDirection.UP)
     messages = [rec.getMessage() for rec in caplog.records]
     assert not any(msg.startswith("wavefront[up]") for msg in messages)
+
+
+def test_cache_miss_build_logs_rss_checkpoints_at_info(primary_grg_path, tmp_path, caplog):
+    dst = tmp_path / "rss-build.grg"
+    shutil.copy2(primary_grg_path, dst)
+    artifact_dir = tmp_path / "artifact-root"
+    backend = ReferenceBackend(
+        pair=ReferencePlanPair(
+            plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
+            plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        op = SpmvGRG(dst, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=artifact_dir)
+
+    operator_messages = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "pygrgl_spmv.grg.SpmvGRG"
+    ]
+    compile_messages = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "pygrgl_spmv.grg.compile"
+    ]
+    assert any("Building SpmvGRG from" in msg for msg in operator_messages)
+    assert any("rss artifact:grg_loaded" in msg and "rss_bytes=" in msg for msg in compile_messages)
+    assert any("rss compile:start" in msg and "rss_bytes=" in msg for msg in compile_messages)
+    assert any("rss compile:mutation_table_ready" in msg and "delta_bytes=" in msg for msg in compile_messages)
+    assert any("rss artifact:saved" in msg and "delta_bytes=" in msg for msg in compile_messages)
+    assert op.artifact_path.exists()
+
+
+def test_artifact_load_rehydrates_shared_nonempty_block_data(primary_grg_path, tmp_path):
+    dst = tmp_path / "artifact-shared-data.grg"
+    shutil.copy2(primary_grg_path, dst)
+    artifact_dir = tmp_path / "artifact-root"
+    backend = ReferenceBackend(
+        pair=ReferencePlanPair(
+            plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
+            plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+        ),
+    )
+    op = SpmvGRG(
+        dst,
+        backend,
+        DATA_DTYPE,
+        INDEX_DTYPE,
+        artifact_dir=artifact_dir,
+    )
+
+    state = load_grg_spmv(op.artifact_path, DATA_DTYPE, INDEX_DTYPE)
+    assert state.A_blocks is not None
+    data_arrays = [block.data for level_blocks in state.A_blocks for block in level_blocks if block.nnz > 0]
+    assert data_arrays
+    first = data_arrays[0]
+    assert first.strides == (0,)
+    assert not first.flags.writeable
+    for data in data_arrays[1:]:
+        assert data.strides == (0,)
+        assert not data.flags.writeable
+        assert np.shares_memory(data, first)
 
 
 @pytest.mark.mkl

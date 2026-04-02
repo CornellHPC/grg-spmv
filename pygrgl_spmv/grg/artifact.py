@@ -183,6 +183,7 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
                     indptr=np.asarray(data[f"A_blocks_{dst_level}_{src_level}_indptr"], dtype=artifact_index_dtype),
                     shape=np.asarray(data[f"A_blocks_{dst_level}_{src_level}_shape"], dtype=artifact_index_dtype),
                     index_dtype=artifact_index_dtype,
+                    shared_data=True,
                 )
             )
         A_blocks.append(level_blocks)

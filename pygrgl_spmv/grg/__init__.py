@@ -82,7 +82,6 @@ class SpmvGRG:
         self._dtype = np.dtype(dtype)
         self._index_dtype = np.dtype(index_dtype)
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        self._logger.setLevel(logging.WARNING)
         if not isinstance(backend, BackendBase):
             raise TypeError(f"SpmvGRG backend must be a BackendBase instance, got {type(backend).__name__}")
         self._backend = backend
@@ -125,14 +124,15 @@ class SpmvGRG:
 
     def _build_and_save_artifact(self, *, source_path: Path, artifact_path: Path) -> CompiledOperatorState:
         grg = pygrgl.load_immutable_grg(str(source_path), load_up_edges=False)
-        _rss_checkpoint("artifact: grg loaded / before compile_grg")
-        compiled = compile_grg(grg, dtype=self._dtype, index_dtype=self._index_dtype)
-        del grg  # GRG C++ object no longer needed; free ~1-2 GB before init_biases
-        _rss_checkpoint("artifact: after compile_grg (grg freed) / before init_biases")
+        prev_rss_bytes = _rss_checkpoint("artifact:grg_loaded", None)
+        compiled = compile_grg(grg, index_dtype=self._index_dtype)
+        prev_rss_bytes = _rss_checkpoint("artifact:compiled", prev_rss_bytes)
+        del grg
+        prev_rss_bytes = _rss_checkpoint("artifact:grg_dropped", prev_rss_bytes)
         self._build_init_biases(compiled)
-        _rss_checkpoint("artifact: after init_biases / before save")
+        prev_rss_bytes = _rss_checkpoint("artifact:init_biases", prev_rss_bytes)
         save_grg_spmv(compiled, artifact_path)
-        _rss_checkpoint("artifact: after save")
+        _rss_checkpoint("artifact:saved", prev_rss_bytes)
         return compiled
 
     def _build_init_biases(self, compiled: CompiledOperatorState) -> None:

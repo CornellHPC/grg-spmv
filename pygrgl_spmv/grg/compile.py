@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
-import resource
 
 import numpy as np
 import pygrgl
@@ -13,23 +13,51 @@ import scipy.sparse as sp
 from pygrgl_spmv.backends import BackendSetup
 from pygrgl_spmv.grg.sparse import binary_csr_from_csr_parts
 
-_RSS_DEBUG: bool = os.getenv("SPMV_DEBUG_RSS") == "1"
-_rss_prev: list[float] = [0.0]
+_LOGGER = logging.getLogger(__name__)
 
 
-def _rss_mb() -> float:
-    """Current process peak RSS in MB (Linux: ru_maxrss is kB)."""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+def _rss_bytes() -> int | None:
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        with open("/proc/self/statm", encoding="ascii") as handle:
+            fields = handle.readline().split()
+    except (OSError, ValueError):
+        return None
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[1]) * page_size
+    except ValueError:
+        return None
 
 
-def _rss_checkpoint(label: str) -> None:
-    """Print a labelled RSS reading if SPMV_DEBUG_RSS=1."""
-    if not _RSS_DEBUG:
-        return
-    cur = _rss_mb()
-    delta = cur - _rss_prev[0]
-    _rss_prev[0] = cur
-    print(f"[rss] {label:<50s}  {cur:8.1f} MB  Δ{delta:+.1f} MB", flush=True)
+def _rss_checkpoint(
+    label: str,
+    prev_rss_bytes: int | None,
+) -> int | None:
+    if not _LOGGER.isEnabledFor(logging.INFO):
+        return prev_rss_bytes
+    rss_bytes = _rss_bytes()
+    if rss_bytes is None:
+        return prev_rss_bytes
+    if prev_rss_bytes is None:
+        _LOGGER.info(
+            "rss %s rss_bytes=%d rss_mib=%.1f",
+            label,
+            rss_bytes,
+            rss_bytes / (1024.0 * 1024.0),
+        )
+    else:
+        delta_bytes = int(rss_bytes - prev_rss_bytes)
+        _LOGGER.info(
+            "rss %s rss_bytes=%d rss_mib=%.1f delta_bytes=%+d delta_mib=%+.1f",
+            label,
+            rss_bytes,
+            rss_bytes / (1024.0 * 1024.0),
+            delta_bytes,
+            delta_bytes / (1024.0 * 1024.0),
+        )
+    return rss_bytes
 
 
 @dataclass
@@ -103,35 +131,35 @@ def _invert_permutation(perm: np.ndarray, *, index_dtype: np.dtype) -> np.ndarra
     return inv
 
 
-def _compute_node_heights(grg, num_nodes: int, *, index_dtype: np.dtype) -> np.ndarray:
-    """Compute node heights from down edges only."""
-    heights = np.zeros(num_nodes, dtype=np.int32)
+def _compute_node_levels(grg, num_nodes: int, *, index_dtype: np.dtype) -> np.ndarray:
+    """Compute node levels from down edges only."""
+    levels = np.zeros(num_nodes, dtype=np.int32)
     for node_id in range(num_nodes):
         children = np.asarray(grg.get_down_edges(node_id), dtype=index_dtype)
         if children.size == 0:
             continue
-        heights[node_id] = int(heights[children].max()) + 1
-    return heights
+        levels[node_id] = int(levels[children].max()) + 1
+    return levels
 
 
 def _build_stable_height_order(
-    node_heights: np.ndarray,
+    node_levels: np.ndarray,
     *,
     index_dtype: np.dtype,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build stable height order directly from per-height counts."""
-    num_nodes = int(node_heights.shape[0])
-    height_values = np.asarray(node_heights, dtype=np.int64)
-    num_levels = 0 if num_nodes == 0 else int(height_values.max()) + 1
+    num_nodes = int(node_levels.shape[0])
+    level_values = np.asarray(node_levels, dtype=np.int64)
+    num_levels = 0 if num_nodes == 0 else int(level_values.max()) + 1
 
-    counts = np.bincount(height_values, minlength=num_levels)
+    counts = np.bincount(level_values, minlength=num_levels)
     level_offsets64 = np.zeros(num_levels + 1, dtype=np.int64)
     level_offsets64[1:] = np.cumsum(counts, dtype=np.int64)
 
     node_perm = np.empty(num_nodes, dtype=index_dtype)
     next_pos = level_offsets64[:-1].copy()
     for node_id in range(num_nodes):
-        level = int(height_values[node_id])
+        level = int(level_values[node_id])
         pos = int(next_pos[level])
         node_perm[pos] = node_id
         next_pos[level] = pos + 1
@@ -167,6 +195,7 @@ def _build_level_blocks(
     level_offsets64 = np.asarray(level_offsets, dtype=np.int64)
     level_sizes = [int(level_offsets64[level + 1] - level_offsets64[level]) for level in range(num_levels)]
     block_indptrs: list[list[np.ndarray | None]] = [[None] * level for level in range(num_levels)]
+    prev_rss_bytes: int | None = None
 
     for parent_id in range(num_nodes):
         parent_level = int(node_levels[parent_id])
@@ -187,8 +216,7 @@ def _build_level_blocks(
                 indptr = np.zeros(level_sizes[parent_level] + 1, dtype=index_dtype)
                 block_indptrs[parent_level][child_level] = indptr
             indptr[row_local + 1] += int(child_level_counts[child_level])
-
-    _rss_checkpoint("level_blocks: pass1 done (block_indptrs allocated)")
+    prev_rss_bytes = _rss_checkpoint("compile:block_indptr_counts", prev_rss_bytes)
 
     block_indices: list[list[np.ndarray | None]] = [[None] * level for level in range(num_levels)]
     for parent_level in range(num_levels):
@@ -198,8 +226,7 @@ def _build_level_blocks(
                 continue
             np.cumsum(indptr, out=indptr)
             block_indices[parent_level][child_level] = np.empty(int(indptr[-1]), dtype=index_dtype)
-
-    _rss_checkpoint("level_blocks: indices allocated (indptrs + indices)")
+    prev_rss_bytes = _rss_checkpoint("compile:block_indices_alloc", prev_rss_bytes)
 
     for parent_id in range(num_nodes):
         parent_level = int(node_levels[parent_id])
@@ -244,8 +271,7 @@ def _build_level_blocks(
                     f"expected {end - start}, got {cols_local.size}"
                 )
             indices[start:end] = cols_local
-
-    _rss_checkpoint("level_blocks: pass2 done (indices filled)")
+    _rss_checkpoint("compile:block_indices_fill", prev_rss_bytes)
 
     A_blocks: list[list[sp.csr_matrix]] = []
     for parent_level in range(num_levels):
@@ -267,11 +293,10 @@ def _build_level_blocks(
                     indptr=indptr,
                     shape=(level_sizes[parent_level], level_sizes[child_level]),
                     index_dtype=index_dtype,
+                    shared_data=True,
                 )
             )
         A_blocks.append(level_blocks)
-
-    _rss_checkpoint("level_blocks: CSR built (+ data arrays, lists dropped)")
     return A_blocks
 
 
@@ -448,7 +473,11 @@ def _validate_sample_prefix(*, node_perm: np.ndarray, level_offsets: np.ndarray,
         )
 
 
-def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOperatorState:
+def compile_grg(
+    grg,
+    *,
+    index_dtype: np.dtype,
+) -> CompiledOperatorState:
     """Compile a non-empty immutable GRG into the normalized sparse traversal layout."""
     num_samples = int(grg.num_samples)
     num_mutations = int(grg.num_mutations)
@@ -469,27 +498,24 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
             f"num_edges={num_edges} exceeds {np.dtype(index_dtype).name} range required for structural arrays"
         )
 
-    _rss_prev[0] = _rss_mb()
-    _rss_checkpoint("compile_grg: start")
-
-    node_heights = _compute_node_heights(grg, num_nodes, index_dtype=index_dtype)
-    _rss_checkpoint("compile_grg: after node_heights")
-
+    prev_rss_bytes = _rss_checkpoint("compile:start", None)
+    node_levels = _compute_node_levels(grg, num_nodes, index_dtype=index_dtype)
+    prev_rss_bytes = _rss_checkpoint("compile:node_levels", prev_rss_bytes)
     node_perm, inv_node_perm, level_offsets = _build_stable_height_order(
-        node_heights,
+        node_levels,
         index_dtype=index_dtype,
     )
-    _rss_checkpoint("compile_grg: after stable_height_order")
+    prev_rss_bytes = _rss_checkpoint("compile:stable_order", prev_rss_bytes)
     _validate_sample_prefix(node_perm=node_perm, level_offsets=level_offsets, num_samples=num_samples)
 
     A_blocks = _build_level_blocks(
         grg,
-        node_levels=node_heights,
+        node_levels=node_levels,
         level_offsets=level_offsets,
         inv_node_perm=inv_node_perm,
         index_dtype=index_dtype,
     )
-    _rss_checkpoint("compile_grg: after level_blocks")
+    prev_rss_bytes = _rss_checkpoint("compile:blocks_ready", prev_rss_bytes)
 
     num_levels = int(level_offsets.size - 1)
     for parent_level in range(num_levels):
@@ -515,12 +541,12 @@ def compile_grg(grg, *, dtype: np.dtype, index_dtype: np.dtype) -> CompiledOpera
         num_nodes=num_nodes,
         index_dtype=index_dtype,
     )
-    _rss_checkpoint("compile_grg: after selectors")
+    prev_rss_bytes = _rss_checkpoint("compile:selectors_ready", prev_rss_bytes)
 
     sample_to_individual = np.arange(num_samples, dtype=index_dtype) // max(int(grg.ploidy), 1)
     coalescence_counts = _build_coalescence_counts(grg, node_perm=node_perm)
     mutation_positions, mutation_times, mutation_alleles, mutation_allele_offsets, mutation_ref_alleles, mutation_ref_allele_offsets = _build_mutation_table(grg)
-    _rss_checkpoint("compile_grg: after mutation_table")
+    _rss_checkpoint("compile:mutation_table_ready", prev_rss_bytes)
 
     return CompiledOperatorState(
         A_blocks=A_blocks,

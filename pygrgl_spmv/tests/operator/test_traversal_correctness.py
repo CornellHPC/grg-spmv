@@ -79,7 +79,7 @@ def test_compiled_blocks_have_sorted_unique_columns(primary_grg_path):
     import pygrgl
 
     grg = pygrgl.load_immutable_grg(primary_grg_path, load_up_edges=False)
-    state = compile_grg(grg, dtype=DATA_DTYPE, index_dtype=INDEX_DTYPE)
+    state = compile_grg(grg, index_dtype=INDEX_DTYPE)
     assert state.A_blocks is not None
     for level_blocks in state.A_blocks:
         for block in level_blocks:
@@ -92,6 +92,25 @@ def test_compiled_blocks_have_sorted_unique_columns(primary_grg_path):
                 if row_indices.size <= 1:
                     continue
                 assert np.all(row_indices[1:] > row_indices[:-1])
+
+
+def test_compiled_nonempty_blocks_share_read_only_bool_data(primary_grg_path):
+    import pygrgl
+
+    grg = pygrgl.load_immutable_grg(primary_grg_path, load_up_edges=False)
+    state = compile_grg(grg, index_dtype=INDEX_DTYPE)
+    assert state.A_blocks is not None
+    data_arrays = [block.data for level_blocks in state.A_blocks for block in level_blocks if block.nnz > 0]
+    assert data_arrays
+    first = data_arrays[0]
+    assert first.dtype == np.bool_
+    assert first.strides == (0,)
+    assert not first.flags.writeable
+    for data in data_arrays[1:]:
+        assert data.dtype == np.bool_
+        assert data.strides == (0,)
+        assert not data.flags.writeable
+        assert np.shares_memory(data, first)
 
 
 def _ones_input(_rng, shape, dtype):

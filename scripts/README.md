@@ -134,8 +134,12 @@ GPU-only flag:
 
 - `--device` (required for `scripts.bench.cusparse` and `scripts.bench.triton`)
 
-`--log-level` changes verbosity only. `--instrumentation` is the opt-in switch
-for slower observability/profiling behavior:
+`--log-level` sets the root logger level used by benchmark progress, operator
+build logs, the `pygrgl_spmv.grg.compile` RSS logger, and backend logs.
+Cache-miss `.grg` builds can therefore emit INFO-level compile RSS checkpoints
+through the normal logging path.
+`--instrumentation` is the opt-in switch for slower observability/profiling
+behavior:
 
 - MKL: per-level CPU-side wavefront debug logging
 - cuSPARSE: NVTX ranges/marks and dynamic scheduler execution

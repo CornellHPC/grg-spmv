@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
+from pygrgl_spmv.grg.sparse import binary_csr_from_csr_parts
 from pygrgl_spmv.memory import alloc_field, capture_snapshot, child_field, ignore_field, tree_rows
 
 
@@ -71,6 +72,11 @@ class _ConflictRetained:
 class _ConflictRoot:
     call: _ConflictCall = child_field(retention="call", activity="yes")
     retained: _ConflictRetained = child_field(retention="persistent", activity="always")
+
+
+@dataclass
+class _SparseRoot:
+    mat: object = alloc_field(label="mat", kind="sparse", owner="operator", retention="persistent", activity="always")
 
 
 def test_capture_snapshot_merges_alias_roles_and_keeps_one_physical_allocation():
@@ -174,3 +180,16 @@ def test_tree_rows_preserve_total_leaf_bytes():
     flat_total = sum(row.nbytes for row in snapshot.allocations)
     assert leaf_total == flat_total
     assert rows[0].path == ("cpu_live",)
+
+
+def test_capture_snapshot_handles_shared_sparse_data_without_breaking():
+    matrix = binary_csr_from_csr_parts(
+        indices=np.arange(6, dtype=np.int32),
+        indptr=np.array([0, 6], dtype=np.int32),
+        shape=(1, 6),
+        index_dtype=np.int32,
+        shared_data=True,
+    )
+    snapshot = capture_snapshot(_SparseRoot(mat=matrix), stage="retained", runtime_k=None)
+    leaf_sizes = sorted(row.nbytes for row in snapshot.allocations)
+    assert leaf_sizes == [1, 8, 24]
