@@ -2,9 +2,10 @@
 
 The planner is intentionally pure and small: it parses explicit plan literals,
 normalizes enum values, and exposes doc-driven properties such as support,
-determinism, and storage sharing. Runtime execution consumes ``need_buffer`` and
-``need_preprocess`` directly, while still auditing ``need_buffer`` against the
-queried ``cusparseSpMM_bufferSize`` result.
+determinism, and storage sharing. Runtime execution still audits
+``need_buffer`` against the queried ``cusparseSpMM_bufferSize`` result, while
+``need_preprocess`` remains docs-grounded metadata and is not currently used by
+the backend runtime path.
 
 The rules in this module are grounded on the CUDA 12.9.0 cuSPARSE SpMM docs:
 https://docs.nvidia.com/cuda/archive/12.9.0/cusparse/index.html#cusparsespmm

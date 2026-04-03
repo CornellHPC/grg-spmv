@@ -133,6 +133,7 @@ Benchmark correctness checks use full-output arrays in memory and do not stop th
 GPU-only flag:
 
 - `--device` (required for `scripts.bench.cusparse` and `scripts.bench.triton`)
+- `--ring-buffer-size` (shared GPU sparse slot count, default `2`)
 
 `--log-level` sets the root logger level used by benchmark progress, operator
 build logs, the `pygrgl_spmv.grg.compile` RSS logger, and backend logs.
@@ -163,6 +164,8 @@ For cuSPARSE, `*` is allowed for every field except `k_hint`. Negation is also s
 For Triton, benchmark plans expose only `k_hint`, `store`, and `fmt`.
 `k_hint` must be either `none` or `1`. Wildcards and negation are supported
 for `store` and `fmt`, but not for `k_hint`.
+Benchmark cases with runtime `k != 1` are skipped for Triton because streamed
+runtime execution is singleton-only.
 One-sided dry-run examples:
 
 ```bash

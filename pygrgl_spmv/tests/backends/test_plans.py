@@ -520,6 +520,7 @@ def test_cusparse_backend_rejects_slot_direction_mismatch(kwargs, match):
             device=0,
             stream=0,
             pair=CusparsePlanPair.from_dicts(pair_dict["plan_up"], pair_dict["plan_down"]),
+            ring_buffer_size=2,
             **kwargs,
         )
 

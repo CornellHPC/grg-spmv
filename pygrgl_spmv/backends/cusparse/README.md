@@ -17,13 +17,16 @@ Exports from [__init__.py](__init__.py):
 - `SpMMAlgorithm`
 - `is_valid_combo`
 
-`CusparseBackend` requires mandatory `device=` and `stream=` constructor
+`CusparseBackend` requires mandatory `device=`, `stream=`, and
+`ring_buffer_size=` constructor
 arguments.
 
 - `device`: visible CUDA ordinal such as `0`
 - `stream`: accepted forms are:
   - raw `cudaStream_t` integer handle such as `0`
   - any CUDA Stream Protocol object such as `cupy.cuda.Stream.null`
+- `ring_buffer_size`: number of streamed sparse-structure slots shared across
+  UP and DOWN
 
 `stream=0` means the null stream on the declared device. Non-null external
 streams must belong to that same device.
@@ -54,6 +57,8 @@ Useful plan properties:
 - `can_share_storage_with(...)`
 
 The plan object is the execution contract for sparse descriptors, dense layout, buffer requirements, and scratch scheduling.
+`need_preprocess` is retained as doc-grounded metadata; the current runtime path
+does not call `cusparseSpMM_preprocess()`.
 
 ## Shared values
 
@@ -75,11 +80,37 @@ The memory ledger counts:
 - logical bytes for the materialized all-ones array path
 - physical bytes for the VMM path through `VmmAliasedAlloc`
 
+## Streamed sparse structure
+
+Uncaptured cuSPARSE execution no longer uploads every sparse block to device
+during `setup()`.
+
+Instead it keeps pinned host CSR/CSC/COO structure for retained blocks and
+copies each block into one of `ring_buffer_size` shared device slots just
+before the corresponding `cusparseSpMM()` launch. Slot assignment is static, so
+the dynamic streamed path keeps fixed device addresses.
+
+Selectors and the shared all-ones values source remain device-resident.
+
+## Captured cuSPARSE workspaces
+
+Captured and dynamic cuSPARSE execution use the same slot-backed sparse path.
+
+- pinned host CSR/CSC/COO structure remains retained on the host
+- each logical op keeps a static slot assignment
+- one sparse descriptor per slot is reused for both dynamic execution and graph
+  capture
+- one SpMM external buffer is pre-allocated per slot from the maximum queried
+  `cusparseSpMM_bufferSize()` seen on that slot
+- graph capture includes the slot H2D copies plus `cusparseSpMM()` launches
+
+Graph-build failures are treated as hard setup errors. The backend does not
+silently downgrade a failed captured workspace to dynamic execution.
+
 ## Dense-state layout
 
-The backend maintains one `_DenseState` per workspace.
-
-Each level owns canonical dense buffers in `orderC`.
+The backend maintains one `_DenseState` per workspace. Each level owns
+canonical dense buffers in `orderC`.
 
 The source-side dense view is chosen from the plan:
 
@@ -105,18 +136,13 @@ For scratch-enabled levels:
 - helper streams launch SpMM into scratch buffers
 - the destination stream reduces scratch buffers into the canonical level buffer in a deterministic order
 
-The supplied `stream=` is the caller stream on the declared `device=`.
+The supplied `stream=` is the caller stream on the declared `device=`. The
+backend also owns one root stream, one copy stream per slot, level streams, and
+scratch streams.
 
-The backend owns:
-
-- one root stream per backend instance
-- backend-owned level streams
-- backend-owned scratch streams
-
-Setup-time GPU allocation/upload, staging, graph warmup/capture/replay, and
-root-side gathers run on root.
-
-SpMM wavefront work runs on the level and scratch streams.
+Setup-time GPU allocation, graph warmup/capture/replay, and root-side gathers
+run on root. Sparse H2D copies run on the slot copy streams. SpMM wavefront
+work runs on the level and scratch streams.
 
 Each wavefront joins per-level completion back onto root before return.
 
@@ -128,7 +154,12 @@ Retained execution memory is organized into:
 - `on_demand`: lazily created workspaces for uncaptured execution
 - `staging`: retained input/output/init helper buffers, keyed by direction and runtime `k`
 
-The backend keeps at most one captured workspace per direction and at most one on-demand workspace per direction. Staging is keyed by direction and runtime `k`.
+The backend keeps at most one captured workspace per direction and at most one
+on-demand workspace per direction. Staging is keyed by direction and runtime
+`k`.
+
+Captured cuSPARSE workspaces retain the same sparse structure and SpMM ext shape
+as the dynamic streamed path, so both stay bounded by `ring_buffer_size`.
 
 ## Instrumentation
 
@@ -140,12 +171,16 @@ When instrumentation is enabled and a plan specifies `k_hint`, the backend warns
 
 Retained device leaves include:
 
-- sparse block index payload
 - shared values
+- slot buffers
 - selector payload
 - captured workspaces
 - on-demand workspaces
 - staging buffers
+
+Retained CPU leaves include:
+
+- pinned host block structure
 
 The ledger does not count:
 

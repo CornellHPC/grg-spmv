@@ -40,6 +40,7 @@ GPU backends also require mandatory `device` and `stream` constructor arguments:
 - CUDA device ordinal such as `0`
 - raw `cudaStream_t` handle, including `0`
 - any object implementing `__cuda_stream__()`
+- `ring_buffer_size` sparse-structure slots shared across UP and DOWN
 
 Typical null-stream call sites use `device=0, stream=0` in internal
 tests/benchmarks or `device=0, stream=cupy.cuda.Stream.null` in user code.
@@ -50,20 +51,27 @@ GPU backends use four stream roles:
 
 - caller stream: the supplied `stream=` handle on the declared `device=`
 - root stream: one backend-owned stream per backend instance
+- slot copy streams: backend-owned streams that stage sparse structure from
+  pinned host memory into the shared device ring
 - level streams: backend-owned worker streams
 - scratch streams: backend-owned helper streams for scratch-enabled levels
 
 `stream=0` means the null stream on the declared device. Non-null external
 streams must resolve to that same device at backend construction time.
 
-Setup-time GPU allocation/upload, staging, graph warmup/capture/replay, and
-root-side gathers run on the root stream.
+Setup-time GPU allocation, graph warmup/capture/replay, and root-side gathers
+run on the root stream.
 
-Level and scratch work run on the backend-owned worker streams.
+Sparse-structure H2D copies run on the slot copy streams. Level and scratch
+work run on the backend-owned worker streams.
 
 Each wavefront joins per-level completion back onto root before return, so any
 root-stream wait or synchronize is also the boundary for the worker work from
 that launch.
+
+cuSPARSE graph and dynamic execution both use the same slot-backed sparse path.
+Sparse structure and SpMM external buffers are bounded by `ring_buffer_size`
+for both modes.
 
 ## Memory ledger
 

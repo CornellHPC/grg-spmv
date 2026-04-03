@@ -116,6 +116,7 @@ def make_cusparse_backend(
     *,
     device,
     stream=0,
+    ring_buffer_size=2,
     fmt_up="csr",
     fmt_down=None,
     k_hint=None,
@@ -194,6 +195,7 @@ def make_cusparse_backend(
         device=device,
         stream=stream,
         pair=CusparsePlanPair.from_dicts(plan_up, plan_down),
+        ring_buffer_size=ring_buffer_size,
         log_level=log_level,
         instrumentation=instrumentation,
     )
@@ -203,6 +205,7 @@ def make_triton_backend(
     *,
     device,
     stream=0,
+    ring_buffer_size=2,
     fmt_up="csr",
     fmt_down=None,
     k_hint=1,
@@ -237,6 +240,7 @@ def make_triton_backend(
         device=device,
         stream=stream,
         pair=TritonPlanPair.from_dicts(plan_up, plan_down),
+        ring_buffer_size=ring_buffer_size,
         log_level=log_level,
         instrumentation=instrumentation,
     )
@@ -267,6 +271,7 @@ def default_backend_builders(*, log_level="INFO", instrumentation=False):
             pytest.param(
                 ("cusparse", lambda: make_cusparse_backend(
                     device=0,
+                    ring_buffer_size=2,
                     fmt_up="csr",
                     fmt_down="csc",
                     k_hint=None,
@@ -281,6 +286,7 @@ def default_backend_builders(*, log_level="INFO", instrumentation=False):
             pytest.param(
                 ("cusparse", lambda: make_cusparse_backend(
                     device=0,
+                    ring_buffer_size=2,
                     fmt_up="csr",
                     fmt_down="csc",
                     k_hint=4,
@@ -299,6 +305,7 @@ def default_backend_builders(*, log_level="INFO", instrumentation=False):
             pytest.param(
                 ("triton", lambda: make_triton_backend(
                     device=0,
+                    ring_buffer_size=2,
                     fmt_up="csr",
                     fmt_down="csc",
                     k_hint=1,
@@ -452,6 +459,8 @@ def matmul_expect_k_hint_warning(op, input_matrix, direction, /, **kwargs):
         raise ValueError(f"Unsupported direction {direction!r}")
 
     backend_type = str(getattr(op._backend, "__class__", type(op._backend)).__module__).lower()
+    if "triton" in backend_type and int(arr.shape[0]) != 1:
+        pytest.skip("streamed Triton backend supports runtime k == 1 only")
     hint = None if plan is None else getattr(plan, "k_hint", None)
     expect_warning = "cusparse" in backend_type and hint is not None and int(arr.shape[0]) != int(hint)
     with pytest.warns(RuntimeWarning, match="k_hint") if expect_warning else nullcontext():

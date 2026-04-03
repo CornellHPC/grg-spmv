@@ -34,6 +34,7 @@ class CommonBenchArgs:
     grg: str
     ks: list[int]
     plan_pair_specs: list[PlanPairSpec]
+    ring_buffer_size: int
     options: list[str]
     n_trials: int
     n_warmup: int
@@ -57,6 +58,7 @@ def add_common_bench_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--trials", type=int, default=10, help="Number of timed trials")
     parser.add_argument("--warmup", type=int, default=3, help="Number of warmup runs")
+    parser.add_argument("--ring-buffer-size", type=int, default=2, help="GPU sparse slot ring size")
     parser.add_argument(
         "--plan-up-down",
         action="append",
@@ -158,6 +160,8 @@ def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
     plan_pair_specs = list(args.plan_up_down or [])
     if not plan_pair_specs:
         raise ValueError("--plan-up-down must be provided at least once")
+    if int(args.ring_buffer_size) < 1:
+        raise ValueError("--ring-buffer-size must be >= 1")
     options = parse_matmul_options(args.matmul_options)
     dtype = parse_dtype(args.dtype)
     index_dtype = parse_index_dtype(args.index_dtype)
@@ -166,6 +170,7 @@ def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
         grg=str(args.grg),
         ks=ks,
         plan_pair_specs=plan_pair_specs,
+        ring_buffer_size=int(args.ring_buffer_size),
         options=options,
         n_trials=int(args.trials),
         n_warmup=int(args.warmup),

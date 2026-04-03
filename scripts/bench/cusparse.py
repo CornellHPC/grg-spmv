@@ -29,7 +29,13 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(f"Argument error: {exc}") from exc
 
-    configs = expand_cusparse_configs(common.plan_pair_specs, int(args.device), common.log_level, common.instrumentation)
+    configs = expand_cusparse_configs(
+        common.plan_pair_specs,
+        int(args.device),
+        common.ring_buffer_size,
+        common.log_level,
+        common.instrumentation,
+    )
     if common.dry_run:
         for entry in configs:
             print(

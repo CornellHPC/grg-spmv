@@ -115,6 +115,7 @@ def test_triton_accepts_raw_null_stream():
         device=0,
         stream=0,
         pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+        ring_buffer_size=2,
         log_level="WARNING",
     )
     assert backend._caller_stream_ptr == 0
@@ -127,6 +128,7 @@ def test_triton_accepts_protocol_null_stream_and_retains_owner():
         device=0,
         stream=stream,
         pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+        ring_buffer_size=2,
         log_level="WARNING",
     )
     assert backend._caller_stream_ptr == 0
@@ -142,6 +144,7 @@ def test_triton_accepts_torch_stream_and_retains_owner():
         device=0,
         stream=master,
         pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+        ring_buffer_size=2,
         log_level="WARNING",
     )
     assert backend._caller_stream_keepalive is master
@@ -153,6 +156,7 @@ def test_triton_rejects_invalid_stream():
             device=0,
             stream=object(),
             pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+            ring_buffer_size=2,
             log_level="WARNING",
         )
 
@@ -169,6 +173,7 @@ def test_triton_rejects_foreign_device_stream():
             device=0,
             stream=master,
             pair=TritonPlanPair.from_dicts(make_triton_plan(k_hint=1, store="N", fmt="CSR"), None),
+            ring_buffer_size=2,
             log_level="WARNING",
         )
 
@@ -292,13 +297,13 @@ def test_triton_transpose_compatible_storage_aliases_block_tensors(primary_grg_p
     backend = op._backend
     H = len(backend._level_offsets) - 1
     for dst_level, src_level, row_index in iter_direction_level_pairs(Direction.DOWN, H):
-        down_block = backend._blocks_down[dst_level][row_index]
+        down_block = backend._host_blocks_down[dst_level][row_index]
         if down_block is None:
             continue
-        up_block = backend._blocks_up[src_level][dst_level]
+        up_block = backend._host_blocks_up[src_level][dst_level]
         assert up_block is not None
-        assert down_block.indices.data_ptr() == up_block.indices.data_ptr()
-        assert down_block.indptr.data_ptr() == up_block.indptr.data_ptr()
+        assert np.shares_memory(down_block.indices, up_block.indices)
+        assert np.shares_memory(down_block.indptr, up_block.indptr)
         return
     raise AssertionError("expected at least one shared Triton block alias")
 
@@ -309,13 +314,13 @@ def test_triton_incompatible_formats_do_not_alias_block_tensors(primary_grg_path
     backend = op._backend
     H = len(backend._level_offsets) - 1
     for dst_level, src_level, row_index in iter_direction_level_pairs(Direction.DOWN, H):
-        down_block = backend._blocks_down[dst_level][row_index]
+        down_block = backend._host_blocks_down[dst_level][row_index]
         if down_block is None:
             continue
-        up_block = backend._blocks_up[src_level][dst_level]
+        up_block = backend._host_blocks_up[src_level][dst_level]
         assert up_block is not None
-        assert down_block.indices.data_ptr() != up_block.indices.data_ptr()
-        assert down_block.indptr.data_ptr() != up_block.indptr.data_ptr()
+        assert not np.shares_memory(down_block.indices, up_block.indices)
+        assert not np.shares_memory(down_block.indptr, up_block.indptr)
         return
     raise AssertionError("expected at least one non-shared Triton block")
 
@@ -337,7 +342,7 @@ def test_triton_setup_gpu_allocations_run_inside_caller_root_scope(primary_grg_p
     backend = make_triton_backend(device=0, fmt_up="csr", fmt_down="csc", k_hint=1)
     depth = _install_scope_depth_probe(monkeypatch, backend)
     seen = {"blocks": 0, "workspace": 0}
-    original_build_blocks = type(backend)._build_direction_blocks
+    original_build_blocks = type(backend)._build_direction_host_blocks
     original_alloc_workspace = type(backend)._alloc_workspace
 
     def _wrapped_build_blocks(self, direction):
@@ -350,7 +355,7 @@ def test_triton_setup_gpu_allocations_run_inside_caller_root_scope(primary_grg_p
         seen["workspace"] += 1
         return original_alloc_workspace(self, direction)
 
-    monkeypatch.setattr(type(backend), "_build_direction_blocks", _wrapped_build_blocks)
+    monkeypatch.setattr(type(backend), "_build_direction_host_blocks", _wrapped_build_blocks)
     monkeypatch.setattr(type(backend), "_alloc_workspace", _wrapped_alloc_workspace)
 
     _ = SpmvGRG(
@@ -376,7 +381,7 @@ def test_triton_tune_once_restores_caller_root_scope_on_failure(primary_grg_path
     def _boom(ws, *, config):
         raise RuntimeError("wavefront failed")
 
-    monkeypatch.setattr(backend, "_launch_wavefront", _boom)
+    monkeypatch.setattr(backend, "_enqueue_wavefront_dispatch", _boom)
 
     with pytest.raises(RuntimeError, match="wavefront failed"):
         backend._tune_once(ws, backend._config_up)
@@ -412,7 +417,7 @@ def test_triton_build_wavefront_graph_restores_caller_root_scope_on_capture_fail
     with torch.cuda.stream(backend._root_stream):
         ws = backend._alloc_workspace(Direction.UP)
     counts = _install_bridge_probe(monkeypatch, backend)
-    original = backend._launch_wavefront
+    original = backend._enqueue_wavefront_dispatch
     calls = {"count": 0}
 
     def _boom(ws, *, config):
@@ -421,7 +426,7 @@ def test_triton_build_wavefront_graph_restores_caller_root_scope_on_capture_fail
             raise RuntimeError("capture enqueue failed")
         return original(ws, config=config)
 
-    monkeypatch.setattr(backend, "_launch_wavefront", _boom)
+    monkeypatch.setattr(backend, "_enqueue_wavefront_dispatch", _boom)
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="The CUDA Graph is empty.*", category=UserWarning)
@@ -503,7 +508,7 @@ def test_triton_dynamic_workspace_allocates_inside_caller_root_scope(primary_grg
 @pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
 def test_triton_structure_only_block_bytes_less_than_value_payload(primary_grg_path, spmv_cache_dir):
     op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, fmt_up="csr", fmt_down=None, infer_missing=False)
-    block = _first_present_block(op._backend._blocks_up)
+    block = _first_present_block(op._backend._host_blocks_up)
     structure_only = int(block.nbytes())
     dense_value_payload = int(block.nnz * (int(np.dtype(DATA_DTYPE).itemsize) + 4) + (block.nrows + 1) * 4)
     assert structure_only < dense_value_payload
@@ -580,8 +585,8 @@ def test_triton_debug_log_level_reports_block_memory(primary_grg_path, spmv_cach
     with caplog.at_level(logging.DEBUG):
         op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir, log_level="DEBUG")
     messages = [rec.getMessage() for rec in caplog.records]
-    assert any("Triton blocks_up" in msg and "rows=" in msg and "nnz=" in msg and "indices_bytes=" in msg for msg in messages)
-    assert any("Triton block dir=up" in msg and "cols=" in msg and "nnz=" in msg for msg in messages)
+    assert any("Triton host_blocks_up" in msg and "rows=" in msg and "nnz=" in msg and "indices_bytes=" in msg for msg in messages)
+    assert any("Triton host_blocks_up dir=up" in msg and "cols=" in msg and "nnz=" in msg for msg in messages)
     del op
 
 
@@ -636,7 +641,7 @@ def test_triton_scratch_enabled_up_matches_reference(primary_grg_path, gt_small,
         scratch_up="1",
         infer_missing=False,
     )
-    X, Y_expected = gt_small.get("forward", 4, seed=123, dtype=DATA_DTYPE)
+    X, Y_expected = gt_small.get("forward", 1, seed=123, dtype=DATA_DTYPE)
     np.testing.assert_allclose(op.matmul(X.T, "up").T, Y_expected, atol=1e-5, rtol=1e-5)
 
 
@@ -650,5 +655,16 @@ def test_triton_scratch_enabled_down_matches_reference(primary_grg_path, gt_smal
         scratch_down="0",
         infer_missing=False,
     )
-    X, Y_expected = gt_small.get("backward", 4, seed=123, dtype=DATA_DTYPE)
+    X, Y_expected = gt_small.get("backward", 1, seed=123, dtype=DATA_DTYPE)
     np.testing.assert_allclose(op.matmul(X.T, "down").T, Y_expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_runtime_k_gt_1_raises_clear_error(primary_grg_path, spmv_cache_dir):
+    op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir)
+    x_up = np.ones((2, op.num_samples), dtype=DATA_DTYPE)
+    x_down = np.ones((2, op.num_mutations), dtype=DATA_DTYPE)
+    with pytest.raises(RuntimeError, match="runtime k == 1 only"):
+        op.matmul(x_up, "up")
+    with pytest.raises(RuntimeError, match="runtime k == 1 only"):
+        op.matmul(x_down, "down")

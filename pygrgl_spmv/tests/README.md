@@ -43,6 +43,9 @@ Memory-ledger rule covered by the suite:
 - validation failures before backend execution must not leave capture active
 - backend generic setup payload must be explicitly retained, borrowed, or dropped
 - benchmark memory tables are rendered from canonical `tree_rows()` output plus benchmark-local case metadata
+- GPU retained sparse memory is now split between CPU pinned host block
+  structure and shared CUDA slot buffers
+- Triton runtime execution is singleton-only (`k == 1`)
 
 ## Markers
 

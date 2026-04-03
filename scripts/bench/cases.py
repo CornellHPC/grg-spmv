@@ -69,6 +69,15 @@ def build_inputs_by_k(*, op, ks: list[int], seed_base: int, dtype: np.dtype) -> 
 
 
 def build_case(*, op, scenario: str, direction: str, inputs: _BenchInputs) -> _ScenarioCase:
+    backend_module = str(getattr(op._backend, "__class__", type(op._backend)).__module__).lower()
+    runtime_k = int(inputs.up_sample.shape[0] if direction == "up" else inputs.down.shape[0])
+    if "triton" in backend_module and runtime_k != 1:
+        return _ScenarioCase(
+            matrix=None,
+            kwargs_factory=lambda: {},
+            skip_reason="streamed Triton backend supports runtime k == 1 only",
+        )
+
     if scenario == "baseline":
         return _ScenarioCase(
             matrix=inputs.up_sample if direction == "up" else inputs.down,

@@ -280,7 +280,7 @@ def _setup_cusparse_signatures(lib):
     lib.cusparseSpMM_bufferSize.argtypes = _spmm_args + [POINTER(c_size_t)]
     lib.cusparseSpMM_bufferSize.restype = c_int
 
-    # cusparseSpMM_preprocess
+    # cusparseSpMM_preprocess (kept for diagnostics / standalone repro harnesses)
     lib.cusparseSpMM_preprocess.argtypes = _spmm_args + [c_void_p]
     lib.cusparseSpMM_preprocess.restype = c_int
 
@@ -478,7 +478,11 @@ class CuSparseLib:
     def spmm_preprocess(self, algo, op_a, op_b,
                         alpha_ptr, sp_desc, B_desc, beta_ptr, C_desc,
                         cdt, ext_buf_ptr):
-        """Run cusparseSpMM_preprocess on an already-allocated workspace."""
+        """Run cusparseSpMM_preprocess on an already-allocated workspace.
+
+        Retained for diagnostics and standalone repro harnesses; the Python
+        cuSPARSE backend runtime does not currently call this.
+        """
         _check_status(self._lib.cusparseSpMM_preprocess(
             self._handle, c_int(op_a), c_int(op_b),
             c_void_p(alpha_ptr), sp_desc, B_desc,
