@@ -92,6 +92,17 @@ the dynamic streamed path keeps fixed device addresses.
 
 Selectors and the shared all-ones values source remain device-resident.
 
+The backend resolves slot dtypes from each stored block's final
+CSR/CSC/COO shape and `nnz`, then streams setup one block at a time:
+materialize one stored block, pin its sparse structure, drop the temporary
+SciPy block, and continue. It uses cheap bounds to choose `int32` when that is
+provably safe, otherwise keeps conservative `int64` structure, and widens into
+shared slot families only when needed. CSR/CSC keep separate offset/index slot
+families; COO still uses one common coordinate dtype. Pinned copies are
+range-checked against those chosen slot dtypes.
+Transposed COO blocks are canonicalized to row-sorted COO before upload because
+cuSPARSE assumes COO coordinates are sorted by row.
+
 ## Captured cuSPARSE workspaces
 
 Captured and dynamic cuSPARSE execution use the same slot-backed sparse path.

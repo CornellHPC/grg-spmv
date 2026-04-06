@@ -2,22 +2,36 @@
 
 from __future__ import annotations
 
+import gc
 from contextlib import contextmanager
 from dataclasses import dataclass
+import functools
 import logging
+import weakref
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
 from pygrgl_spmv import SpmvGRG
+from pygrgl_spmv.backends import BackendSetup, ReferenceBackend, ReferencePlanPair
 from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlan, CusparsePlanPair, is_valid_combo
 from pygrgl_spmv.backends.types import Direction, InitMode
+from pygrgl_spmv.grg.sparse import binary_csr_from_parts
 from pygrgl_spmv.memory import alloc_field, capture_snapshot, live_snapshot, tree_rows
+from pygrgl_spmv.tests.backends._streaming_stress import (
+    LargeBandCase,
+    build_large_band_setup,
+    build_overlap_band_setup,
+    clear_gpu_state,
+    expected_down,
+    expected_up,
+    prepare_cusparse_large_band_case,
+)
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
-    INDEX_DTYPE,
     K_CORE,
     K_MATRIX,
     binary_pm1,
@@ -69,7 +83,6 @@ def _make_op(
             infer_missing=infer_missing,
         ),
         dtype,
-        INDEX_DTYPE,
         artifact_dir=cache_dir,
     )
 
@@ -80,6 +93,160 @@ def _run_up(op, X_col_major):
 
 def _run_down(op, X_col_major):
     return op.matmul(X_col_major.T, "down").T
+
+
+def _synthetic_setup(
+    *,
+    n: int = 4,
+    block_indices_dtype=np.int32,
+    block_indptr_dtype=np.int32,
+    selector_indices_dtype=np.int32,
+    selector_indptr_dtype=np.int32,
+    level_offsets_dtype=np.int32,
+):
+    I = binary_csr_from_parts(
+        indices=np.arange(n, dtype=np.int32),
+        indptr=np.arange(n + 1, dtype=np.int32),
+        shape=(n, n),
+        shared_data=True,
+    )
+    P = binary_csr_from_parts(
+        indices=np.roll(np.arange(n, dtype=np.int32), 1),
+        indptr=np.arange(n + 1, dtype=np.int32),
+        shape=(n, n),
+        shared_data=True,
+    )
+    sel_mut = binary_csr_from_parts(
+        indices=np.arange(2 * n, 3 * n, dtype=np.int32),
+        indptr=np.arange(n + 1, dtype=np.int32),
+        shape=(n, 3 * n),
+        shared_data=True,
+    )
+    sel_miss = binary_csr_from_parts(
+        indices=np.empty(0, dtype=np.int32),
+        indptr=np.zeros(n + 1, dtype=np.int32),
+        shape=(n, 3 * n),
+        shared_data=True,
+    )
+
+    for block in (I, P):
+        block.indices = block.indices.astype(block_indices_dtype)
+        block.indptr = block.indptr.astype(block_indptr_dtype)
+    sel_mut.indices = sel_mut.indices.astype(selector_indices_dtype)
+    sel_mut.indptr = sel_mut.indptr.astype(selector_indptr_dtype)
+    sel_miss.indices = sel_miss.indices.astype(selector_indices_dtype)
+    sel_miss.indptr = sel_miss.indptr.astype(selector_indptr_dtype)
+
+    return BackendSetup(
+        A_blocks=[[], [I], [P, I]],
+        level_offsets=np.asarray([0, n, 2 * n, 3 * n], dtype=level_offsets_dtype),
+        num_samples=n,
+        num_mutations=n,
+        num_nodes=3 * n,
+        sel_mut=sel_mut,
+        sel_miss=sel_miss,
+        coalescence_counts=None,
+        dtype=np.float64,
+    )
+
+
+def _materialized_csc_block_with_large_row_index() -> sp.csc_matrix:
+    nrows = int(np.iinfo(np.int32).max) + 2
+    block = sp.csc_matrix((1, 1), dtype=np.bool_)
+    block.data = np.ones(1, dtype=np.bool_)
+    block.indices = np.array([nrows - 1], dtype=np.int64)
+    block.indptr = np.array([0, 1], dtype=np.int32)
+    block._shape = (nrows, 1)
+    return block
+
+
+def _materialized_coo_block_with_large_row_index() -> sp.coo_matrix:
+    nrows = int(np.iinfo(np.int32).max) + 2
+    block = sp.coo_matrix((1, 1), dtype=np.bool_)
+    block.data = np.ones(1, dtype=np.bool_)
+    block.row = np.array([nrows - 1], dtype=np.int64)
+    block.col = np.array([0], dtype=np.int32)
+    block._shape = (nrows, 1)
+    return block
+
+
+@pytest.fixture(scope="module")
+def large_band_case() -> LargeBandCase:
+    return prepare_cusparse_large_band_case()
+
+
+def _make_stream_backend(*, ring_buffer_size: int) -> object:
+    return make_cusparse_backend(
+        device=0,
+        ring_buffer_size=int(ring_buffer_size),
+        fmt_up="csr",
+        fmt_down="csc",
+        k_hint=None,
+        infer_missing=False,
+        log_level="WARNING",
+    )
+
+
+def _force_int64_slot_dtypes(monkeypatch, backend) -> None:
+    # CUDA 12.9 cuSPARSE SpMM becomes unreliable when nnz approaches 2^31 - 1
+    # for both int32 and int64 structure, so these large-stream tests keep nnz
+    # below that boundary and force int64 slot families explicitly.
+    monkeypatch.setattr(
+        backend,
+        "_scan_slot_struct_dtypes",
+        lambda: (np.dtype(np.int64), np.dtype(np.int64)),
+    )
+
+
+def _make_reference_backend() -> ReferenceBackend:
+    return ReferenceBackend(
+        pair=ReferencePlanPair(
+            plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
+            plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+        ),
+        log_level="WARNING",
+    )
+
+
+def _run_stream_direction(backend: object, direction: str, primary: np.ndarray) -> np.ndarray:
+    if direction == "up":
+        output, _ = backend.run_up(primary, init_mode=InitMode.NONE, init=None, need_miss_output=False)
+        return output
+    if direction == "down":
+        return backend.run_down(primary, miss=None, init_mode=InitMode.NONE, init=None)
+    raise ValueError(f"unknown direction {direction!r}")
+
+
+def _expected_band_direction(
+    direction: str,
+    primary: np.ndarray,
+    *,
+    shifts: tuple[int, int, int],
+    bandwidth: int,
+) -> np.ndarray:
+    if direction == "up":
+        return expected_up(primary, shifts=shifts, bandwidth=bandwidth)
+    if direction == "down":
+        return expected_down(primary, shifts=shifts, bandwidth=bandwidth)
+    raise ValueError(f"unknown direction {direction!r}")
+
+
+@functools.cache
+def _spin_kernel():
+    module = cp.RawModule(
+        code=r"""
+        extern "C" __global__ void spin(unsigned long long iters) {
+          unsigned long long start = clock64();
+          while (clock64() - start < iters) {}
+        }
+        """
+    )
+    return module.get_function("spin")
+
+
+def _warm_spin_kernel() -> None:
+    _spin_kernel()((1,), (1,), (1_000_000,))
+    cp.cuda.runtime.deviceSynchronize()
 
 
 def _install_bridge_probe(monkeypatch, backend):
@@ -162,6 +329,284 @@ def test_cupy_memory_accounting_uses_logical_bytes():
     assert snapshot.allocations[0].nbytes == int(arr.nbytes)
 
 
+def test_cusparse_host_pin_uses_separate_struct_dtypes_for_csc_blocks():
+    backend = make_cusparse_backend(device=0, fmt_up="csc", fmt_down=None, k_hint=None, infer_missing=False)
+    backend._apply_setup_state(_synthetic_setup())
+    backend._H = len(backend._level_offsets) - 1
+    stored = _materialized_csc_block_with_large_row_index()
+
+    backend._slot_struct0_dtype = np.dtype(np.int32)
+    backend._slot_struct1_dtype = np.dtype(np.int64)
+    host_block = backend._pin_host_block(stored)
+    assert host_block is not None
+    assert host_block.struct_buffers[0].dtype == np.int32
+    assert host_block.struct_buffers[1].dtype == np.int64
+
+
+def test_cusparse_coo_slots_use_common_coordinate_dtype(monkeypatch):
+    backend = make_cusparse_backend(device=0, fmt_up="coo", fmt_down=None, k_hint=None, algo_up="coo_alg1", infer_missing=False)
+    backend._apply_setup_state(_synthetic_setup())
+    backend._H = len(backend._level_offsets) - 1
+    stored = _materialized_coo_block_with_large_row_index()
+    original = backend._stored_matrix
+
+    def _wrapped(direction: Direction, *, dst_level: int, src_level: int):
+        if direction == Direction.UP and dst_level == 1 and src_level == 0:
+            return stored
+        return original(direction, dst_level=dst_level, src_level=src_level)
+
+    monkeypatch.setattr(backend, "_stored_matrix", _wrapped)
+    struct0_dtype, struct1_dtype = backend._scan_slot_struct_dtypes()
+    assert struct0_dtype == np.dtype(np.int64)
+    assert struct1_dtype == np.dtype(np.int64)
+
+
+def test_cusparse_store_t_coo_materialization_is_row_sorted():
+    block = binary_csr_from_parts(
+        indices=np.array([1, 2, 0, 2], dtype=np.int32),
+        indptr=np.array([0, 2, 4], dtype=np.int32),
+        shape=(2, 3),
+        shared_data=True,
+    )
+    direct = block.T.tocoo()
+    assert not np.all(np.asarray(direct.row)[1:] >= np.asarray(direct.row)[:-1])
+
+    sel_mut = binary_csr_from_parts(
+        indices=np.empty(0, dtype=np.int32),
+        indptr=np.zeros(2, dtype=np.int32),
+        shape=(1, 5),
+        shared_data=True,
+    )
+    sel_miss = binary_csr_from_parts(
+        indices=np.empty(0, dtype=np.int32),
+        indptr=np.zeros(2, dtype=np.int32),
+        shape=(1, 5),
+        shared_data=True,
+    )
+    backend = make_cusparse_backend(
+        device=0,
+        fmt_up=None,
+        fmt_down="coo",
+        k_hint=None,
+        algo_down="coo_alg3",
+        infer_missing=False,
+    )
+    backend._apply_setup_state(
+        BackendSetup(
+            A_blocks=[[], [block]],
+            level_offsets=np.array([0, 3, 5], dtype=np.int32),
+            num_samples=3,
+            num_mutations=1,
+            num_nodes=5,
+            sel_mut=sel_mut,
+            sel_miss=sel_miss,
+            coalescence_counts=None,
+            dtype=np.float64,
+        )
+    )
+    backend._H = len(backend._level_offsets) - 1
+
+    stored = backend._materialize_stored_block(Direction.DOWN, dst_level=0, src_level=1)
+    assert stored is not None
+    rows = np.asarray(stored.row)
+    cols = np.asarray(stored.col)
+    assert np.all(rows[1:] >= rows[:-1])
+    assert np.all((rows[1:] > rows[:-1]) | ((rows[1:] == rows[:-1]) & (cols[1:] >= cols[:-1])))
+    if hasattr(stored, "has_canonical_format"):
+        assert bool(stored.has_canonical_format)
+
+
+def test_cusparse_slot_pool_compacts_safe_int64_indices_and_offsets():
+    backend = make_cusparse_backend(device=0, fmt_up="csr", fmt_down="csc", k_hint=1)
+    backend.setup(
+        _synthetic_setup(
+            block_indices_dtype=np.int64,
+            block_indptr_dtype=np.int64,
+            selector_indices_dtype=np.int64,
+            selector_indptr_dtype=np.int64,
+            level_offsets_dtype=np.int64,
+        )
+    )
+    assert backend._slot_struct0_dtype == np.dtype(np.int32)
+    assert backend._slot_struct1_dtype == np.dtype(np.int32)
+    assert backend._slot_pool is not None
+    assert backend._slot_pool.slots[0].struct0.dtype == np.int32
+    assert backend._slot_pool.slots[0].struct1.dtype == np.int32
+    y, _ = backend.run_up(np.arange(1, 5, dtype=np.float64).reshape(4, 1), init_mode=InitMode.NONE, init=None, need_miss_output=False)
+    np.testing.assert_array_equal(y[:, 0], np.array([5.0, 3.0, 5.0, 7.0]))
+
+
+@pytest.mark.stress
+@pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
+@pytest.mark.parametrize("runtime_k", [1, 2])
+@pytest.mark.parametrize("ring_buffer_size", [1, 2])
+def test_cusparse_large_stream_exact_two_pass_sequence(large_band_case, order, runtime_k, ring_buffer_size, monkeypatch):
+    clear_gpu_state()
+    backend = _make_stream_backend(ring_buffer_size=ring_buffer_size)
+    _force_int64_slot_dtypes(monkeypatch, backend)
+    setup = build_large_band_setup(large_band_case)
+    try:
+        backend.setup(setup)
+        assert backend._slot_struct0_dtype == np.dtype(np.int64)
+        assert backend._slot_struct1_dtype == np.dtype(np.int64)
+        for run_idx, direction in enumerate(order):
+            rng = np.random.default_rng(40_000 + 1_000 * ring_buffer_size + 100 * runtime_k + 10 * run_idx + (0 if direction == "up" else 1))
+            primary = binary_pm1(rng, (large_band_case.n, int(runtime_k)), DATA_DTYPE)
+            expected = _expected_band_direction(
+                direction,
+                primary,
+                shifts=large_band_case.shifts,
+                bandwidth=large_band_case.bandwidth,
+            )
+            actual = _run_stream_direction(backend, direction, primary)
+            np.testing.assert_array_equal(actual, expected)
+    finally:
+        del backend
+        del setup
+        clear_gpu_state()
+
+
+@pytest.mark.stress
+@pytest.mark.parametrize("first_direction", ["up", "down"])
+@pytest.mark.xfail(strict=True, reason="ring=3 must fail once three streamed slots cannot fit into total VRAM")
+def test_cusparse_large_stream_ring3_xfail(large_band_case, first_direction, monkeypatch):
+    clear_gpu_state()
+    backend = _make_stream_backend(ring_buffer_size=3)
+    _force_int64_slot_dtypes(monkeypatch, backend)
+    setup = build_large_band_setup(large_band_case)
+    try:
+        backend.setup(setup)
+        assert backend._slot_struct0_dtype == np.dtype(np.int64)
+        assert backend._slot_struct1_dtype == np.dtype(np.int64)
+        rng = np.random.default_rng(90_000 + (0 if first_direction == "up" else 1))
+        primary = binary_pm1(rng, (large_band_case.n, 1), DATA_DTYPE)
+        _ = _run_stream_direction(backend, first_direction, primary)
+    finally:
+        del backend
+        del setup
+        clear_gpu_state()
+
+
+@pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
+@pytest.mark.parametrize("runtime_k", [1, 2])
+@pytest.mark.parametrize("ring_buffer_size", [1, 2])
+def test_cusparse_stream_copy_overlaps_compute(order, runtime_k, ring_buffer_size, monkeypatch):
+    clear_gpu_state()
+    _warm_spin_kernel()
+    backend = _make_stream_backend(ring_buffer_size=ring_buffer_size)
+    ref_backend = _make_reference_backend()
+    setup = build_overlap_band_setup()
+    state = {
+        "active": True,
+        "compute": [],
+        "copy": [],
+    }
+    original_launch = type(backend)._launch_spmm
+
+    def _wrapped_launch(self, *, ws, op, sp_desc, dst_desc, beta_ptr, stream, ext_ptr):
+        if state["active"]:
+            start = cp.cuda.Event()
+            end = cp.cuda.Event()
+            start.record(stream)
+            original_launch(
+                self,
+                ws=ws,
+                op=op,
+                sp_desc=sp_desc,
+                dst_desc=dst_desc,
+                beta_ptr=beta_ptr,
+                stream=stream,
+                ext_ptr=ext_ptr,
+            )
+            with stream:
+                _spin_kernel()((1,), (1,), (10_000_000,))
+            end.record(stream)
+            state["compute"].append((start, end))
+            return
+        original_launch(
+            self,
+            ws=ws,
+            op=op,
+            sp_desc=sp_desc,
+            dst_desc=dst_desc,
+            beta_ptr=beta_ptr,
+            stream=stream,
+            ext_ptr=ext_ptr,
+        )
+
+    def _wrapped_copy(self, ws, dst_level, op_idx, op):
+        if self._slot_pool is None:
+            raise RuntimeError("slot pool is not initialized")
+        copy_stream = self._slot_copy_streams[op.slot]
+        slot_buffers = self._slot_pool.slots[op.slot]
+        host0, host1 = op.host_block.struct_buffers
+        with copy_stream:
+            prev_event = self._prev_compute_event(ws, op)
+            if prev_event is not None:
+                copy_stream.wait_event(prev_event)
+            start = None
+            end = None
+            if state["active"]:
+                start = cp.cuda.Event()
+                end = cp.cuda.Event()
+                start.record(copy_stream)
+            self._cp.cuda.runtime.memcpyAsync(
+                slot_buffers.struct0.data.ptr,
+                int(np.asarray(host0).ctypes.data),
+                int(host0.nbytes),
+                self._cp.cuda.runtime.memcpyHostToDevice,
+                copy_stream.ptr,
+            )
+            self._cp.cuda.runtime.memcpyAsync(
+                slot_buffers.struct1.data.ptr,
+                int(np.asarray(host1).ctypes.data),
+                int(host1.nbytes),
+                self._cp.cuda.runtime.memcpyHostToDevice,
+                copy_stream.ptr,
+            )
+            if state["active"]:
+                assert start is not None and end is not None
+                end.record(copy_stream)
+                state["copy"].append((start, end))
+            ws.copy_done_by_level[dst_level][op_idx].record(copy_stream)
+
+    monkeypatch.setattr(type(backend), "_launch_spmm", _wrapped_launch)
+    monkeypatch.setattr(type(backend), "_copy_host_block_to_slot", _wrapped_copy)
+
+    def _has_overlap() -> bool:
+        for compute_start, compute_end in state["compute"]:
+            if cp.cuda.get_elapsed_time(compute_start, compute_end) <= 0.0:
+                continue
+            for copy_start, copy_end in state["copy"]:
+                if cp.cuda.get_elapsed_time(copy_start, copy_end) <= 0.0:
+                    continue
+                if cp.cuda.get_elapsed_time(copy_start, compute_end) > 0.0 and cp.cuda.get_elapsed_time(compute_start, copy_end) > 0.0:
+                    return True
+        return False
+
+    try:
+        backend.setup(setup)
+        ref_backend.setup(setup)
+        for run_idx, direction in enumerate(order):
+            rng = np.random.default_rng(50_000 + 1_000 * ring_buffer_size + 100 * runtime_k + 10 * run_idx + (0 if direction == "up" else 1))
+            primary = binary_pm1(rng, (setup.num_samples, int(runtime_k)), DATA_DTYPE)
+            expected = _run_stream_direction(ref_backend, direction, primary)
+            actual = _run_stream_direction(backend, direction, primary)
+            np.testing.assert_array_equal(actual, expected)
+            cp.cuda.runtime.deviceSynchronize()
+            if run_idx == 0:
+                if int(ring_buffer_size) == 1:
+                    assert not _has_overlap()
+                else:
+                    assert _has_overlap()
+                state["active"] = False
+    finally:
+        del ref_backend
+        del backend
+        del setup
+        clear_gpu_state()
+
+
 def test_cusparse_accepts_raw_null_stream():
     backend = CusparseBackend(
         device=0,
@@ -230,7 +675,6 @@ def test_forward_explicit_dense_view_plans(primary_grg_path, gt_small, plan_up):
         primary_grg_path,
         CusparseBackend(device=0, stream=0, pair=CusparsePlanPair.from_dicts(plan_up, None), ring_buffer_size=2, log_level="WARNING"),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=_CACHE_DIR,
     )
     X, Y_expected = gt_small.get("forward", 4, seed=841, dtype=DATA_DTYPE)
@@ -251,7 +695,6 @@ def test_backward_explicit_dense_view_plans(primary_grg_path, gt_small, plan_dow
         primary_grg_path,
         CusparseBackend(device=0, stream=0, pair=CusparsePlanPair.from_dicts(None, plan_down), ring_buffer_size=2, log_level="WARNING"),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=_CACHE_DIR,
     )
     X, Y_expected = gt_small.get("backward", 4, seed=842, dtype=DATA_DTYPE)
@@ -378,7 +821,6 @@ def test_csr_alg3_rejects_csr_transpose_path(primary_grg_path):
                 log_level="WARNING",
             ),
             DATA_DTYPE,
-            INDEX_DTYPE,
             artifact_dir=_CACHE_DIR,
         )
 
@@ -494,7 +936,6 @@ def test_cusparse_setup_and_run_stay_on_declared_device_after_device_switch(prim
             primary_grg_path,
             backend,
             DATA_DTYPE,
-            INDEX_DTYPE,
             artifact_dir=_CACHE_DIR,
         )
         x_up, y_up = gt_small.get("forward", 1, seed=5114, dtype=DATA_DTYPE)
@@ -532,7 +973,6 @@ def test_cusparse_setup_gpu_allocations_run_inside_caller_root_scope(primary_grg
         primary_grg_path,
         backend,
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=_CACHE_DIR,
     )
 
@@ -631,7 +1071,6 @@ def test_cusparse_dynamic_runtime_never_calls_preprocess(primary_grg_path, monke
         primary_grg_path,
         backend,
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=_CACHE_DIR,
     )
 
@@ -649,7 +1088,6 @@ def test_cusparse_graph_setup_and_runtime_never_call_preprocess(primary_grg_path
         primary_grg_path,
         backend,
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=_CACHE_DIR,
     )
 
@@ -769,9 +1207,69 @@ def test_debug_log_level_reports_block_memory(primary_grg_path, caplog):
     with caplog.at_level(logging.DEBUG):
         op = _make_op(primary_grg_path, fmt_up="csr", fmt_down="csc", k_hint=1, log_level="DEBUG")
     messages = [rec.getMessage() for rec in caplog.records]
-    assert any("cuSPARSE host_blocks_up" in msg and "rows=" in msg and "nnz=" in msg and "index0_bytes=" in msg for msg in messages)
+    assert any("cuSPARSE host_blocks_up" in msg and "rows=" in msg and "nnz=" in msg and "struct0_bytes=" in msg for msg in messages)
     assert any("cuSPARSE host_blocks_up dir=up" in msg and "cols=" in msg and "nnz=" in msg for msg in messages)
     del op
+
+
+def test_cusparse_setup_streams_materialized_blocks_before_slot_pool_alloc(monkeypatch):
+    refs: list[weakref.ReferenceType[sp.spmatrix]] = []
+    materialized = {"count": 0, "checked": 0}
+    backend = make_cusparse_backend(device=0, fmt_up="csc", fmt_down="csc", k_hint=None, infer_missing=False)
+    original_materialize = type(backend)._materialize_stored_block
+    original_alloc_slot_pool = type(backend)._alloc_slot_pool
+
+    def _wrapped_materialize(self, direction, *, dst_level, src_level):
+        if refs:
+            gc.collect()
+            materialized["checked"] += 1
+            assert all(ref() is None for ref in refs)
+            refs.clear()
+        sparse = original_materialize(self, direction, dst_level=dst_level, src_level=src_level)
+        if sparse is not None:
+            materialized["count"] += 1
+            refs.append(weakref.ref(sparse))
+        return sparse
+
+    def _wrapped_alloc_slot_pool(self):
+        gc.collect()
+        assert refs
+        assert all(ref() is None for ref in refs)
+        return original_alloc_slot_pool(self)
+
+    monkeypatch.setattr(type(backend), "_materialize_stored_block", _wrapped_materialize)
+    monkeypatch.setattr(type(backend), "_alloc_slot_pool", _wrapped_alloc_slot_pool)
+
+    backend.setup(_synthetic_setup())
+    assert materialized["count"] >= 3
+    assert materialized["checked"] >= 2
+
+
+def test_cusparse_info_log_level_reports_setup_rss_checkpoints(monkeypatch, caplog):
+    import pygrgl_spmv._rss as rss_mod
+
+    values = iter([100, 140, 120, 160])
+    monkeypatch.setattr(rss_mod, "rss_bytes", lambda: next(values))
+
+    backend = make_cusparse_backend(device=0, fmt_up="csc", fmt_down="csc", k_hint=None, infer_missing=False, log_level="INFO")
+    with caplog.at_level(logging.INFO, logger="pygrgl_spmv.backends.cusparse.backend.CusparseBackend"):
+        backend.setup(_synthetic_setup())
+
+    messages = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "pygrgl_spmv.backends.cusparse.backend.CusparseBackend" and rec.getMessage().startswith("rss setup:")
+    ]
+    assert [msg.split()[1] for msg in messages] == [
+        "setup:start",
+        "setup:host_blocks_up_ready",
+        "setup:host_blocks_down_ready",
+        "setup:complete",
+    ]
+    assert "delta_bytes=" not in messages[0]
+    assert all("delta_bytes=" in msg for msg in messages[1:])
+    assert "stored_blocks=" in messages[1] and "struct0_bytes=" in messages[1] and "struct1_bytes=" in messages[1]
+    assert "stored_blocks=" in messages[2] and "struct0_bytes=" in messages[2] and "struct1_bytes=" in messages[2]
 
 
 def test_instrumentation_disables_graph_mode(primary_grg_path, gt_small):
@@ -813,7 +1311,6 @@ def test_transpose_compatible_storage_aliases_payload_but_not_descriptors(primar
         primary_grg_path,
         CusparseBackend(device=0, stream=0, pair=CusparsePlanPair.from_dicts(up, down), ring_buffer_size=2, log_level="WARNING"),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=_CACHE_DIR,
     )
     backend = op._backend
@@ -825,8 +1322,8 @@ def test_transpose_compatible_storage_aliases_payload_but_not_descriptors(primar
             src_level = row_index + dst_level + 1
             up_block = backend._host_blocks_up[src_level][dst_level]
             assert up_block is not None
-            assert np.shares_memory(down_block.index_buffers[0], up_block.index_buffers[0])
-            assert np.shares_memory(down_block.index_buffers[1], up_block.index_buffers[1])
+            assert np.shares_memory(down_block.struct_buffers[0], up_block.struct_buffers[0])
+            assert np.shares_memory(down_block.struct_buffers[1], up_block.struct_buffers[1])
             return
     raise AssertionError("expected at least one shared cuSPARSE block alias")
 

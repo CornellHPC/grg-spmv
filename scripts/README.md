@@ -26,7 +26,7 @@ one config, the `Config` column is rendered as `-`.
 
 Internal layout:
 
-- `scripts/bench/cli.py`: CLI parsing, dtype/index parsing, logging
+- `scripts/bench/cli.py`: CLI parsing and logging
 - `scripts/bench/configs.py`: plan-pair parsing, config expansion, dry-run formatting
 - `scripts/bench/cases.py`: generated inputs and scenario construction
 - `scripts/bench/run.py`: benchmark execution and runtime diagnostics
@@ -126,7 +126,6 @@ Benchmark correctness checks use full-output arrays in memory and do not stop th
 - `--log-level`
 - `--instrumentation`
 - `--dtype` (`float32` or `float64`)
-- `--index-dtype` (`int32` or `int64`)
 - `--dry-run`
 - `--skip-note`
 
@@ -136,9 +135,11 @@ GPU-only flag:
 - `--ring-buffer-size` (shared GPU sparse slot count, default `2`)
 
 `--log-level` sets the root logger level used by benchmark progress, operator
-build logs, the `pygrgl_spmv.grg.compile` RSS logger, and backend logs.
-Cache-miss `.grg` builds can therefore emit INFO-level compile RSS checkpoints
-through the normal logging path.
+build logs, compile RSS checkpoints, backend setup RSS checkpoints, and backend
+logs. Cache-miss `.grg` builds and GPU backend `setup()` can therefore emit
+INFO-level RSS checkpoints through the normal logging path. The GPU
+`setup:host_blocks_*_ready` lines include compact host-block counts and byte
+totals.
 `--instrumentation` is the opt-in switch for slower observability/profiling
 behavior:
 
@@ -194,7 +195,6 @@ uv run python -m scripts.bench.mkl \
   --ks 4,16 \
   --warmup 1 --trials 3 \
   --dtype float64 \
-  --index-dtype int32 \
   --plan-up-down="[k_hint=none,store=N,fmt=CSR,n_threads=1][k_hint=none,store=T,fmt=CSC,n_threads=1]" \
   --matmul-options baseline,init_vector
 ```

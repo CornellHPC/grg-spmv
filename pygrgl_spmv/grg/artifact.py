@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
 
 from pygrgl_spmv.grg.compile import CompiledOperatorState, _invert_permutation
-from pygrgl_spmv.grg.sparse import binary_csr_from_csr_parts
+from pygrgl_spmv.grg.sparse import binary_csr_from_parts
 
 GRG_SPMV_FORMAT_MAGIC = "grg_spmv"
-GRG_SPMV_FORMAT_VERSION = 3
+GRG_SPMV_FORMAT_VERSION = 5
 _FORMAT_MAGIC_KEY = "grg_spmv_magic"
 _FORMAT_VERSION_KEY = "grg_spmv_format_version"
+_LOGGER = logging.getLogger(__name__)
 
 
 def artifact_path_for_grg(grg_path: Path, artifact_root: Path) -> Path:
@@ -34,10 +36,6 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
     if state.init_vector_up_bias is None or state.init_vector_down_bias is None:
         raise RuntimeError("Init vector bias cache must be populated before .grg_spmv save")
 
-    index_dtype = np.asarray(state.level_offsets).dtype
-    if index_dtype not in {np.dtype(np.int32), np.dtype(np.int64)}:
-        raise ValueError(f"Unsupported artifact index dtype: {index_dtype}")
-
     save_dict = {
         _FORMAT_MAGIC_KEY: np.asarray(GRG_SPMV_FORMAT_MAGIC),
         _FORMAT_VERSION_KEY: np.asarray(GRG_SPMV_FORMAT_VERSION, dtype=np.int32),
@@ -48,9 +46,9 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         "num_individuals": np.asarray(state.num_individuals, dtype=np.int64),
         "num_edges": np.asarray(state.num_edges, dtype=np.int64),
         "has_missing_data": np.asarray(state.has_missing_data, dtype=bool),
-        "level_offsets": np.asarray(state.level_offsets, dtype=index_dtype),
-        "node_perm": np.asarray(state.node_perm, dtype=index_dtype),
-        "sample_to_individual": np.asarray(state.sample_to_individual, dtype=index_dtype),
+        "level_offsets": np.asarray(state.level_offsets),
+        "node_perm": np.asarray(state.node_perm),
+        "sample_to_individual": np.asarray(state.sample_to_individual),
         "mutation_positions": np.asarray(state.mutation_positions, dtype=np.float64),
         "mutation_times": np.asarray(state.mutation_times, dtype=np.float64),
         "mutation_alleles": np.asarray(state.mutation_alleles),
@@ -64,10 +62,10 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
             state.init_xtx_up_bias is not None and state.init_xtx_down_bias is not None,
             dtype=bool,
         ),
-        "sel_mut_indices": np.asarray(state.sel_mut.indices, dtype=index_dtype),
-        "sel_mut_indptr": np.asarray(state.sel_mut.indptr, dtype=index_dtype),
-        "sel_miss_indices": np.asarray(state.sel_miss.indices, dtype=index_dtype),
-        "sel_miss_indptr": np.asarray(state.sel_miss.indptr, dtype=index_dtype),
+        "sel_mut_indices": np.asarray(state.sel_mut.indices),
+        "sel_mut_indptr": np.asarray(state.sel_mut.indptr),
+        "sel_miss_indices": np.asarray(state.sel_miss.indices),
+        "sel_miss_indptr": np.asarray(state.sel_miss.indptr),
     }
     if state.coalescence_counts is not None:
         save_dict["coalescence_counts"] = np.asarray(state.coalescence_counts, dtype=np.int64)
@@ -77,9 +75,9 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         save_dict["init_xtx_down_bias"] = np.asarray(state.init_xtx_down_bias)
     for dst_level, blocks in enumerate(state.A_blocks):
         for src_level, block in enumerate(blocks):
-            save_dict[f"A_blocks_{dst_level}_{src_level}_indices"] = np.asarray(block.indices, dtype=index_dtype)
-            save_dict[f"A_blocks_{dst_level}_{src_level}_indptr"] = np.asarray(block.indptr, dtype=index_dtype)
-            save_dict[f"A_blocks_{dst_level}_{src_level}_shape"] = np.asarray(block.shape, dtype=index_dtype)
+            save_dict[f"A_blocks_{dst_level}_{src_level}_indices"] = np.asarray(block.indices)
+            save_dict[f"A_blocks_{dst_level}_{src_level}_indptr"] = np.asarray(block.indptr)
+            save_dict[f"A_blocks_{dst_level}_{src_level}_shape"] = np.asarray(block.shape, dtype=np.int64)
 
     path = Path(artifact_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,31 +89,29 @@ def _load_archive(artifact_path) -> np.lib.npyio.NpzFile:
     return np.load(artifact_path, allow_pickle=False)
 
 
-def _artifact_index_dtype(data: np.lib.npyio.NpzFile) -> np.dtype:
-    dtype = np.asarray(data["level_offsets"]).dtype
-    if dtype not in {np.dtype(np.int32), np.dtype(np.int64)}:
-        raise ValueError(f"Unsupported .grg_spmv structural dtype: {dtype}")
-    required = (
-        "node_perm",
-        "sample_to_individual",
-        "sel_mut_indices",
-        "sel_mut_indptr",
-        "sel_miss_indices",
-        "sel_miss_indptr",
+def _log_struct_array(key: str, arr: np.ndarray) -> None:
+    if not _LOGGER.isEnabledFor(logging.INFO):
+        return
+    _LOGGER.info(
+        "artifact array key=%s dtype=%s shape=%s nbytes=%d",
+        key,
+        np.asarray(arr).dtype,
+        tuple(int(v) for v in np.asarray(arr).shape),
+        int(np.asarray(arr).nbytes),
     )
-    for key in required:
-        arr_dtype = np.asarray(data[key]).dtype
-        if arr_dtype != dtype:
-            raise ValueError(f"Inconsistent structural dtype for {key}: {arr_dtype}, expected {dtype}")
-    for key in data.files:
-        if key.startswith("A_blocks_") and key.endswith(("_indices", "_indptr", "_shape")):
-            arr_dtype = np.asarray(data[key]).dtype
-            if arr_dtype != dtype:
-                raise ValueError(f"Inconsistent structural dtype for {key}: {arr_dtype}, expected {dtype}")
-    return dtype
 
 
-def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
+def _load_struct_array(data: np.lib.npyio.NpzFile, key: str, *, non_negative: bool = True) -> np.ndarray:
+    arr = np.asarray(data[key])
+    if arr.dtype not in {np.dtype(np.int32), np.dtype(np.int64)}:
+        raise ValueError(f"Unsupported structural dtype for {key}: {arr.dtype}")
+    if non_negative and arr.size and int(arr.min()) < 0:
+        raise ValueError(f"Structural array {key} must be non-negative")
+    _log_struct_array(key, arr)
+    return arr
+
+
+def load_grg_spmv(artifact_path, dtype) -> CompiledOperatorState:
     data = _load_archive(artifact_path)
     if _FORMAT_MAGIC_KEY not in data.files:
         raise ValueError(f"Unsupported .grg_spmv artifact in {artifact_path}: missing {_FORMAT_MAGIC_KEY}")
@@ -130,20 +126,12 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
             f"Unsupported .grg_spmv artifact in {artifact_path}: got {version}, expected {GRG_SPMV_FORMAT_VERSION}"
         )
 
-    artifact_index_dtype = _artifact_index_dtype(data)
-    requested_index_dtype = np.dtype(index_dtype)
-    if requested_index_dtype != artifact_index_dtype:
-        raise ValueError(
-            f".grg_spmv structural dtype is {artifact_index_dtype.name}, "
-            f"but SpmvGRG was requested with index_dtype={requested_index_dtype.name}"
-        )
-
     num_samples = int(np.asarray(data["num_samples"]).item())
     num_mutations = int(np.asarray(data["num_mutations"]).item())
     num_nodes = int(np.asarray(data["num_nodes"]).item())
-    level_offsets = np.asarray(data["level_offsets"], dtype=artifact_index_dtype)
-    node_perm = np.asarray(data["node_perm"], dtype=artifact_index_dtype)
-    sample_to_individual = np.asarray(data["sample_to_individual"], dtype=artifact_index_dtype)
+    level_offsets = _load_struct_array(data, "level_offsets")
+    node_perm = _load_struct_array(data, "node_perm")
+    sample_to_individual = _load_struct_array(data, "sample_to_individual")
     init_vector_up_bias = np.asarray(data["init_vector_up_bias"], dtype=dtype)
     init_vector_down_bias = np.asarray(data["init_vector_down_bias"], dtype=dtype)
 
@@ -157,19 +145,17 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
         init_xtx_up_bias = np.asarray(data["init_xtx_up_bias"], dtype=dtype)
         init_xtx_down_bias = np.asarray(data["init_xtx_down_bias"], dtype=dtype)
 
-    inv_node_perm = _invert_permutation(node_perm, index_dtype=artifact_index_dtype)
+    inv_node_perm = _invert_permutation(node_perm)
 
-    sel_mut = binary_csr_from_csr_parts(
-        indices=np.asarray(data["sel_mut_indices"], dtype=artifact_index_dtype),
-        indptr=np.asarray(data["sel_mut_indptr"], dtype=artifact_index_dtype),
+    sel_mut = binary_csr_from_parts(
+        indices=_load_struct_array(data, "sel_mut_indices"),
+        indptr=_load_struct_array(data, "sel_mut_indptr"),
         shape=(num_mutations, num_nodes),
-        index_dtype=artifact_index_dtype,
     )
-    sel_miss = binary_csr_from_csr_parts(
-        indices=np.asarray(data["sel_miss_indices"], dtype=artifact_index_dtype),
-        indptr=np.asarray(data["sel_miss_indptr"], dtype=artifact_index_dtype),
+    sel_miss = binary_csr_from_parts(
+        indices=_load_struct_array(data, "sel_miss_indices"),
+        indptr=_load_struct_array(data, "sel_miss_indptr"),
         shape=(num_mutations, num_nodes),
-        index_dtype=artifact_index_dtype,
     )
 
     num_levels = len(level_offsets) - 1
@@ -178,11 +164,10 @@ def load_grg_spmv(artifact_path, dtype, index_dtype) -> CompiledOperatorState:
         level_blocks = []
         for src_level in range(dst_level):
             level_blocks.append(
-                binary_csr_from_csr_parts(
-                    indices=np.asarray(data[f"A_blocks_{dst_level}_{src_level}_indices"], dtype=artifact_index_dtype),
-                    indptr=np.asarray(data[f"A_blocks_{dst_level}_{src_level}_indptr"], dtype=artifact_index_dtype),
-                    shape=np.asarray(data[f"A_blocks_{dst_level}_{src_level}_shape"], dtype=artifact_index_dtype),
-                    index_dtype=artifact_index_dtype,
+                binary_csr_from_parts(
+                    indices=_load_struct_array(data, f"A_blocks_{dst_level}_{src_level}_indices"),
+                    indptr=_load_struct_array(data, f"A_blocks_{dst_level}_{src_level}_indptr"),
+                    shape=np.asarray(data[f"A_blocks_{dst_level}_{src_level}_shape"], dtype=np.int64),
                     shared_data=True,
                 )
             )

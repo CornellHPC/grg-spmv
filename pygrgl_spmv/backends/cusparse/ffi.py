@@ -40,6 +40,7 @@ CUSPARSE_OPERATION_TRANSPOSE = 1
 CUSPARSE_ORDER_COL = 1              # column-major dense layout
 CUSPARSE_ORDER_ROW = 2              # row-major (C-contiguous) dense layout
 CUSPARSE_INDEX_32I = 2              # int32 index type
+CUSPARSE_INDEX_64I = 3              # int64 index type
 CUSPARSE_INDEX_BASE_ZERO = 0
 CUSPARSE_POINTER_MODE_DEVICE = 1    # alpha/beta are device pointers
 
@@ -397,38 +398,38 @@ class CuSparseLib:
 
     # --- Descriptor creation ------------------------------------------------
 
-    def create_csr(self, nrows, ncols, nnz, indptr_ptr, indices_ptr, data_ptr, cdt):
+    def create_csr(self, nrows, ncols, nnz, indptr_ptr, indices_ptr, data_ptr, offset_type, index_type, cdt):
         """Create a const CSR sparse matrix descriptor. Returns c_void_p."""
         desc = c_void_p()
         _check_status(self._lib.cusparseCreateConstCsr(
             byref(desc),
             c_int64(nrows), c_int64(ncols), c_int64(nnz),
             c_void_p(indptr_ptr), c_void_p(indices_ptr), c_void_p(data_ptr),
-            c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_32I),
+            c_int(offset_type), c_int(index_type),
             c_int(CUSPARSE_INDEX_BASE_ZERO), c_int(cdt),
         ), 'cusparseCreateConstCsr')
         return desc
 
-    def create_csc(self, nrows, ncols, nnz, indptr_ptr, indices_ptr, data_ptr, cdt):
+    def create_csc(self, nrows, ncols, nnz, indptr_ptr, indices_ptr, data_ptr, offset_type, index_type, cdt):
         """Create a const CSC sparse matrix descriptor. Returns c_void_p."""
         desc = c_void_p()
         _check_status(self._lib.cusparseCreateConstCsc(
             byref(desc),
             c_int64(nrows), c_int64(ncols), c_int64(nnz),
             c_void_p(indptr_ptr), c_void_p(indices_ptr), c_void_p(data_ptr),
-            c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_32I),
+            c_int(offset_type), c_int(index_type),
             c_int(CUSPARSE_INDEX_BASE_ZERO), c_int(cdt),
         ), 'cusparseCreateConstCsc')
         return desc
 
-    def create_coo(self, nrows, ncols, nnz, row_ptr, col_ptr, data_ptr, cdt):
+    def create_coo(self, nrows, ncols, nnz, row_ptr, col_ptr, data_ptr, coord_type, cdt):
         """Create a const COO sparse matrix descriptor. Returns c_void_p."""
         desc = c_void_p()
         _check_status(self._lib.cusparseCreateConstCoo(
             byref(desc),
             c_int64(nrows), c_int64(ncols), c_int64(nnz),
             c_void_p(row_ptr), c_void_p(col_ptr), c_void_p(data_ptr),
-            c_int(CUSPARSE_INDEX_32I), c_int(CUSPARSE_INDEX_BASE_ZERO),
+            c_int(coord_type), c_int(CUSPARSE_INDEX_BASE_ZERO),
             c_int(cdt),
         ), 'cusparseCreateConstCoo')
         return desc

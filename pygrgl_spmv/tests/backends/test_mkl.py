@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import warnings
 
 import numpy as np
@@ -11,7 +12,6 @@ from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.backends.mkl import MklBackend, MklPlan, MklPlanPair
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
-    INDEX_DTYPE,
     K_CORE,
     K_MATRIX,
     make_mkl_backend,
@@ -22,6 +22,34 @@ from pygrgl_spmv.tests.conftest import (
 pytestmark = pytest.mark.mkl
 
 MKL_FMTS = ["csr", "csc", "coo"]
+
+
+class _FakeMklLib:
+    def __init__(self):
+        self.calls: list[tuple[str, int, int]] = []
+
+    def mkl_sparse_d_create_csr(self, _handle, _base, m, n, _rows_start, _rows_end, _col_idx, _values):
+        self.calls.append(("csr", int(getattr(m, "value", m)), int(getattr(n, "value", n))))
+        return 0
+
+    def mkl_sparse_destroy(self, _handle):
+        return 0
+
+
+class _FakeCsr:
+    def __init__(
+        self,
+        *,
+        shape: tuple[int, int] = (1, 1),
+        indices_dtype=np.int32,
+        indptr_dtype=np.int32,
+        nnz: int = 1,
+    ) -> None:
+        self.shape = tuple(int(v) for v in shape)
+        self.nnz = int(nnz)
+        self.indices = np.zeros(self.nnz, dtype=indices_dtype)
+        self.indptr = np.array([0, self.nnz], dtype=indptr_dtype)
+        self.data = np.ones(self.nnz, dtype=np.float64)
 
 
 def _make_mkl_op(
@@ -46,7 +74,6 @@ def _make_mkl_op(
             log_level="WARNING",
         ),
         dtype,
-        INDEX_DTYPE,
         artifact_dir=cache_dir,
     )
 
@@ -91,7 +118,6 @@ def _make_backend(primary_grg_path, spmv_cache_dir, *, plan_up, plan_down):
             log_level="WARNING",
         ),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=spmv_cache_dir,
     )
     return op._backend
@@ -242,7 +268,6 @@ def test_run_uses_per_direction_thread_counts(primary_grg_path, gt_small, spmv_c
             log_level="WARNING",
         ),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=spmv_cache_dir,
     )
 
@@ -275,13 +300,51 @@ def test_nonshared_handles_keep_distinct_k_hints(primary_grg_path, spmv_cache_di
             log_level="WARNING",
         ),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=spmv_cache_dir,
     )
 
     assert sorted(set(k for _, k, _ in calls)) == [2, 16]
     assert all(not transpose for _, _, transpose in calls)
     assert len({handle_id for handle_id, _, _ in calls}) >= 2
+
+
+def test_lp64_rejects_int64_csr_indices_before_mkl_call(monkeypatch):
+    import pygrgl_spmv.backends.mkl.ffi as mkl_ffi
+
+    fake_lib = _FakeMklLib()
+    fake_mat = _FakeCsr(indices_dtype=np.int64, indptr_dtype=np.int32)
+    monkeypatch.setattr(mkl_ffi, "_ensure_loaded", lambda: (fake_lib, np.int32, ctypes.c_int))
+    monkeypatch.setattr(mkl_ffi, "_scipy_to_fmt", lambda _mat, _fmt: fake_mat)
+
+    with pytest.raises(ValueError, match="LP64 MKL requires CSR indices to use int32"):
+        mkl_ffi.MklSparseHandle(object(), "csr")
+    assert fake_lib.calls == []
+
+
+def test_lp64_rejects_oversized_shape_before_mkl_call(monkeypatch):
+    import pygrgl_spmv.backends.mkl.ffi as mkl_ffi
+
+    fake_lib = _FakeMklLib()
+    fake_mat = _FakeCsr(shape=(1, np.iinfo(np.int32).max + 1), nnz=0)
+    monkeypatch.setattr(mkl_ffi, "_ensure_loaded", lambda: (fake_lib, np.int32, ctypes.c_int))
+    monkeypatch.setattr(mkl_ffi, "_scipy_to_fmt", lambda _mat, _fmt: fake_mat)
+
+    with pytest.raises(ValueError, match="LP64 MKL requires ncols <="):
+        mkl_ffi.MklSparseHandle(object(), "csr")
+    assert fake_lib.calls == []
+
+
+def test_lp64_accepts_valid_int32_csr(monkeypatch):
+    import pygrgl_spmv.backends.mkl.ffi as mkl_ffi
+
+    fake_lib = _FakeMklLib()
+    fake_mat = _FakeCsr(indices_dtype=np.int32, indptr_dtype=np.int32)
+    monkeypatch.setattr(mkl_ffi, "_ensure_loaded", lambda: (fake_lib, np.int32, ctypes.c_int))
+    monkeypatch.setattr(mkl_ffi, "_scipy_to_fmt", lambda _mat, _fmt: fake_mat)
+
+    handle = mkl_ffi.MklSparseHandle(object(), "csr")
+    assert fake_lib.calls == [("csr", 1, 1)]
+    handle.destroy()
 
 
 def test_up_handles_store_transposed_blocks_when_plan_requests_store_t(primary_grg_path, spmv_cache_dir):

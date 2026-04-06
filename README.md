@@ -32,7 +32,6 @@ op = SpmvGRG(
     "/path/to/file.grg",
     backend,
     np.float64,
-    np.int32,
     artifact_dir="pygrgl_spmv_artifacts",
 )
 ```
@@ -57,10 +56,12 @@ streams must belong to that same device.
 
 Backend `log_level` controls backend verbosity. `SpmvGRG` itself has no
 `log_level=` parameter and follows normal Python logger inheritance. Cache-miss
-`.grg` builds emit INFO-level RSS checkpoints through the
-`pygrgl_spmv.grg.compile` logger when the root logger is configured
-accordingly. Set `instrumentation=True` when you want profiling/observability
-behavior that may reduce absolute performance.
+`.grg` builds and GPU backend `setup()` can emit INFO-level RSS checkpoints
+through the normal logging path when the relevant logger level reaches `INFO`.
+The GPU `setup:host_blocks_*_ready` lines include compact host-block counts and
+byte totals.
+Set `instrumentation=True` when you want profiling/observability behavior that
+may reduce absolute performance.
 
 ## Artifact behavior
 
@@ -68,6 +69,10 @@ behavior that may reduce absolute performance.
 - default artifact root: `./pygrgl_spmv_artifacts`
 - derived artifact paths encode the full GRG path to avoid collisions between GRGs with the same filename in different directories
 - you can also construct `SpmvGRG` directly from a `.grg_spmv` file without the original `.grg`
+- compile uses scratch structural dtypes internally, then finalizes each stored structural array independently to `int32` or `int64`
+- zero-length structural arrays are canonicalized to `int32`
+- `.grg_spmv` load preserves those stored structural dtypes and logs them at INFO level
+- compile RSS checkpoints separate mutation-row materialization from post-selector retained state
 - binary sparse structure is stored as bool-backed CSR on the host to reduce RAM
 - non-empty `A_blocks` reuse one shared read-only zero-stride bool payload
 - selectors remain ordinary bool-backed CSR matrices

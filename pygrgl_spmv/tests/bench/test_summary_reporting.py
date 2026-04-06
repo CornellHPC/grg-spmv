@@ -20,7 +20,7 @@ from pygrgl_spmv.memory import (
     live_snapshot,
 )
 from pygrgl_spmv.backends.mkl import MklPlan
-from scripts.bench.cli import parse_dtype, parse_index_dtype, tolerances_for_dtype
+from scripts.bench.cli import parse_dtype, tolerances_for_dtype
 from scripts.bench.configs import BenchConfig, format_dry_run_line
 from scripts.bench.report import (
     bytes_to_gib,
@@ -96,13 +96,11 @@ class _RootMem:
 def test_dtype_parsers_and_tolerances():
     assert parse_dtype("float32") == np.dtype(np.float32)
     assert parse_dtype("float64") == np.dtype(np.float64)
-    assert parse_index_dtype("int32") == np.dtype(np.int32)
-    assert parse_index_dtype("int64") == np.dtype(np.int64)
     assert tolerances_for_dtype(np.float32) == (1e-2, 1e-1)
     assert tolerances_for_dtype(np.float64) == (1e-8, 1e-5)
 
 
-def test_format_dry_run_line_includes_dtype_and_index_dtype():
+def test_format_dry_run_line_includes_dtype():
     line = format_dry_run_line(
         BenchConfig(
             label="x",
@@ -115,10 +113,8 @@ def test_format_dry_run_line_includes_dtype_and_index_dtype():
         [1, 4],
         ["baseline"],
         dtype=np.float32,
-        index_dtype=np.int32,
     )
     assert "dtype=float32" in line
-    assert "index_dtype=int32" in line
 
 
 def test_summarize_config_display_single_config_moves_everything_to_common():

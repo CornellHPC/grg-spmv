@@ -15,7 +15,6 @@ from pygrgl_spmv.grg.artifact import load_grg_spmv
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
     HAS_MKL_RUNTIME,
-    INDEX_DTYPE,
     make_mkl_backend,
     matmul_expect_k_hint_warning,
     tol,
@@ -30,8 +29,8 @@ def test_wavefront_debug_logging_preserves_values(backend_builder, primary_grg_p
     wave_backend = backend_builder()
     wave_backend._logger.setLevel(logging.DEBUG)
 
-    op_base = SpmvGRG(primary_grg_path, base_backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
-    op_wave = SpmvGRG(primary_grg_path, wave_backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    op_base = SpmvGRG(primary_grg_path, base_backend, DATA_DTYPE, artifact_dir=spmv_cache_dir)
+    op_wave = SpmvGRG(primary_grg_path, wave_backend, DATA_DTYPE, artifact_dir=spmv_cache_dir)
 
     rng = np.random.default_rng(4404)
     rows = 2
@@ -61,11 +60,11 @@ def test_reusing_backend_instance_does_not_leak_call_buffers_into_next_setup(pri
             plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
         ),
     )
-    first = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    first = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, artifact_dir=spmv_cache_dir)
     x = np.ones((8, first.num_samples), dtype=DATA_DTYPE)
     _ = first.matmul(x, pygrgl.TraversalDirection.UP)
 
-    second = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    second = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, artifact_dir=spmv_cache_dir)
     assert second.memory.retained is not None
     assert not any(row.retention == "call" and row.owner == "backend" for row in second.memory.retained.allocations)
 
@@ -78,13 +77,13 @@ def test_validation_error_before_backend_run_does_not_leave_capture_active(prima
             plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
         ),
     )
-    op = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    op = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, artifact_dir=spmv_cache_dir)
     op._compiled.coalescence_counts = None
     op._retained_mem.coalescence_counts = None
     x = np.ones((2, op.num_samples), dtype=DATA_DTYPE)
     with pytest.raises(ValueError, match="coalescence counts"):
         op.matmul(x, pygrgl.TraversalDirection.UP, init="xtx")
-    reused = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    reused = SpmvGRG(primary_grg_path, backend, DATA_DTYPE, artifact_dir=spmv_cache_dir)
     assert reused.memory.retained is not None
 
 
@@ -96,7 +95,6 @@ def test_wavefront_debug_logs_all_levels_when_instrumented(primary_grg_path, spm
             primary_grg_path,
             make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1, log_level="DEBUG", instrumentation=True),
             DATA_DTYPE,
-            INDEX_DTYPE,
             artifact_dir=spmv_cache_dir,
         )
         x = np.ones((2, op.num_samples), dtype=DATA_DTYPE)
@@ -114,7 +112,6 @@ def test_wavefront_debug_logging_is_quiet_without_instrumentation(primary_grg_pa
             primary_grg_path,
             make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1, log_level="DEBUG", instrumentation=False),
             DATA_DTYPE,
-            INDEX_DTYPE,
             artifact_dir=spmv_cache_dir,
         )
         x = np.ones((2, op.num_samples), dtype=DATA_DTYPE)
@@ -135,7 +132,7 @@ def test_cache_miss_build_logs_rss_checkpoints_at_info(primary_grg_path, tmp_pat
     )
 
     with caplog.at_level(logging.INFO):
-        op = SpmvGRG(dst, backend, DATA_DTYPE, INDEX_DTYPE, artifact_dir=artifact_dir)
+        op = SpmvGRG(dst, backend, DATA_DTYPE, artifact_dir=artifact_dir)
 
     operator_messages = [
         rec.getMessage()
@@ -147,10 +144,27 @@ def test_cache_miss_build_logs_rss_checkpoints_at_info(primary_grg_path, tmp_pat
         for rec in caplog.records
         if rec.name == "pygrgl_spmv.grg.compile"
     ]
+    compile_labels = [
+        msg.split()[1]
+        for msg in compile_messages
+        if msg.startswith("rss compile:")
+    ]
+    expected_labels = [
+        "compile:start",
+        "compile:blocks_ready",
+        "compile:mutation_rows_loaded",
+        "compile:selectors_built",
+        "compile:selectors_ready",
+        "compile:mutation_table_ready",
+    ]
+    matched = 0
+    for label in compile_labels:
+        if matched < len(expected_labels) and label == expected_labels[matched]:
+            matched += 1
+
     assert any("Building SpmvGRG from" in msg for msg in operator_messages)
     assert any("rss artifact:grg_loaded" in msg and "rss_bytes=" in msg for msg in compile_messages)
-    assert any("rss compile:start" in msg and "rss_bytes=" in msg for msg in compile_messages)
-    assert any("rss compile:mutation_table_ready" in msg and "delta_bytes=" in msg for msg in compile_messages)
+    assert matched == len(expected_labels)
     assert any("rss artifact:saved" in msg and "delta_bytes=" in msg for msg in compile_messages)
     assert op.artifact_path.exists()
 
@@ -169,11 +183,10 @@ def test_artifact_load_rehydrates_shared_nonempty_block_data(primary_grg_path, t
         dst,
         backend,
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=artifact_dir,
     )
 
-    state = load_grg_spmv(op.artifact_path, DATA_DTYPE, INDEX_DTYPE)
+    state = load_grg_spmv(op.artifact_path, DATA_DTYPE)
     assert state.A_blocks is not None
     data_arrays = [block.data for level_blocks in state.A_blocks for block in level_blocks if block.nnz > 0]
     assert data_arrays
@@ -226,7 +239,6 @@ def test_cache_miss_build_uses_down_edges_only_and_fails_on_missing_coals(primar
             dst,
             make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
             DATA_DTYPE,
-            INDEX_DTYPE,
             artifact_dir=cache_dir,
         )
     assert calls["loader"] == 1
@@ -244,7 +256,6 @@ def test_cache_hit_does_not_reload_grg(primary_grg_path, tmp_path, monkeypatch):
         dst,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=cache_dir,
     )
     import pygrgl_spmv.grg as grg_module
@@ -257,7 +268,6 @@ def test_cache_hit_does_not_reload_grg(primary_grg_path, tmp_path, monkeypatch):
         dst,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=cache_dir,
     )
     assert second.shape == first.shape
@@ -282,7 +292,6 @@ def test_cache_hit_skips_init_bias_rebuild(primary_grg_path, tmp_path, monkeypat
         dst,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=cache_dir,
     )
 
@@ -296,7 +305,6 @@ def test_cache_hit_skips_init_bias_rebuild(primary_grg_path, tmp_path, monkeypat
         dst,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=cache_dir,
     )
     assert second.shape[0] > 0
@@ -312,7 +320,6 @@ def test_artifact_path_uses_grg_spmv_suffix(primary_grg_path, tmp_path):
         dst,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=artifact_dir,
     )
     assert op.artifact_path.suffix == ".grg_spmv"
@@ -329,7 +336,6 @@ def test_direct_artifact_load_skips_grg_loader(primary_grg_path, tmp_path, monke
         dst,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=artifact_dir,
     )
 
@@ -343,7 +349,6 @@ def test_direct_artifact_load_skips_grg_loader(primary_grg_path, tmp_path, monke
         first.artifact_path,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=artifact_dir,
     )
 
@@ -365,25 +370,29 @@ def test_direct_artifact_load_skips_grg_loader(primary_grg_path, tmp_path, monke
 
 @pytest.mark.mkl
 @MKL_ONLY
-def test_artifact_index_dtype_mismatch_rejected(primary_grg_path, tmp_path):
-    dst = tmp_path / "artifact-dtype.grg"
+def test_direct_artifact_load_logs_structural_array_dtypes(primary_grg_path, tmp_path, caplog):
+    dst = tmp_path / "direct-artifact-logs.grg"
     shutil.copy2(primary_grg_path, dst)
     artifact_dir = tmp_path / "artifact-root"
     first = SpmvGRG(
         dst,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
         DATA_DTYPE,
-        np.int32,
         artifact_dir=artifact_dir,
     )
-    with pytest.raises(ValueError, match="structural dtype"):
+
+    with caplog.at_level(logging.INFO, logger="pygrgl_spmv.grg.artifact"):
         _ = SpmvGRG(
             first.artifact_path,
             make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
             DATA_DTYPE,
-            np.int64,
             artifact_dir=artifact_dir,
         )
+
+    messages = [rec.getMessage() for rec in caplog.records if rec.name == "pygrgl_spmv.grg.artifact"]
+    assert any("artifact array key=level_offsets" in msg and "dtype=" in msg for msg in messages)
+    assert any("artifact array key=sel_mut_indices" in msg and "dtype=" in msg for msg in messages)
+    assert any("artifact array key=A_blocks_1_0_indptr" in msg and "dtype=" in msg for msg in messages)
 
 
 @pytest.mark.smoke
@@ -394,7 +403,6 @@ def test_mem_usage_tracks_retained_and_last_call(primary_grg_path, spmv_cache_di
         primary_grg_path,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1, log_level="WARNING"),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=spmv_cache_dir,
     )
     assert op.memory.retained is not None

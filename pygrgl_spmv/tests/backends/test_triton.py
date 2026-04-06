@@ -2,20 +2,34 @@
 
 from __future__ import annotations
 
+import gc
 from contextlib import contextmanager
 import logging
 import numpy as np
 import pytest
+import scipy.sparse as sp
+import weakref
 import warnings
 
 from pygrgl_spmv import SpmvGRG
+from pygrgl_spmv.backends import BackendSetup, ReferenceBackend, ReferencePlanPair
 from pygrgl_spmv.backends.triton import TritonBackend, TritonPlanPair
 from pygrgl_spmv.backends import iter_direction_level_pairs
 from pygrgl_spmv.backends.triton.backend import _AUTOTUNE_CACHE
 from pygrgl_spmv.backends.triton.kernel import CscKernelConfig, CsrKernelConfig
 from pygrgl_spmv.backends.types import Direction, InitMode
+from pygrgl_spmv.grg.sparse import binary_csr_from_parts
 from pygrgl_spmv.memory import live_snapshot
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, HAS_TRITON_RUNTIME, INDEX_DTYPE, make_triton_backend, make_triton_plan
+from pygrgl_spmv.tests.backends._streaming_stress import (
+    LargeBandCase,
+    build_large_band_setup,
+    build_overlap_band_setup,
+    clear_gpu_state,
+    expected_down,
+    expected_up,
+    prepare_triton_large_band_case,
+)
+from pygrgl_spmv.tests.conftest import DATA_DTYPE, HAS_TRITON_RUNTIME, binary_pm1, make_triton_backend, make_triton_plan
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
@@ -63,7 +77,6 @@ def _make_op(
             infer_missing=infer_missing,
         ),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=cache_dir,
     )
 
@@ -74,6 +87,129 @@ def _first_present_block(grid):
             if block is not None:
                 return block
     raise AssertionError("expected at least one non-empty Triton block")
+
+
+def _synthetic_setup(
+    *,
+    n: int = 4,
+    block_indices_dtype=np.int32,
+    block_indptr_dtype=np.int32,
+    selector_indices_dtype=np.int32,
+    selector_indptr_dtype=np.int32,
+    level_offsets_dtype=np.int32,
+):
+    I = binary_csr_from_parts(
+        indices=np.arange(n, dtype=np.int32),
+        indptr=np.arange(n + 1, dtype=np.int32),
+        shape=(n, n),
+        shared_data=True,
+    )
+    P = binary_csr_from_parts(
+        indices=np.roll(np.arange(n, dtype=np.int32), 1),
+        indptr=np.arange(n + 1, dtype=np.int32),
+        shape=(n, n),
+        shared_data=True,
+    )
+    sel_mut = binary_csr_from_parts(
+        indices=np.arange(2 * n, 3 * n, dtype=np.int32),
+        indptr=np.arange(n + 1, dtype=np.int32),
+        shape=(n, 3 * n),
+        shared_data=True,
+    )
+    sel_miss = binary_csr_from_parts(
+        indices=np.empty(0, dtype=np.int32),
+        indptr=np.zeros(n + 1, dtype=np.int32),
+        shape=(n, 3 * n),
+        shared_data=True,
+    )
+
+    for block in (I, P):
+        block.indices = block.indices.astype(block_indices_dtype)
+        block.indptr = block.indptr.astype(block_indptr_dtype)
+    sel_mut.indices = sel_mut.indices.astype(selector_indices_dtype)
+    sel_mut.indptr = sel_mut.indptr.astype(selector_indptr_dtype)
+    sel_miss.indices = sel_miss.indices.astype(selector_indices_dtype)
+    sel_miss.indptr = sel_miss.indptr.astype(selector_indptr_dtype)
+
+    return BackendSetup(
+        A_blocks=[[], [I], [P, I]],
+        level_offsets=np.asarray([0, n, 2 * n, 3 * n], dtype=level_offsets_dtype),
+        num_samples=n,
+        num_mutations=n,
+        num_nodes=3 * n,
+        sel_mut=sel_mut,
+        sel_miss=sel_miss,
+        coalescence_counts=None,
+        dtype=np.float64,
+    )
+
+
+def _materialized_csc_block_with_large_row_index() -> sp.csc_matrix:
+    nrows = int(np.iinfo(np.int32).max) + 2
+    block = sp.csc_matrix((1, 1), dtype=np.bool_)
+    block.data = np.ones(1, dtype=np.bool_)
+    block.indices = np.array([nrows - 1], dtype=np.int64)
+    block.indptr = np.array([0, 1], dtype=np.int32)
+    block._shape = (nrows, 1)
+    return block
+
+
+@pytest.fixture(scope="module")
+def large_band_case() -> LargeBandCase:
+    return prepare_triton_large_band_case()
+
+
+def _make_stream_backend(*, ring_buffer_size: int) -> object:
+    return make_triton_backend(
+        device=0,
+        ring_buffer_size=int(ring_buffer_size),
+        fmt_up="csr",
+        fmt_down="csc",
+        k_hint=None,
+        infer_missing=False,
+        log_level="WARNING",
+    )
+
+
+def _force_int64_slot_dtypes(monkeypatch, backend) -> None:
+    monkeypatch.setattr(
+        backend,
+        "_scan_slot_struct_dtypes",
+        lambda: (np.dtype(np.int64), np.dtype(np.int64)),
+    )
+
+
+def _make_reference_backend() -> ReferenceBackend:
+    return ReferenceBackend(
+        pair=ReferencePlanPair(
+            plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
+            plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+        ),
+        log_level="WARNING",
+    )
+
+
+def _run_stream_direction(backend: object, direction: str, primary: np.ndarray) -> np.ndarray:
+    if direction == "up":
+        output, _ = backend.run_up(primary, init_mode=InitMode.NONE, init=None, need_miss_output=False)
+        return output
+    if direction == "down":
+        return backend.run_down(primary, miss=None, init_mode=InitMode.NONE, init=None)
+    raise ValueError(f"unknown direction {direction!r}")
+
+
+def _expected_band_direction(
+    direction: str,
+    primary: np.ndarray,
+    *,
+    shifts: tuple[int, int, int],
+    bandwidth: int,
+) -> np.ndarray:
+    if direction == "up":
+        return expected_up(primary, shifts=shifts, bandwidth=bandwidth)
+    if direction == "down":
+        return expected_down(primary, shifts=shifts, bandwidth=bandwidth)
+    raise ValueError(f"unknown direction {direction!r}")
 
 
 def _install_bridge_probe(monkeypatch, backend):
@@ -179,6 +315,217 @@ def test_triton_rejects_foreign_device_stream():
 
 
 @pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_host_pin_uses_separate_struct_dtypes_for_csc_blocks():
+    backend = make_triton_backend(device=0, fmt_up="csc", fmt_down=None, k_hint=1, infer_missing=False)
+    backend._apply_setup_state(_synthetic_setup())
+    stored = _materialized_csc_block_with_large_row_index()
+
+    backend._slot_indices_dtype = np.dtype(np.int64)
+    backend._slot_indptr_dtype = np.dtype(np.int32)
+    host_block = backend._pin_host_block(stored)
+    assert host_block is not None
+    assert host_block.indices.dtype == np.int64
+    assert host_block.indptr.dtype == np.int32
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_down_only_scan_uses_stored_block_shape():
+    huge = int(np.iinfo(np.int32).max) + 2
+    block = sp.csr_matrix((1, huge), dtype=np.bool_)
+    block.data = np.ones(1, dtype=np.bool_)
+    block.indices = np.array([huge - 1], dtype=np.int64)
+    block.indptr = np.array([0, 1], dtype=np.int32)
+    block._shape = (1, huge)
+
+    empty_selector = binary_csr_from_parts(
+        indices=np.empty(0, dtype=np.int32),
+        indptr=np.zeros(2, dtype=np.int32),
+        shape=(1, huge + 1),
+        shared_data=True,
+    )
+    backend = make_triton_backend(device=0, fmt_up=None, fmt_down="csc", k_hint=1, infer_missing=False)
+    backend._apply_setup_state(
+        BackendSetup(
+            A_blocks=[[], [block]],
+            level_offsets=np.array([0, huge, huge + 1], dtype=np.int64),
+            num_samples=huge,
+            num_mutations=1,
+            num_nodes=huge + 1,
+            sel_mut=empty_selector,
+            sel_miss=empty_selector,
+            coalescence_counts=None,
+            dtype=np.float64,
+        )
+    )
+
+    assert backend._scan_slot_struct_dtypes() == (np.dtype(np.int64), np.dtype(np.int32))
+    backend._slot_indices_dtype, backend._slot_indptr_dtype = backend._scan_slot_struct_dtypes()
+    host_block = backend._build_direction_host_blocks(Direction.DOWN)[0][0]
+    assert host_block is not None
+    assert host_block.indices.dtype == np.int64
+    assert host_block.indptr.dtype == np.int32
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_slot_pool_compacts_safe_int64_indices_and_offsets():
+    backend = make_triton_backend(device=0, fmt_up="csr", fmt_down="csc", k_hint=1)
+    backend.setup(
+        _synthetic_setup(
+            block_indices_dtype=np.int64,
+            block_indptr_dtype=np.int64,
+            selector_indices_dtype=np.int64,
+            selector_indptr_dtype=np.int64,
+            level_offsets_dtype=np.int64,
+        )
+    )
+    assert backend._slot_indices_dtype == np.dtype(np.int32)
+    assert backend._slot_indptr_dtype == np.dtype(np.int32)
+    assert backend._slot_pool is not None
+    assert backend._slot_pool.slots[0].indices.dtype == torch.int32
+    assert backend._slot_pool.slots[0].indptr.dtype == torch.int32
+    y, _ = backend.run_up(np.arange(1, 5, dtype=np.float64).reshape(4, 1), init_mode=InitMode.NONE, init=None, need_miss_output=False)
+    np.testing.assert_array_equal(y[:, 0], np.array([5.0, 3.0, 5.0, 7.0]))
+
+
+@pytest.mark.stress
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+@pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
+@pytest.mark.parametrize("ring_buffer_size", [1, 2])
+def test_triton_large_stream_exact_two_pass_sequence(large_band_case, order, ring_buffer_size, monkeypatch):
+    clear_gpu_state()
+    backend = _make_stream_backend(ring_buffer_size=ring_buffer_size)
+    _force_int64_slot_dtypes(monkeypatch, backend)
+    setup = build_large_band_setup(large_band_case)
+    try:
+        backend.setup(setup)
+        assert backend._slot_indices_dtype == np.dtype(np.int64)
+        assert backend._slot_indptr_dtype == np.dtype(np.int64)
+        for run_idx, direction in enumerate(order):
+            rng = np.random.default_rng(60_000 + 1_000 * ring_buffer_size + 10 * run_idx + (0 if direction == "up" else 1))
+            primary = binary_pm1(rng, (large_band_case.n, 1), DATA_DTYPE)
+            expected = _expected_band_direction(
+                direction,
+                primary,
+                shifts=large_band_case.shifts,
+                bandwidth=large_band_case.bandwidth,
+            )
+            actual = _run_stream_direction(backend, direction, primary)
+            np.testing.assert_array_equal(actual, expected)
+    finally:
+        del backend
+        del setup
+        clear_gpu_state()
+
+
+@pytest.mark.stress
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+@pytest.mark.parametrize("first_direction", ["up", "down"])
+@pytest.mark.xfail(strict=True, reason="ring=3 must fail once three streamed slots cannot fit into total VRAM")
+def test_triton_large_stream_ring3_xfail(large_band_case, first_direction, monkeypatch):
+    clear_gpu_state()
+    backend = _make_stream_backend(ring_buffer_size=3)
+    _force_int64_slot_dtypes(monkeypatch, backend)
+    setup = build_large_band_setup(large_band_case)
+    try:
+        backend.setup(setup)
+        assert backend._slot_indices_dtype == np.dtype(np.int64)
+        assert backend._slot_indptr_dtype == np.dtype(np.int64)
+        rng = np.random.default_rng(80_000 + (0 if first_direction == "up" else 1))
+        primary = binary_pm1(rng, (large_band_case.n, 1), DATA_DTYPE)
+        _ = _run_stream_direction(backend, first_direction, primary)
+    finally:
+        del backend
+        del setup
+        clear_gpu_state()
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+@pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
+@pytest.mark.parametrize("ring_buffer_size", [1, 2])
+def test_triton_stream_copy_overlaps_compute(order, ring_buffer_size, monkeypatch):
+    clear_gpu_state()
+    backend = _make_stream_backend(ring_buffer_size=ring_buffer_size)
+    ref_backend = _make_reference_backend()
+    setup = build_overlap_band_setup()
+    state = {
+        "active": True,
+        "compute": [],
+        "copy": [],
+    }
+    original_launch = type(backend)._launch_op
+
+    def _wrapped_launch(self, op, *, x, y, config):
+        if state["active"]:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            stream = torch.cuda.current_stream(device=self._torch_device)
+            start.record(stream)
+            original_launch(self, op, x=x, y=y, config=config)
+            torch.cuda._sleep(10_000_000)
+            end.record(stream)
+            state["compute"].append((start, end))
+            return
+        original_launch(self, op, x=x, y=y, config=config)
+
+    def _wrapped_copy(self, ws, dst_level, op_idx, op):
+        copy_stream = self._slot_copy_streams[op.slot]
+        host_indices, host_indptr = self._host_tensor_pair(op)
+        with torch.cuda.stream(copy_stream):
+            prev_event = self._prev_compute_event(ws, op)
+            if prev_event is not None:
+                copy_stream.wait_event(prev_event)
+            start = None
+            end = None
+            if state["active"]:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record(copy_stream)
+            op.block.indices[: int(op.host_block.indices.size)].copy_(host_indices, non_blocking=True)
+            op.block.indptr[: int(op.host_block.indptr.size)].copy_(host_indptr, non_blocking=True)
+            if state["active"]:
+                assert start is not None and end is not None
+                end.record(copy_stream)
+                state["copy"].append((start, end))
+            ws.copy_done_by_level[dst_level][op_idx].record(copy_stream)
+
+    monkeypatch.setattr(type(backend), "_launch_op", _wrapped_launch)
+    monkeypatch.setattr(type(backend), "_copy_host_block_to_slot", _wrapped_copy)
+
+    def _has_overlap() -> bool:
+        for compute_start, compute_end in state["compute"]:
+            if compute_start.elapsed_time(compute_end) <= 0.0:
+                continue
+            for copy_start, copy_end in state["copy"]:
+                if copy_start.elapsed_time(copy_end) <= 0.0:
+                    continue
+                if copy_start.elapsed_time(compute_end) > 0.0 and compute_start.elapsed_time(copy_end) > 0.0:
+                    return True
+        return False
+
+    try:
+        backend.setup(setup)
+        ref_backend.setup(setup)
+        for run_idx, direction in enumerate(order):
+            rng = np.random.default_rng(70_000 + 1_000 * ring_buffer_size + 10 * run_idx + (0 if direction == "up" else 1))
+            primary = binary_pm1(rng, (setup.num_samples, 1), DATA_DTYPE)
+            expected = _run_stream_direction(ref_backend, direction, primary)
+            actual = _run_stream_direction(backend, direction, primary)
+            np.testing.assert_array_equal(actual, expected)
+            torch.cuda.synchronize()
+            if run_idx == 0:
+                if int(ring_buffer_size) == 1:
+                    assert not _has_overlap()
+                else:
+                    assert _has_overlap()
+                state["active"] = False
+    finally:
+        del ref_backend
+        del backend
+        del setup
+        clear_gpu_state()
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
 def test_triton_graphs_created_after_setup(primary_grg_path, spmv_cache_dir):
     op = _make_op(primary_grg_path, cache_dir=spmv_cache_dir)
     backend = op._backend
@@ -215,7 +562,6 @@ def test_triton_setup_and_run_stay_on_declared_device_after_device_switch(primar
             primary_grg_path,
             backend,
             DATA_DTYPE,
-            INDEX_DTYPE,
             artifact_dir=spmv_cache_dir,
         )
         x_up, y_up = gt_small.get("forward", 1, seed=129, dtype=DATA_DTYPE)
@@ -362,7 +708,6 @@ def test_triton_setup_gpu_allocations_run_inside_caller_root_scope(primary_grg_p
         primary_grg_path,
         backend,
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=spmv_cache_dir,
     )
 
@@ -588,6 +933,68 @@ def test_triton_debug_log_level_reports_block_memory(primary_grg_path, spmv_cach
     assert any("Triton host_blocks_up" in msg and "rows=" in msg and "nnz=" in msg and "indices_bytes=" in msg for msg in messages)
     assert any("Triton host_blocks_up dir=up" in msg and "cols=" in msg and "nnz=" in msg for msg in messages)
     del op
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_setup_streams_materialized_blocks_before_slot_pool_alloc(monkeypatch):
+    refs: list[weakref.ReferenceType[sp.spmatrix]] = []
+    materialized = {"count": 0, "checked": 0}
+    backend = make_triton_backend(device=0, fmt_up="csc", fmt_down="csc", k_hint=None, infer_missing=False)
+    original_materialize = type(backend)._materialize_stored_block
+    original_alloc_slot_pool = type(backend)._alloc_slot_pool
+
+    def _wrapped_materialize(self, direction, *, dst_level, src_level):
+        if refs:
+            gc.collect()
+            materialized["checked"] += 1
+            assert all(ref() is None for ref in refs)
+            refs.clear()
+        sparse = original_materialize(self, direction, dst_level=dst_level, src_level=src_level)
+        if sparse is not None:
+            materialized["count"] += 1
+            refs.append(weakref.ref(sparse))
+        return sparse
+
+    def _wrapped_alloc_slot_pool(self):
+        gc.collect()
+        assert refs
+        assert all(ref() is None for ref in refs)
+        return original_alloc_slot_pool(self)
+
+    monkeypatch.setattr(type(backend), "_materialize_stored_block", _wrapped_materialize)
+    monkeypatch.setattr(type(backend), "_alloc_slot_pool", _wrapped_alloc_slot_pool)
+
+    backend.setup(_synthetic_setup())
+    assert materialized["count"] >= 3
+    assert materialized["checked"] >= 2
+
+
+@pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")
+def test_triton_info_log_level_reports_setup_rss_checkpoints(monkeypatch, caplog):
+    import pygrgl_spmv._rss as rss_mod
+
+    values = iter([100, 140, 120, 160])
+    monkeypatch.setattr(rss_mod, "rss_bytes", lambda: next(values))
+
+    backend = make_triton_backend(device=0, fmt_up="csc", fmt_down="csc", k_hint=None, infer_missing=False, log_level="INFO")
+    with caplog.at_level(logging.INFO, logger="pygrgl_spmv.backends.triton.backend.TritonBackend"):
+        backend.setup(_synthetic_setup())
+
+    messages = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "pygrgl_spmv.backends.triton.backend.TritonBackend" and rec.getMessage().startswith("rss setup:")
+    ]
+    assert [msg.split()[1] for msg in messages] == [
+        "setup:start",
+        "setup:host_blocks_up_ready",
+        "setup:host_blocks_down_ready",
+        "setup:complete",
+    ]
+    assert "delta_bytes=" not in messages[0]
+    assert all("delta_bytes=" in msg for msg in messages[1:])
+    assert "stored_blocks=" in messages[1] and "indices_bytes=" in messages[1] and "indptr_bytes=" in messages[1]
+    assert "stored_blocks=" in messages[2] and "indices_bytes=" in messages[2] and "indptr_bytes=" in messages[2]
 
 
 @pytest.mark.skipif(not HAS_TRITON_RUNTIME, reason="Triton runtime unavailable")

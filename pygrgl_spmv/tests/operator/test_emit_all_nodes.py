@@ -7,7 +7,7 @@ import pygrgl
 import pytest
 
 from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, matmul_expect_k_hint_warning, tol
+from pygrgl_spmv.tests.conftest import DATA_DTYPE, matmul_expect_k_hint_warning, tol
 
 
 def _expected(grg, matrix, direction, **kwargs):
@@ -73,7 +73,7 @@ def test_emit_all_nodes_init_modes(op, grg_ref):
 @pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["f32", "f64"])
 @pytest.mark.parametrize("direction", [pygrgl.TraversalDirection.UP, pygrgl.TraversalDirection.DOWN], ids=["up", "down"])
 def test_emit_all_nodes_dtype(backend_config, primary_grg_path, grg_ref, spmv_cache_dir, dtype, direction):
-    op = SpmvGRG(primary_grg_path, backend_config, dtype, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+    op = SpmvGRG(primary_grg_path, backend_config, dtype, artifact_dir=spmv_cache_dir)
     rng = np.random.default_rng(6401 if direction == pygrgl.TraversalDirection.UP else 6402)
     cols = grg_ref.num_samples if direction == pygrgl.TraversalDirection.UP else grg_ref.num_mutations
     matrix = rng.standard_normal((2, cols), dtype=dtype)

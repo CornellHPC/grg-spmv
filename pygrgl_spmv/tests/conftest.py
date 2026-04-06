@@ -14,7 +14,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PRIMARY_GRG = str(REPO_ROOT / "pygrgl_spmv" / "tests" / "data" / "msprime.example.igd.final.grg")
 DEFAULT_MISSING_GRG = str(REPO_ROOT / "pygrgl_spmv" / "tests" / "data" / "test-200-samples.miss.final.grg")
 
-INDEX_DTYPE = np.int32
 DATA_DTYPE = np.float64
 K_CORE = [1, 2, 4]
 K_MATRIX = [1, 2, 3, 7, 8, 9, 16, 20]
@@ -360,6 +359,12 @@ def pytest_addoption(parser):
         help="Run only tests marked 'smoke'",
     )
     parser.addoption(
+        "--stress",
+        action="store_true",
+        default=False,
+        help="Run only when stress tests are explicitly requested",
+    )
+    parser.addoption(
         "--grg",
         default=DEFAULT_PRIMARY_GRG,
         help="Primary GRG file used by traversal/backends tests",
@@ -374,6 +379,7 @@ def pytest_addoption(parser):
 def pytest_collection_modifyitems(config, items):
     backend = config.getoption("--backend")
     smoke = bool(config.getoption("--smoke"))
+    stress = bool(config.getoption("--stress"))
 
     match backend:
         case "all":
@@ -417,6 +423,12 @@ def pytest_collection_modifyitems(config, items):
         if deselected:
             config.hook.pytest_deselected(items=deselected)
             items[:] = keep
+
+    if not stress:
+        skip_stress = pytest.mark.skip(reason="stress tests require --stress")
+        for item in items:
+            if "stress" in item.keywords:
+                item.add_marker(skip_stress)
 
 
 def valid_fmt_algo_params(*, transpose_bool: bool = False):

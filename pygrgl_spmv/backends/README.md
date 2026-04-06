@@ -45,6 +45,24 @@ GPU backends also require mandatory `device` and `stream` constructor arguments:
 Typical null-stream call sites use `device=0, stream=0` in internal
 tests/benchmarks or `device=0, stream=cupy.cuda.Stream.null` in user code.
 
+GPU backends resolve slot dtypes from each direction's stored block shape and
+`nnz`, then stream setup one block at a time: materialize one stored block,
+pin its sparse structure, drop the temporary SciPy block, and continue. They
+pick `int32` only when cheap bounds prove it is safe and otherwise use
+conservative `int64` structure. They do not accept separate structural-dtype
+parameters.
+
+GPU backend setup can also log INFO-level RSS checkpoints at:
+
+- `setup:start`
+- `setup:host_blocks_up_ready`
+- `setup:host_blocks_down_ready`
+- `setup:complete`
+
+Those RSS lines are process diagnostics, not part of the additive memory ledger.
+The two `host_blocks_*_ready` lines also include compact host-block counts and
+byte totals so setup RSS deltas are interpretable without DEBUG logging.
+
 ## GPU stream model
 
 GPU backends use four stream roles:

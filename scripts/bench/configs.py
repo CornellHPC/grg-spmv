@@ -244,13 +244,12 @@ def expand_triton_configs(
     return configs
 
 
-def format_dry_run_line(entry: BenchConfig, ks: list[int], options: list[str], *, dtype: np.dtype, index_dtype: np.dtype) -> str:
+def format_dry_run_line(entry: BenchConfig, ks: list[int], options: list[str], *, dtype: np.dtype) -> str:
     parts = [
         entry.label,
         f"ks={','.join(str(k) for k in ks)}",
         f"options={','.join(options)}",
         f"dtype={np.dtype(dtype).name}",
-        f"index_dtype={np.dtype(index_dtype).name}",
         f"instrumentation={'on' if entry.instrumentation else 'off'}",
         f"plan_up={_render_plan_text(entry.plan_up_text)}",
         f"plan_down={_render_plan_text(entry.plan_down_text)}",

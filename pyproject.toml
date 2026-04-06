@@ -77,6 +77,7 @@ exclude = [
 testpaths = ["pygrgl_spmv/tests"]
 markers = [
     "smoke: core fast tests selected by --smoke",
+    "stress: literal machine-scale stress tests selected by --stress",
     "gpu: tests requiring a GPU (CuPy + cuSPARSE)",
     "mkl: tests specific to MKL backend",
     "cusparse: tests specific to cuSPARSE backend",

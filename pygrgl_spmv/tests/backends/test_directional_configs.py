@@ -8,7 +8,6 @@ import pytest
 from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
-    INDEX_DTYPE,
     make_cusparse_backend,
     make_mkl_backend,
     make_triton_backend,
@@ -35,7 +34,6 @@ def _make_directional_op(grg_path, *, artifact_dir, build_backend, **kwargs):
         grg_path,
         build_backend(**kwargs),
         DATA_DTYPE,
-        INDEX_DTYPE,
         artifact_dir=artifact_dir,
     )
 

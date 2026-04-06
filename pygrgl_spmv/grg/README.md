@@ -45,6 +45,10 @@ The artifact stores:
 - retained block structure
 - init-bias vectors and optional XTX init-bias vectors
 
+Structural arrays are written in their native stored dtypes exactly as compiled.
+There is no separate artifact field describing structural dtype policy; the
+array dtypes in the archive are the source of truth.
+
 ## Compile pipeline
 
 Compilation is implemented in [compile.py](compile.py).
@@ -54,10 +58,17 @@ Compilation is implemented in [compile.py](compile.py).
 - supports non-empty immutable GRGs only
 - uses only down edges from the input GRG
 - computes node levels and stable level order
+- uses scratch structural dtypes during streamed construction, then finalizes each stored structural array independently to the smallest safe signed dtype (`int32` or `int64`)
+- canonicalizes zero-length structural arrays to `int32`
 - builds level-block CSR matrices directly from streamed child lists with bool-backed binary payloads
+- loads mutation rows only immediately before selector construction, then drops them before the mutation-table phase
 - builds mutation and missingness selectors from sorted mutation rows; repeated `MutationID` rows are allowed when one mutation is attached to multiple nodes, and only missingness selector rows may need duplicate coalescing when those repeated rows share one missingness node
 - loads mutation tables and optional coalescence counts
-- logs INFO-level RSS checkpoints through `pygrgl_spmv.grg.compile` during cache-miss `.grg` builds when root logging is enabled
+- logs INFO-level RSS checkpoints through `pygrgl_spmv.grg.compile` during cache-miss `.grg` builds when root logging is enabled at `compile:start`, `compile:blocks_ready`, `compile:mutation_rows_loaded`, `compile:selectors_built`, `compile:selectors_ready`, and `compile:mutation_table_ready`
+
+Artifact load does not re-pick structural dtypes. It validates the stored
+arrays and logs each structural array key, dtype, shape, and byte count at
+INFO level.
 
 The result is a `CompiledOperatorState`.
 

@@ -40,6 +40,7 @@ Setup:
 - builds selector row/col index arrays
 - configures MKL sparse-handle hints
 - records per-level call-count and nnz statistics for debug logging
+- matches MKL's integer ABI width at handle creation time; LP64 builds reject `int64` structure and oversized block shapes instead of narrowing them
 
 Execution:
 

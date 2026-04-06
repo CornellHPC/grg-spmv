@@ -12,10 +12,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import scipy.sparse as sp
 
-from pygrgl_spmv.backends import (
+from pygrgl_spmv._rss import rss_checkpoint
+from pygrgl_spmv.backends.base import (
     BackendBase,
     CallCapture,
     BackendSetup,
+    _copy_struct_checked,
+    _layout_struct_dtypes,
+    _require_struct_dtype,
     effective_k_hint,
     iter_direction_level_pairs,
     selector_rows_unique_from_csr_indptr,
@@ -30,6 +34,8 @@ from pygrgl_spmv.backends._cuda_stream import (
 )
 from pygrgl_spmv.backends._nvtx import make_cupy_tracer
 from pygrgl_spmv.backends.cusparse.ffi import (
+    CUSPARSE_INDEX_32I,
+    CUSPARSE_INDEX_64I,
     CuSparseLib,
     CudaVmmDriver,
     cuda_dtype,
@@ -61,6 +67,11 @@ def _numpy_ptr(value: np.ndarray) -> int:
     return int(np.asarray(value).__array_interface__["data"][0])
 
 
+def _cusparse_index_type(dtype: np.dtype) -> int:
+    dt = _require_struct_dtype(dtype, label="cuSPARSE structural dtype")
+    return CUSPARSE_INDEX_32I if dt == np.dtype(np.int32) else CUSPARSE_INDEX_64I
+
+
 def is_valid_combo(fmt: str, transpose_bool: bool, algo: str) -> bool:
     """Return whether a combo is executable on the current backend/runtime path."""
     plan = CusparsePlan.from_dict(
@@ -82,7 +93,7 @@ def is_valid_combo(fmt: str, transpose_bool: bool, algo: str) -> bool:
 class _CuHostBlock:
     """Pinned host sparse structure.
 
-    ``index_buffers`` hold sparse indices only:
+    ``struct_buffers`` hold sparse structure only:
     CSR/CSC use ``(indptr, indices)``, COO uses ``(row, col)``.
     """
 
@@ -90,56 +101,18 @@ class _CuHostBlock:
     nrows: int
     ncols: int
     nnz: int
-    index_buffers: tuple[np.ndarray, np.ndarray] = alloc_field(label="host_blocks", kind="sparse")
+    struct_buffers: tuple[np.ndarray, np.ndarray] = alloc_field(label="host_blocks", kind="sparse")
     payload_key: tuple[int, int] = ignore_field()
 
-    @classmethod
-    def from_scipy(cls, matrix: sp.spmatrix, *, fmt: str, cupyx: Any) -> "_CuHostBlock":
-        if fmt == "csr":
-            mat = sp.csr_matrix(matrix)
-            index_buffers = (
-                cupyx.empty_pinned((mat.indptr.size,), dtype=np.int32),
-                cupyx.empty_pinned((mat.indices.size,), dtype=np.int32),
-            )
-            np.copyto(index_buffers[0], np.asarray(mat.indptr, dtype=np.int32))
-            np.copyto(index_buffers[1], np.asarray(mat.indices, dtype=np.int32))
-        elif fmt == "csc":
-            mat = matrix.tocsc()
-            index_buffers = (
-                cupyx.empty_pinned((mat.indptr.size,), dtype=np.int32),
-                cupyx.empty_pinned((mat.indices.size,), dtype=np.int32),
-            )
-            np.copyto(index_buffers[0], np.asarray(mat.indptr, dtype=np.int32))
-            np.copyto(index_buffers[1], np.asarray(mat.indices, dtype=np.int32))
-        elif fmt == "coo":
-            mat = matrix.tocoo()
-            index_buffers = (
-                cupyx.empty_pinned((mat.row.size,), dtype=np.int32),
-                cupyx.empty_pinned((mat.col.size,), dtype=np.int32),
-            )
-            np.copyto(index_buffers[0], np.asarray(mat.row, dtype=np.int32))
-            np.copyto(index_buffers[1], np.asarray(mat.col, dtype=np.int32))
-        else:
-            raise ValueError(f"Unknown sparse format: {fmt!r}")
-        return cls(
-            fmt=fmt,
-            nrows=int(mat.shape[0]),
-            ncols=int(mat.shape[1]),
-            nnz=int(mat.nnz),
-            index_buffers=index_buffers,
-            payload_key=(_numpy_ptr(index_buffers[0]), _numpy_ptr(index_buffers[1])),
-        )
-
     def nbytes(self) -> int:
-        return int(sum(int(buf.nbytes) for buf in self.index_buffers))
-
+        return int(sum(int(buf.nbytes) for buf in self.struct_buffers))
 
 @dataclass
 class _CuSlotBuffers:
     """One reusable device sparse slot."""
 
-    index0: CupyArray = alloc_field(label="slot_buffers", kind="sparse")
-    index1: CupyArray = alloc_field(label="slot_buffers", kind="sparse")
+    struct0: CupyArray = alloc_field(label="slot_buffers", kind="sparse")
+    struct1: CupyArray = alloc_field(label="slot_buffers", kind="sparse")
 
 
 @dataclass
@@ -213,8 +186,12 @@ class _SelectorLevels:
             lo = int(level_offsets[h])
             hi = int(level_offsets[h + 1])
             block = selector[:, lo:hi].tocoo()
-            rows_by_level.append(cp.asarray(block.row.astype(np.int32, copy=False)))
-            cols_by_level.append(cp.asarray(block.col.astype(np.int32, copy=False)))
+            row = np.asarray(block.row)
+            col = np.asarray(block.col)
+            _require_struct_dtype(row.dtype, label="selector row indices")
+            _require_struct_dtype(col.dtype, label="selector col indices")
+            rows_by_level.append(cp.asarray(row))
+            cols_by_level.append(cp.asarray(col))
         return cls(
             rows_by_level=rows_by_level,
             cols_by_level=cols_by_level,
@@ -569,6 +546,8 @@ class CusparseBackend(BackendBase):
         self._num_mutations = 0
         self._num_nodes = 0
         self._level_offsets = np.empty(0, dtype=np.int64)
+        self._slot_struct0_dtype = np.dtype(np.int32)
+        self._slot_struct1_dtype = np.dtype(np.int32)
 
         self._shared_ones: _SharedOnes | None = None
 
@@ -625,10 +604,63 @@ class CusparseBackend(BackendBase):
     def _wavefront_for(self, direction: Direction) -> list[list[_CuWavefrontOp]]:
         return self._wavefront_up if direction == Direction.UP else self._wavefront_down
 
-    def _operator_matrix(self, direction: Direction, *, dst_level: int, src_level: int) -> sp.spmatrix:
-        if direction == Direction.UP:
-            return self._A_blocks[dst_level][src_level]
-        return self._A_blocks[src_level][dst_level]
+    def _materialize_stored_block(
+        self,
+        direction: Direction,
+        *,
+        dst_level: int,
+        src_level: int,
+    ) -> sp.spmatrix | None:
+        plan = self._plan_for(direction)
+        if plan is None:
+            return None
+        stored = self._stored_matrix(direction, dst_level=dst_level, src_level=src_level)
+        if stored.nnz == 0:
+            return None
+        match plan.fmt:
+            case SparseFormat.CSR:
+                return stored.tocsr()
+            case SparseFormat.CSC:
+                return stored.tocsc()
+            case SparseFormat.COO:
+                sparse = stored.tocoo()
+                sparse.sum_duplicates()
+                return sparse
+            case _:
+                raise ValueError(f"Unknown sparse format: {plan.fmt.value!r}")
+
+    def _scan_slot_struct_dtypes(self) -> tuple[np.dtype, np.dtype]:
+        struct0_dtype = np.dtype(np.int32)
+        struct1_dtype = np.dtype(np.int32)
+        require_common = False
+        for direction in self._configured_directions():
+            plan = self._plan_for(direction)
+            if plan is None:
+                continue
+            store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
+            if not store_actual:
+                continue
+            if plan.fmt == SparseFormat.COO:
+                require_common = True
+            for dst_level, src_level, _row_index in iter_direction_level_pairs(direction, self._H):
+                stored = self._stored_matrix(direction, dst_level=dst_level, src_level=src_level)
+                if stored.nnz == 0:
+                    continue
+                block_struct0_dtype, block_struct1_dtype = _layout_struct_dtypes(
+                    plan.fmt.value,
+                    nrows=int(stored.shape[0]),
+                    ncols=int(stored.shape[1]),
+                    nnz=int(stored.nnz),
+                )
+                if block_struct0_dtype == np.dtype(np.int64):
+                    struct0_dtype = np.dtype(np.int64)
+                if block_struct1_dtype == np.dtype(np.int64):
+                    struct1_dtype = np.dtype(np.int64)
+        if require_common and (struct0_dtype == np.dtype(np.int64) or struct1_dtype == np.dtype(np.int64)):
+            return np.dtype(np.int64), np.dtype(np.int64)
+        if require_common:
+            return np.dtype(np.int32), np.dtype(np.int32)
+        return struct0_dtype, struct1_dtype
 
     def _destroy_shared_ones(self) -> None:
         values = self._shared_ones
@@ -660,13 +692,13 @@ class CusparseBackend(BackendBase):
             retained.shared_values_materialized = self._shared_ones._materialized
             retained.shared_values_vmm = None
         retained.host_blocks_up = [
-            block.index_buffers
+            block.struct_buffers
             for row in self._host_blocks_up
             for block in row
             if block is not None
         ]
         retained.host_blocks_down = [
-            block.index_buffers
+            block.struct_buffers
             for row in self._host_blocks_down
             for block in row
             if block is not None
@@ -911,6 +943,10 @@ class CusparseBackend(BackendBase):
         self._dtype = np.dtype(setup.dtype)
         self._cuda_dtype = cuda_dtype(self._dtype)
         self._H = len(self._level_offsets) - 1
+        prev_rss_bytes = rss_checkpoint(self._logger, "setup:start", None)
+        self._slot_struct0_dtype, self._slot_struct1_dtype = self._scan_slot_struct_dtypes()
+        self._host_blocks_up = [[] for _ in range(self._H)]
+        self._host_blocks_down = [[] for _ in range(self._H)]
 
         if self._cuda_dtype is None:
             raise RuntimeError("CUDA dtype not initialized")
@@ -922,8 +958,26 @@ class CusparseBackend(BackendBase):
                 self._shared_ones = self._build_shared_ones()
                 self._slot_pool = None
 
-            self._host_blocks_up = self._build_direction_host_blocks(direction=Direction.UP)
-            self._host_blocks_down = self._build_direction_host_blocks(direction=Direction.DOWN)
+            if self._plan_up is not None:
+                self._host_blocks_up = self._build_direction_host_blocks(
+                    direction=Direction.UP,
+                )
+                prev_rss_bytes = rss_checkpoint(
+                    self._logger,
+                    "setup:host_blocks_up_ready",
+                    prev_rss_bytes,
+                    extras=self._host_block_summary(Direction.UP),
+                )
+            if self._plan_down is not None:
+                self._host_blocks_down = self._build_direction_host_blocks(
+                    direction=Direction.DOWN,
+                )
+                prev_rss_bytes = rss_checkpoint(
+                    self._logger,
+                    "setup:host_blocks_down_ready",
+                    prev_rss_bytes,
+                    extras=self._host_block_summary(Direction.DOWN),
+                )
 
             with self._root_stream:
                 self._slot_pool = self._alloc_slot_pool()
@@ -1001,8 +1055,54 @@ class CusparseBackend(BackendBase):
         self._sync_retained_root()
         self._bump_retained_epoch()
         self._assert_setup_memory_contract()
+        rss_checkpoint(self._logger, "setup:complete", prev_rss_bytes)
 
-    def _build_direction_host_blocks(self, *, direction: Direction) -> list[list[_CuHostBlock | None]]:
+    def _pin_struct_buffer(self, values: np.ndarray, *, dtype: np.dtype, label: str) -> np.ndarray:
+        arr = np.asarray(values)
+        _require_struct_dtype(arr.dtype, label=label)
+        host = self._cupyx.empty_pinned(arr.shape, dtype=_require_struct_dtype(dtype, label=label))
+        _copy_struct_checked(host, arr, label=label)
+        return host
+
+    def _pin_host_block(self, sparse: sp.spmatrix) -> _CuHostBlock | None:
+        if sparse.nnz == 0:
+            return None
+        fmt = str(getattr(sparse, "format", "")).lower()
+        if fmt == "csr":
+            struct0 = np.asarray(sparse.indptr)
+            struct1 = np.asarray(sparse.indices)
+        elif fmt == "csc":
+            struct0 = np.asarray(sparse.indptr)
+            struct1 = np.asarray(sparse.indices)
+        elif fmt == "coo":
+            struct0 = np.asarray(sparse.row)
+            struct1 = np.asarray(sparse.col)
+        else:
+            raise ValueError(f"Unknown sparse format: {fmt!r}")
+        host0 = self._pin_struct_buffer(
+            struct0,
+            dtype=self._slot_struct0_dtype,
+            label=f"cuSPARSE {fmt} struct0",
+        )
+        host1 = self._pin_struct_buffer(
+            struct1,
+            dtype=self._slot_struct1_dtype,
+            label=f"cuSPARSE {fmt} struct1",
+        )
+        return _CuHostBlock(
+            fmt=fmt,
+            nrows=int(sparse.shape[0]),
+            ncols=int(sparse.shape[1]),
+            nnz=int(sparse.nnz),
+            struct_buffers=(host0, host1),
+            payload_key=(_numpy_ptr(host0), _numpy_ptr(host1)),
+        )
+
+    def _build_direction_host_blocks(
+        self,
+        *,
+        direction: Direction,
+    ) -> list[list[_CuHostBlock | None]]:
         plan = self._plan_for(direction)
         if plan is None:
             return [[] for _ in range(self._H)]
@@ -1013,15 +1113,11 @@ class CusparseBackend(BackendBase):
         store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
         if store_actual:
             for dst_level, src_level, row_index in iter_direction_level_pairs(direction, self._H):
-                matrix = self._operator_matrix(direction, dst_level=dst_level, src_level=src_level)
-                if matrix.nnz == 0:
+                sparse = self._materialize_stored_block(direction, dst_level=dst_level, src_level=src_level)
+                if sparse is None:
                     continue
-                stored = matrix if plan.store == plan.store.N else matrix.T.tocsr()
-                rows[dst_level][row_index] = _CuHostBlock.from_scipy(
-                    stored,
-                    fmt=plan.fmt.value.lower(),
-                    cupyx=self._cupyx,
-                )
+                rows[dst_level][row_index] = self._pin_host_block(sparse)
+                del sparse
             return rows
 
         owner_direction = (
@@ -1037,55 +1133,56 @@ class CusparseBackend(BackendBase):
             owner_block = owner_grid[owner_dst][owner_row_index]
             if owner_block is None:
                 continue
-            matrix = self._operator_matrix(direction, dst_level=dst_level, src_level=src_level)
-            if matrix.nnz == 0:
+            stored = self._stored_matrix(direction, dst_level=dst_level, src_level=src_level)
+            if stored.nnz == 0:
                 continue
-            nrows, ncols = matrix.shape
-            if plan.store == plan.store.T:
-                nrows, ncols = ncols, nrows
             rows[dst_level][row_index] = _CuHostBlock(
                 fmt=plan.fmt.value.lower(),
-                nrows=nrows,
-                ncols=ncols,
+                nrows=int(stored.shape[0]),
+                ncols=int(stored.shape[1]),
                 nnz=owner_block.nnz,
-                index_buffers=owner_block.index_buffers,
+                struct_buffers=owner_block.struct_buffers,
                 payload_key=owner_block.payload_key,
             )
         return rows
 
-    def _slot_lengths(self) -> tuple[int, int]:
+    def _slot_struct_lengths(self) -> tuple[int, int]:
         max0 = 0
         max1 = 0
         for block in _iter_unique_host_blocks(self._host_blocks_up, self._host_blocks_down):
-            max0 = max(max0, int(block.index_buffers[0].size))
-            max1 = max(max1, int(block.index_buffers[1].size))
+            max0 = max(max0, int(block.struct_buffers[0].size))
+            max1 = max(max1, int(block.struct_buffers[1].size))
         return max0, max1
 
     def _alloc_slot_pool(self) -> _CuSlotPool:
-        max0, max1 = self._slot_lengths()
+        max0, max1 = self._slot_struct_lengths()
         return _CuSlotPool(
             slots=[
                 _CuSlotBuffers(
-                    index0=self._cp.zeros((max0,), dtype=self._cp.int32),
-                    index1=self._cp.zeros((max1,), dtype=self._cp.int32),
+                    struct0=self._cp.zeros((max0,), dtype=self._slot_struct0_dtype),
+                    struct1=self._cp.zeros((max1,), dtype=self._slot_struct1_dtype),
                 )
                 for _ in range(self._ring_buffer_size)
             ]
         )
 
-    def _make_sparse_desc(self, *, block: _CuHostBlock, index0_ptr: int, index1_ptr: int) -> c_void_p:
+    def _make_sparse_desc(self, *, block: _CuHostBlock, struct0_ptr: int, struct1_ptr: int) -> c_void_p:
         if self._cuda_dtype is None:
             raise RuntimeError("CUDA dtype not initialized")
         if self._shared_ones is None:
             raise RuntimeError("shared ones are not initialized")
+        struct0_type = _cusparse_index_type(self._slot_struct0_dtype)
+        struct1_type = _cusparse_index_type(self._slot_struct1_dtype)
         if block.fmt == "csr":
             return self._cslib.create_csr(
                 block.nrows,
                 block.ncols,
                 block.nnz,
-                index0_ptr,
-                index1_ptr,
+                struct0_ptr,
+                struct1_ptr,
                 int(self._shared_ones.ptr),
+                struct0_type,
+                struct1_type,
                 self._cuda_dtype,
             )
         if block.fmt == "csc":
@@ -1093,19 +1190,24 @@ class CusparseBackend(BackendBase):
                 block.nrows,
                 block.ncols,
                 block.nnz,
-                index0_ptr,
-                index1_ptr,
+                struct0_ptr,
+                struct1_ptr,
                 int(self._shared_ones.ptr),
+                struct0_type,
+                struct1_type,
                 self._cuda_dtype,
             )
         if block.fmt == "coo":
+            if struct0_type != struct1_type:
+                raise RuntimeError("cuSPARSE COO slots require a common coordinate dtype")
             return self._cslib.create_coo(
                 block.nrows,
                 block.ncols,
                 block.nnz,
-                index0_ptr,
-                index1_ptr,
+                struct0_ptr,
+                struct1_ptr,
                 int(self._shared_ones.ptr),
+                struct0_type,
                 self._cuda_dtype,
             )
         raise ValueError(f"Unknown sparse format: {block.fmt!r}")
@@ -1140,8 +1242,8 @@ class CusparseBackend(BackendBase):
                         host_block=block,
                         slot_desc=self._make_sparse_desc(
                             block=block,
-                            index0_ptr=self._slot_pool.slots[slot].index0.data.ptr,
-                            index1_ptr=self._slot_pool.slots[slot].index1.data.ptr,
+                            struct0_ptr=self._slot_pool.slots[slot].struct0.data.ptr,
+                            struct1_ptr=self._slot_pool.slots[slot].struct1.data.ptr,
                         ),
                         nnz=block.nnz,
                         prev_in_slot=prev_in_slot.get(slot),
@@ -1150,6 +1252,42 @@ class CusparseBackend(BackendBase):
                 prev_in_slot[slot] = (dst, op_idx)
                 seq_idx += 1
         return ops
+
+    def _host_block_summary(self, direction: Direction) -> tuple[tuple[str, int], ...]:
+        plan = self._plan_for(direction)
+        if plan is None:
+            return (
+                ("stored_blocks", 0),
+                ("alias_blocks", 0),
+                ("empty_blocks", 0),
+                ("struct0_bytes", 0),
+                ("struct1_bytes", 0),
+            )
+        grid = self._grid_for(direction)
+        store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
+        stored_blocks = 0
+        alias_blocks = 0
+        empty_blocks = 0
+        struct0_bytes = 0
+        struct1_bytes = 0
+        for dst_level, src_level, row_index in iter_direction_level_pairs(direction, self._H):
+            block = grid[dst_level][row_index]
+            if block is None:
+                empty_blocks += 1
+                continue
+            if not store_actual:
+                alias_blocks += 1
+                continue
+            stored_blocks += 1
+            struct0_bytes += int(block.struct_buffers[0].nbytes)
+            struct1_bytes += int(block.struct_buffers[1].nbytes)
+        return (
+            ("stored_blocks", stored_blocks),
+            ("alias_blocks", alias_blocks),
+            ("empty_blocks", empty_blocks),
+            ("struct0_bytes", struct0_bytes),
+            ("struct1_bytes", struct1_bytes),
+        )
 
     def _log_block_memory(self, direction: Direction) -> None:
         if not self._logger.isEnabledFor(logging.DEBUG):
@@ -1161,38 +1299,27 @@ class CusparseBackend(BackendBase):
         store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
         bucket = "host_blocks_up" if direction == Direction.UP else "host_blocks_down"
 
-        stored_blocks = 0
-        alias_blocks = 0
-        empty_blocks = 0
         total_rows = 0
         total_cols = 0
         total_nnz = 0
-        index0_bytes = 0
-        index1_bytes = 0
 
         for dst_level, src_level, row_index in iter_direction_level_pairs(direction, self._H):
             block = grid[dst_level][row_index]
             if block is None:
-                empty_blocks += 1
                 continue
             alias = not store_actual
             total_rows += int(block.nrows)
             total_cols += int(block.ncols)
             total_nnz += int(block.nnz)
 
-            block_index0 = 0
-            block_index1 = 0
+            block_struct0 = 0
+            block_struct1 = 0
             if not alias:
-                block_index0 = int(block.index_buffers[0].nbytes)
-                block_index1 = int(block.index_buffers[1].nbytes)
-                stored_blocks += 1
-                index0_bytes += block_index0
-                index1_bytes += block_index1
-            else:
-                alias_blocks += 1
+                block_struct0 = int(block.struct_buffers[0].nbytes)
+                block_struct1 = int(block.struct_buffers[1].nbytes)
 
             self._logger.debug(
-                "cuSPARSE %s dir=%s dst=%d src=%d fmt=%s rows=%d cols=%d nnz=%d alias=%s index0_bytes=%d index1_bytes=%d",
+                "cuSPARSE %s dir=%s dst=%d src=%d fmt=%s rows=%d cols=%d nnz=%d alias=%s struct0_bytes=%d struct1_bytes=%d",
                 bucket,
                 direction.value,
                 dst_level,
@@ -1202,31 +1329,32 @@ class CusparseBackend(BackendBase):
                 block.ncols,
                 block.nnz,
                 alias,
-                block_index0,
-                block_index1,
+                block_struct0,
+                block_struct1,
             )
 
+        summary = dict(self._host_block_summary(direction))
         self._logger.debug(
-            "cuSPARSE %s dir=%s rows=%d cols=%d nnz=%d stored_blocks=%d alias_blocks=%d empty_blocks=%d index0_bytes=%d index1_bytes=%d",
+            "cuSPARSE %s dir=%s rows=%d cols=%d nnz=%d stored_blocks=%d alias_blocks=%d empty_blocks=%d struct0_bytes=%d struct1_bytes=%d",
             bucket,
             direction.value,
             total_rows,
             total_cols,
             total_nnz,
-            stored_blocks,
-            alias_blocks,
-            empty_blocks,
-            index0_bytes,
-            index1_bytes,
+            int(summary["stored_blocks"]),
+            int(summary["alias_blocks"]),
+            int(summary["empty_blocks"]),
+            int(summary["struct0_bytes"]),
+            int(summary["struct1_bytes"]),
         )
         if self._slot_pool is not None:
-            slot_index0 = int(sum(int(slot.index0.nbytes) for slot in self._slot_pool.slots))
-            slot_index1 = int(sum(int(slot.index1.nbytes) for slot in self._slot_pool.slots))
+            slot_struct0 = int(sum(int(slot.struct0.nbytes) for slot in self._slot_pool.slots))
+            slot_struct1 = int(sum(int(slot.struct1.nbytes) for slot in self._slot_pool.slots))
             self._logger.debug(
-                "cuSPARSE slot_pool slots=%d index0_bytes=%d index1_bytes=%d",
+                "cuSPARSE slot_pool slots=%d struct0_bytes=%d struct1_bytes=%d",
                 len(self._slot_pool.slots),
-                slot_index0,
-                slot_index1,
+                slot_struct0,
+                slot_struct1,
             )
 
     def _ops_for(self, direction: Direction) -> list[list[_CuWavefrontOp]]:
@@ -1695,20 +1823,20 @@ class CusparseBackend(BackendBase):
             raise RuntimeError("slot pool is not initialized")
         copy_stream = self._slot_copy_streams[op.slot]
         slot_buffers = self._slot_pool.slots[op.slot]
-        host0, host1 = op.host_block.index_buffers
+        host0, host1 = op.host_block.struct_buffers
         with copy_stream:
             prev_event = self._prev_compute_event(ws, op)
             if prev_event is not None:
                 copy_stream.wait_event(prev_event)
             self._cp.cuda.runtime.memcpyAsync(
-                slot_buffers.index0.data.ptr,
+                slot_buffers.struct0.data.ptr,
                 _numpy_ptr(host0),
                 int(host0.nbytes),
                 self._cp.cuda.runtime.memcpyHostToDevice,
                 copy_stream.ptr,
             )
             self._cp.cuda.runtime.memcpyAsync(
-                slot_buffers.index1.data.ptr,
+                slot_buffers.struct1.data.ptr,
                 _numpy_ptr(host1),
                 int(host1.nbytes),
                 self._cp.cuda.runtime.memcpyHostToDevice,

@@ -6,7 +6,6 @@ import logging
 import os
 from dataclasses import dataclass
 from time import perf_counter
-from typing import List
 
 import numpy as np
 import scipy.sparse as sp
@@ -90,10 +89,6 @@ class MklRetained:
     xtx_host: np.ndarray | None = alloc_field(
         label="xtx_host", kind="init", owner="backend", retention="persistent", activity="always", default=None
     )
-
-
-def _stored_block(base_block: sp.spmatrix, store: StoredMatrix) -> sp.spmatrix:
-    return base_block if store == StoredMatrix.N else base_block.T
 
 
 def _needs_transpose(direction: Direction, store: StoredMatrix) -> bool:
@@ -224,7 +219,6 @@ class MklBackend(BackendBase):
     def _build_direction_handles(
         self,
         spec: _MklDirectionSpec,
-        A_blocks: List[List[sp.csr_matrix]],
     ) -> list[list[MklSparseHandle | None]]:
         num_levels = len(self._level_offsets) - 1
         if not spec.store_blocks:
@@ -235,12 +229,7 @@ class MklBackend(BackendBase):
             for dst_level in range(num_levels)
         ]
         for dst_level, src_level, row_index in iter_direction_level_pairs(spec.direction, num_levels):
-            base_block = (
-                A_blocks[dst_level][src_level]
-                if spec.direction == Direction.UP
-                else A_blocks[src_level][dst_level]
-            )
-            stored = _stored_block(base_block, spec.plan.store)
+            stored = self._stored_matrix(spec.direction, dst_level=dst_level, src_level=src_level)
             rows[dst_level][row_index] = (
                 None if stored.nnz == 0 else MklSparseHandle(stored, spec.plan.fmt.value.lower())
             )
@@ -385,10 +374,10 @@ class MklBackend(BackendBase):
         up_spec = self._direction_spec(Direction.UP)
         down_spec = self._direction_spec(Direction.DOWN)
         if up_spec is not None:
-            self._blocks_up = self._build_direction_handles(up_spec, self._A_blocks)
+            self._blocks_up = self._build_direction_handles(up_spec)
             self._ops_up = self._build_direction_ops(up_spec)
         if down_spec is not None:
-            self._blocks_down = self._build_direction_handles(down_spec, self._A_blocks)
+            self._blocks_down = self._build_direction_handles(down_spec)
             self._ops_down = self._build_direction_ops(down_spec)
 
         self._selector_rows = {}

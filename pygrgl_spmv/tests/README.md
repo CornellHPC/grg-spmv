@@ -33,6 +33,7 @@ Observability rule covered by the suite:
 - `log_level` controls logger verbosity
 - operator build logs follow normal Python/root logger inheritance
 - compile RSS checkpoints are emitted on the `pygrgl_spmv.grg.compile` logger
+- GPU setup RSS checkpoints are emitted on the backend logger
 - `instrumentation` is the opt-in flag for slower profiling/observability behavior
 
 Memory-ledger rule covered by the suite:
@@ -45,20 +46,29 @@ Memory-ledger rule covered by the suite:
 - benchmark memory tables are rendered from canonical `tree_rows()` output plus benchmark-local case metadata
 - GPU retained sparse memory is now split between CPU pinned host block
   structure and shared CUDA slot buffers
+- GPU setup streams stored sparse blocks one at a time during host pinning
 - Triton runtime execution is singleton-only (`k == 1`)
 
 ## Markers
 
 - `smoke`: core fast checks selected by `--smoke`
+- `stress`: literal machine-scale stress tests selected by `--stress`
 - `gpu`: requires CuPy/cuSPARSE
 - `mkl`: requires MKL runtime
 
 `--smoke` runs only tests marked `smoke`.
+Stress tests are skipped unless `--stress` is supplied.
+
+The giant streamed exact-output and ring-3 OOM contract tests live under `stress`.
+The many-small-block streamed-overlap tests are ordinary GPU tests.
+cuSPARSE large-stream stress keeps `nnz` below the CUDA 12.9 near-`2^31`
+cuSPARSE SpMM bug boundary and forces int64 slot families locally in the test.
 
 ## CLI Options
 
 - `--backend {all,mkl,cusparse,triton}`
 - `--smoke`
+- `--stress`
 - `--grg <path>`: primary GRG used by traversal/backend tests
 - `--missing-grg <path>`: missingness GRG used by missingness tests
 

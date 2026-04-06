@@ -7,7 +7,7 @@ import pygrgl
 import pytest
 
 from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.tests.conftest import DATA_DTYPE, INDEX_DTYPE, default_backend_builders
+from pygrgl_spmv.tests.conftest import DATA_DTYPE, default_backend_builders
 
 
 @pytest.fixture(scope="session", params=default_backend_builders(log_level="INFO"))
@@ -46,7 +46,7 @@ def missing_grg(missing_grg_path):
 @pytest.fixture
 def make_operator(backend_builder, spmv_cache_dir):
     def _make(path: str, dtype=DATA_DTYPE):
-        return SpmvGRG(path, backend_builder(), dtype, INDEX_DTYPE, artifact_dir=spmv_cache_dir)
+        return SpmvGRG(path, backend_builder(), dtype, artifact_dir=spmv_cache_dir)
 
     return _make
 

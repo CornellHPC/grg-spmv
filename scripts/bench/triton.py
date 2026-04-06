@@ -44,7 +44,6 @@ def main() -> None:
                     common.ks,
                     common.options,
                     dtype=common.dtype,
-                    index_dtype=common.index_dtype,
                 )
             )
         return
@@ -57,7 +56,6 @@ def main() -> None:
         n_trials=common.n_trials,
         n_warmup=common.n_warmup,
         dtype=common.dtype,
-        index_dtype=common.index_dtype,
         output_atol=common.output_atol,
         output_rtol=common.output_rtol,
         skip_note=common.skip_note,

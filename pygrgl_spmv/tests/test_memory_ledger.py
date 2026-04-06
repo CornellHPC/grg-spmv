@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
-from pygrgl_spmv.grg.sparse import binary_csr_from_csr_parts
+from pygrgl_spmv.grg.sparse import binary_csr_from_parts
 from pygrgl_spmv.memory import alloc_field, capture_snapshot, child_field, ignore_field, tree_rows
 
 
@@ -183,11 +183,10 @@ def test_tree_rows_preserve_total_leaf_bytes():
 
 
 def test_capture_snapshot_handles_shared_sparse_data_without_breaking():
-    matrix = binary_csr_from_csr_parts(
+    matrix = binary_csr_from_parts(
         indices=np.arange(6, dtype=np.int32),
         indptr=np.array([0, 6], dtype=np.int32),
         shape=(1, 6),
-        index_dtype=np.int32,
         shared_data=True,
     )
     snapshot = capture_snapshot(_SparseRoot(mat=matrix), stage="retained", runtime_k=None)

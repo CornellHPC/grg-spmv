@@ -4,60 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-import os
 
 import numpy as np
 import pygrgl
 import scipy.sparse as sp
 
+from pygrgl_spmv._rss import rss_checkpoint
 from pygrgl_spmv.backends import BackendSetup
-from pygrgl_spmv.grg.sparse import binary_csr_from_csr_parts
+from pygrgl_spmv.grg.sparse import binary_csr_from_parts, finalize_int_array, pick_small_signed_int_dtype
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _rss_bytes() -> int | None:
-    try:
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        with open("/proc/self/statm", encoding="ascii") as handle:
-            fields = handle.readline().split()
-    except (OSError, ValueError):
-        return None
-    if len(fields) < 2:
-        return None
-    try:
-        return int(fields[1]) * page_size
-    except ValueError:
-        return None
-
-
-def _rss_checkpoint(
-    label: str,
-    prev_rss_bytes: int | None,
-) -> int | None:
-    if not _LOGGER.isEnabledFor(logging.INFO):
-        return prev_rss_bytes
-    rss_bytes = _rss_bytes()
-    if rss_bytes is None:
-        return prev_rss_bytes
-    if prev_rss_bytes is None:
-        _LOGGER.info(
-            "rss %s rss_bytes=%d rss_mib=%.1f",
-            label,
-            rss_bytes,
-            rss_bytes / (1024.0 * 1024.0),
-        )
-    else:
-        delta_bytes = int(rss_bytes - prev_rss_bytes)
-        _LOGGER.info(
-            "rss %s rss_bytes=%d rss_mib=%.1f delta_bytes=%+d delta_mib=%+.1f",
-            label,
-            rss_bytes,
-            rss_bytes / (1024.0 * 1024.0),
-            delta_bytes,
-            delta_bytes / (1024.0 * 1024.0),
-        )
-    return rss_bytes
 
 
 @dataclass
@@ -106,36 +62,19 @@ class CompiledOperatorState:
         )
 
 
-def _cast_index_array(values, *, index_dtype: np.dtype, label: str) -> np.ndarray:
-    """Cast non-negative structural arrays into the configured index dtype."""
-    arr64 = np.asarray(values, dtype=np.int64)
-    if arr64.ndim == 0:
-        arr64 = arr64.reshape(1)
-    if arr64.size == 0:
-        return arr64.astype(index_dtype, copy=False)
-    if int(arr64.min()) < 0:
-        raise ValueError(f"{label} must be non-negative")
-    if int(arr64.max()) > np.iinfo(index_dtype).max:
-        raise ValueError(
-            f"{label} exceeds {np.dtype(index_dtype).name} range: max={int(arr64.max())}, "
-            f"limit={np.iinfo(index_dtype).max}"
-        )
-    return arr64.astype(index_dtype, copy=False)
-
-
-def _invert_permutation(perm: np.ndarray, *, index_dtype: np.dtype) -> np.ndarray:
+def _invert_permutation(perm: np.ndarray) -> np.ndarray:
     """Build the inverse of a dense permutation array."""
-    perm_arr = np.asarray(perm, dtype=index_dtype)
-    inv = np.empty(int(perm_arr.size), dtype=index_dtype)
-    inv[perm_arr] = np.arange(int(perm_arr.size), dtype=index_dtype)
+    perm_arr = finalize_int_array(perm, label="perm")
+    inv = np.empty(int(perm_arr.size), dtype=perm_arr.dtype)
+    inv[perm_arr] = np.arange(int(perm_arr.size), dtype=perm_arr.dtype)
     return inv
 
 
-def _compute_node_levels(grg, num_nodes: int, *, index_dtype: np.dtype) -> np.ndarray:
+def _compute_node_levels(grg, num_nodes: int, *, node_id_scratch_dtype: np.dtype) -> np.ndarray:
     """Compute node levels from down edges only."""
     levels = np.zeros(num_nodes, dtype=np.int32)
     for node_id in range(num_nodes):
-        children = np.asarray(grg.get_down_edges(node_id), dtype=index_dtype)
+        children = np.asarray(grg.get_down_edges(node_id), dtype=node_id_scratch_dtype)
         if children.size == 0:
             continue
         levels[node_id] = int(levels[children].max()) + 1
@@ -144,8 +83,6 @@ def _compute_node_levels(grg, num_nodes: int, *, index_dtype: np.dtype) -> np.nd
 
 def _build_stable_height_order(
     node_levels: np.ndarray,
-    *,
-    index_dtype: np.dtype,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build stable height order directly from per-height counts."""
     num_nodes = int(node_levels.shape[0])
@@ -156,30 +93,19 @@ def _build_stable_height_order(
     level_offsets64 = np.zeros(num_levels + 1, dtype=np.int64)
     level_offsets64[1:] = np.cumsum(counts, dtype=np.int64)
 
-    node_perm = np.empty(num_nodes, dtype=index_dtype)
+    node_perm64 = np.empty(num_nodes, dtype=np.int64)
     next_pos = level_offsets64[:-1].copy()
     for node_id in range(num_nodes):
         level = int(level_values[node_id])
         pos = int(next_pos[level])
-        node_perm[pos] = node_id
+        node_perm64[pos] = node_id
         next_pos[level] = pos + 1
 
-    inv_node_perm = _invert_permutation(node_perm, index_dtype=index_dtype)
-    level_offsets = _cast_index_array(level_offsets64, index_dtype=index_dtype, label="level_offsets")
+    node_perm = finalize_int_array(node_perm64, label="node_perm")
+    inv_node_perm = _invert_permutation(node_perm)
+    level_offsets = finalize_int_array(level_offsets64, label="level_offsets")
     return node_perm, inv_node_perm, level_offsets
 
-
-def _empty_binary_csr(
-    *,
-    shape: tuple[int, int],
-    index_dtype: np.dtype,
-) -> sp.csr_matrix:
-    return binary_csr_from_csr_parts(
-        indices=np.empty(0, dtype=index_dtype),
-        indptr=np.zeros(shape[0] + 1, dtype=index_dtype),
-        shape=shape,
-        index_dtype=index_dtype,
-    )
 
 def _build_level_blocks(
     grg,
@@ -187,19 +113,23 @@ def _build_level_blocks(
     node_levels: np.ndarray,
     level_offsets: np.ndarray,
     inv_node_perm: np.ndarray,
-    index_dtype: np.dtype,
+    node_id_scratch_dtype: np.dtype,
 ) -> list[list[sp.csr_matrix]]:
     """Build block CSR matrices in two streamed passes with exact-sized arrays."""
     num_nodes = int(node_levels.shape[0])
     num_levels = int(level_offsets.size - 1)
     level_offsets64 = np.asarray(level_offsets, dtype=np.int64)
+    block_indptr_scratch_dtype = pick_small_signed_int_dtype(max(int(grg.num_edges), 0))
     level_sizes = [int(level_offsets64[level + 1] - level_offsets64[level]) for level in range(num_levels)]
+    block_index_scratch_dtypes = [
+        pick_small_signed_int_dtype(max(level_size - 1, 0))
+        for level_size in level_sizes
+    ]
     block_indptrs: list[list[np.ndarray | None]] = [[None] * level for level in range(num_levels)]
-    prev_rss_bytes: int | None = None
 
     for parent_id in range(num_nodes):
         parent_level = int(node_levels[parent_id])
-        children = np.asarray(grg.get_down_edges(parent_id), dtype=index_dtype)
+        children = np.asarray(grg.get_down_edges(parent_id), dtype=node_id_scratch_dtype)
         if children.size == 0:
             continue
 
@@ -213,11 +143,9 @@ def _build_level_blocks(
         for child_level in np.flatnonzero(child_level_counts):
             indptr = block_indptrs[parent_level][child_level]
             if indptr is None:
-                indptr = np.zeros(level_sizes[parent_level] + 1, dtype=index_dtype)
+                indptr = np.zeros(level_sizes[parent_level] + 1, dtype=block_indptr_scratch_dtype)
                 block_indptrs[parent_level][child_level] = indptr
             indptr[row_local + 1] += int(child_level_counts[child_level])
-    prev_rss_bytes = _rss_checkpoint("compile:block_indptr_counts", prev_rss_bytes)
-
     block_indices: list[list[np.ndarray | None]] = [[None] * level for level in range(num_levels)]
     for parent_level in range(num_levels):
         for child_level in range(parent_level):
@@ -225,12 +153,18 @@ def _build_level_blocks(
             if indptr is None:
                 continue
             np.cumsum(indptr, out=indptr)
-            block_indices[parent_level][child_level] = np.empty(int(indptr[-1]), dtype=index_dtype)
-    prev_rss_bytes = _rss_checkpoint("compile:block_indices_alloc", prev_rss_bytes)
-
+            indptr = finalize_int_array(
+                indptr,
+                label=f"A_blocks[{parent_level}][{child_level}].indptr",
+            )
+            block_indptrs[parent_level][child_level] = indptr
+            block_indices[parent_level][child_level] = np.empty(
+                int(indptr[-1]),
+                dtype=block_index_scratch_dtypes[child_level],
+            )
     for parent_id in range(num_nodes):
         parent_level = int(node_levels[parent_id])
-        children = np.asarray(grg.get_down_edges(parent_id), dtype=index_dtype)
+        children = np.asarray(grg.get_down_edges(parent_id), dtype=node_id_scratch_dtype)
         if children.size == 0:
             continue
 
@@ -249,14 +183,6 @@ def _build_level_blocks(
         )
         for b0, b1 in zip(bounds[:-1], bounds[1:]):
             child_level = int(child_levels_sorted[int(b0)])
-            cols_local = np.asarray(
-                child_positions_sorted[int(b0) : int(b1)] - level_offsets[child_level],
-                dtype=index_dtype,
-            )
-            if cols_local.size > 1 and np.any(cols_local[1:] == cols_local[:-1]):
-                raise RuntimeError(
-                    f"Duplicate GRG edge detected for parent node {parent_id} and child level {child_level}"
-                )
             indptr = block_indptrs[parent_level][child_level]
             indices = block_indices[parent_level][child_level]
             if indptr is None or indices is None:
@@ -265,14 +191,22 @@ def _build_level_blocks(
                 )
             start = int(indptr[row_local])
             end = int(indptr[row_local + 1])
-            if (end - start) != int(cols_local.size):
+            if (end - start) != int(b1 - b0):
                 raise RuntimeError(
                     f"Row nnz mismatch for block ({parent_level}, {child_level}) row {row_local}: "
-                    f"expected {end - start}, got {cols_local.size}"
+                    f"expected {end - start}, got {int(b1 - b0)}"
                 )
-            indices[start:end] = cols_local
-    _rss_checkpoint("compile:block_indices_fill", prev_rss_bytes)
-
+            cols_local = indices[start:end]
+            np.subtract(
+                child_positions_sorted[int(b0) : int(b1)],
+                level_offsets[child_level],
+                out=cols_local,
+                casting="unsafe",
+            )
+            if cols_local.size > 1 and np.any(cols_local[1:] == cols_local[:-1]):
+                raise RuntimeError(
+                    f"Duplicate GRG edge detected for parent node {parent_id} and child level {child_level}"
+                )
     A_blocks: list[list[sp.csr_matrix]] = []
     for parent_level in range(num_levels):
         level_blocks: list[sp.csr_matrix] = []
@@ -281,18 +215,21 @@ def _build_level_blocks(
             indices = block_indices[parent_level][child_level]
             if indptr is None or indices is None:
                 level_blocks.append(
-                    _empty_binary_csr(
+                    binary_csr_from_parts(
+                        indices=np.empty(0, dtype=np.int32),
+                        indptr=np.zeros(level_sizes[parent_level] + 1, dtype=np.int32),
                         shape=(level_sizes[parent_level], level_sizes[child_level]),
-                        index_dtype=index_dtype,
                     )
                 )
                 continue
             level_blocks.append(
-                binary_csr_from_csr_parts(
-                    indices=indices,
+                binary_csr_from_parts(
+                    indices=finalize_int_array(
+                        indices,
+                        label=f"A_blocks[{parent_level}][{child_level}].indices",
+                    ),
                     indptr=indptr,
                     shape=(level_sizes[parent_level], level_sizes[child_level]),
-                    index_dtype=index_dtype,
                     shared_data=True,
                 )
             )
@@ -301,16 +238,15 @@ def _build_level_blocks(
 
 
 def _build_selectors(
-    grg,
+    mutation_rows,
     *,
     inv_node_perm: np.ndarray,
     num_mutations: int,
     num_nodes: int,
-    index_dtype: np.dtype,
+    node_id_scratch_dtype: np.dtype,
 ) -> tuple[sp.csr_matrix, sp.csr_matrix]:
     """Build selectors from sorted mutation rows, allowing contiguous repeated mutation IDs."""
-    rows = grg.get_mutation_node_miss()
-    row_count = len(rows)
+    row_count = len(mutation_rows)
     if row_count < num_mutations:
         raise ValueError(
             "GRG mutation rows are incomplete: "
@@ -318,15 +254,16 @@ def _build_selectors(
         )
 
     invalid_node = int(pygrgl.INVALID_NODE)
-    mut_indptr = np.zeros(num_mutations + 1, dtype=index_dtype)
-    miss_indptr = np.zeros(num_mutations + 1, dtype=index_dtype)
-    mut_indices = np.empty(row_count, dtype=index_dtype)
-    miss_indices = np.empty(row_count, dtype=index_dtype)
+    selector_indptr_scratch_dtype = pick_small_signed_int_dtype(max(row_count, 0))
+    mut_indptr = np.zeros(num_mutations + 1, dtype=selector_indptr_scratch_dtype)
+    miss_indptr = np.zeros(num_mutations + 1, dtype=selector_indptr_scratch_dtype)
+    mut_indices = np.empty(row_count, dtype=node_id_scratch_dtype)
+    miss_indices = np.empty(row_count, dtype=node_id_scratch_dtype)
     mut_nnz = 0
     miss_nnz = 0
     next_mut_id = 0
 
-    for mut_id_raw, mut_node_raw, miss_node_raw in rows:
+    for mut_id_raw, mut_node_raw, miss_node_raw in mutation_rows:
         mut_id = int(mut_id_raw)
         if mut_id < 0 or mut_id >= num_mutations:
             raise ValueError(
@@ -358,17 +295,15 @@ def _build_selectors(
             f"ended at mutation id {next_mut_id - 1}, expected {num_mutations - 1}"
         )
 
-    sel_mut = binary_csr_from_csr_parts(
-        indices=mut_indices[:mut_nnz],
-        indptr=mut_indptr,
+    sel_mut = binary_csr_from_parts(
+        indices=finalize_int_array(mut_indices[:mut_nnz], label="sel_mut.indices"),
+        indptr=finalize_int_array(mut_indptr, label="sel_mut.indptr"),
         shape=(num_mutations, num_nodes),
-        index_dtype=index_dtype,
     )
-    sel_miss = binary_csr_from_csr_parts(
-        indices=miss_indices[:miss_nnz],
-        indptr=miss_indptr,
+    sel_miss = binary_csr_from_parts(
+        indices=finalize_int_array(miss_indices[:miss_nnz], label="sel_miss.indices"),
+        indptr=finalize_int_array(miss_indptr, label="sel_miss.indptr"),
         shape=(num_mutations, num_nodes),
-        index_dtype=index_dtype,
     )
     if row_count > num_mutations and sel_miss.nnz > 0:
         # Repeated mutation rows can legitimately share one missingness node,
@@ -475,8 +410,6 @@ def _validate_sample_prefix(*, node_perm: np.ndarray, level_offsets: np.ndarray,
 
 def compile_grg(
     grg,
-    *,
-    index_dtype: np.dtype,
 ) -> CompiledOperatorState:
     """Compile a non-empty immutable GRG into the normalized sparse traversal layout."""
     num_samples = int(grg.num_samples)
@@ -489,23 +422,11 @@ def compile_grg(
         raise ValueError(
             "compile_grg() only supports immutable GRGs; MutableGRG inputs may expose unsorted mutation rows."
         )
-    if num_nodes > np.iinfo(index_dtype).max:
-        raise ValueError(
-            f"num_nodes={num_nodes} exceeds {np.dtype(index_dtype).name} range required for structural arrays"
-        )
-    if num_edges > np.iinfo(index_dtype).max:
-        raise ValueError(
-            f"num_edges={num_edges} exceeds {np.dtype(index_dtype).name} range required for structural arrays"
-        )
+    node_id_scratch_dtype = pick_small_signed_int_dtype(max(num_nodes - 1, 0))
 
-    prev_rss_bytes = _rss_checkpoint("compile:start", None)
-    node_levels = _compute_node_levels(grg, num_nodes, index_dtype=index_dtype)
-    prev_rss_bytes = _rss_checkpoint("compile:node_levels", prev_rss_bytes)
-    node_perm, inv_node_perm, level_offsets = _build_stable_height_order(
-        node_levels,
-        index_dtype=index_dtype,
-    )
-    prev_rss_bytes = _rss_checkpoint("compile:stable_order", prev_rss_bytes)
+    prev_rss_bytes = rss_checkpoint(_LOGGER, "compile:start", None)
+    node_levels = _compute_node_levels(grg, num_nodes, node_id_scratch_dtype=node_id_scratch_dtype)
+    node_perm, inv_node_perm, level_offsets = _build_stable_height_order(node_levels)
     _validate_sample_prefix(node_perm=node_perm, level_offsets=level_offsets, num_samples=num_samples)
 
     A_blocks = _build_level_blocks(
@@ -513,46 +434,38 @@ def compile_grg(
         node_levels=node_levels,
         level_offsets=level_offsets,
         inv_node_perm=inv_node_perm,
-        index_dtype=index_dtype,
+        node_id_scratch_dtype=node_id_scratch_dtype,
     )
-    prev_rss_bytes = _rss_checkpoint("compile:blocks_ready", prev_rss_bytes)
+    del node_levels
+    prev_rss_bytes = rss_checkpoint(_LOGGER, "compile:blocks_ready", prev_rss_bytes)
 
-    num_levels = int(level_offsets.size - 1)
-    for parent_level in range(num_levels):
-        if len(A_blocks[parent_level]) != parent_level:
-            raise RuntimeError(
-                f"Invalid number of blocks at level {parent_level}: got {len(A_blocks[parent_level])}, expected {parent_level}"
-            )
-        for child_level, block in enumerate(A_blocks[parent_level]):
-            expected_shape = (
-                int(level_offsets[parent_level + 1] - level_offsets[parent_level]),
-                int(level_offsets[child_level + 1] - level_offsets[child_level]),
-            )
-            if block.shape != expected_shape:
-                raise RuntimeError(
-                    f"Invalid block shape for A_blocks[{parent_level}][{child_level}]: "
-                    f"got {block.shape}, expected {expected_shape}"
-                )
+    mutation_rows = grg.get_mutation_node_miss()
+    prev_rss_bytes = rss_checkpoint(_LOGGER, "compile:mutation_rows_loaded", prev_rss_bytes)
 
     sel_mut, sel_miss = _build_selectors(
-        grg,
+        mutation_rows,
         inv_node_perm=inv_node_perm,
         num_mutations=num_mutations,
         num_nodes=num_nodes,
-        index_dtype=index_dtype,
+        node_id_scratch_dtype=node_id_scratch_dtype,
     )
-    prev_rss_bytes = _rss_checkpoint("compile:selectors_ready", prev_rss_bytes)
+    prev_rss_bytes = rss_checkpoint(_LOGGER, "compile:selectors_built", prev_rss_bytes)
+    del mutation_rows
+    prev_rss_bytes = rss_checkpoint(_LOGGER, "compile:selectors_ready", prev_rss_bytes)
 
-    sample_to_individual = np.arange(num_samples, dtype=index_dtype) // max(int(grg.ploidy), 1)
+    sample_to_individual = finalize_int_array(
+        np.arange(num_samples, dtype=node_id_scratch_dtype) // max(int(grg.ploidy), 1),
+        label="sample_to_individual",
+    )
     coalescence_counts = _build_coalescence_counts(grg, node_perm=node_perm)
     mutation_positions, mutation_times, mutation_alleles, mutation_allele_offsets, mutation_ref_alleles, mutation_ref_allele_offsets = _build_mutation_table(grg)
-    _rss_checkpoint("compile:mutation_table_ready", prev_rss_bytes)
+    rss_checkpoint(_LOGGER, "compile:mutation_table_ready", prev_rss_bytes)
 
     return CompiledOperatorState(
         A_blocks=A_blocks,
         level_offsets=level_offsets,
-        node_perm=node_perm.copy(),
-        inv_node_perm=inv_node_perm.copy(),
+        node_perm=node_perm,
+        inv_node_perm=inv_node_perm,
         sel_mut=sel_mut,
         sel_miss=sel_miss,
         num_samples=num_samples,

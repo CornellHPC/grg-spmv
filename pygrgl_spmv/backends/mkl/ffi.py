@@ -60,6 +60,7 @@ _STATUS_NAMES = {
     5: 'INTERNAL_ERROR',
     6: 'NOT_SUPPORTED',
 }
+_INT32_MAX = int(np.iinfo(np.int32).max)
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +248,29 @@ def _check(status, func_name):
         raise RuntimeError(f"MKL {func_name} failed: status {status} ({name})")
 
 
+def _validate_lp64_matrix(mat, fmt):
+    m, n = (int(v) for v in mat.shape)
+    if m > _INT32_MAX:
+        raise ValueError(f"LP64 MKL requires nrows <= {_INT32_MAX}, got {m}")
+    if n > _INT32_MAX:
+        raise ValueError(f"LP64 MKL requires ncols <= {_INT32_MAX}, got {n}")
+    if fmt in ('csr', 'csc'):
+        for name in ('indptr', 'indices'):
+            arr = np.asarray(getattr(mat, name))
+            if arr.dtype == np.dtype(np.int64):
+                raise ValueError(f"LP64 MKL requires {fmt.upper()} {name} to use int32, got int64")
+        return
+    if fmt == 'coo':
+        if int(mat.nnz) > _INT32_MAX:
+            raise ValueError(f"LP64 MKL requires COO nnz <= {_INT32_MAX}, got {int(mat.nnz)}")
+        for name in ('row', 'col'):
+            arr = np.asarray(getattr(mat, name))
+            if arr.dtype == np.dtype(np.int64):
+                raise ValueError(f"LP64 MKL requires COO {name} to use int32, got int64")
+        return
+    raise ValueError(f"Unsupported format: {fmt!r}")
+
+
 # ---------------------------------------------------------------------------
 # MklSparseHandle — persistent inspector-executor handle
 # ---------------------------------------------------------------------------
@@ -266,9 +290,9 @@ class MklSparseHandle:
     """
 
     def __init__(self, mat, fmt='csr'):
-        lib, int_dtype, ct_int = _ensure_loaded()
+        lib, mkl_int_dtype, mkl_ct_int = _ensure_loaded()
         self._lib = lib
-        self._ct_int = ct_int
+        self._ct_int = mkl_ct_int
         self._handle = c_void_p()
         self._fmt = fmt
 
@@ -277,19 +301,22 @@ class MklSparseHandle:
         self._nnz = self._mat.nnz
         self._shape = self._mat.shape
 
-        # Ensure index arrays use the correct MKL integer type
+        if mkl_int_dtype == np.int32:
+            _validate_lp64_matrix(self._mat, fmt)
+
+        # Ensure index arrays use the MKL ABI integer width
         if fmt in ('csr', 'csc'):
-            self._mat.indptr = self._mat.indptr.astype(int_dtype, copy=False)
-            self._mat.indices = self._mat.indices.astype(int_dtype, copy=False)
+            self._mat.indptr = self._mat.indptr.astype(mkl_int_dtype, copy=False)
+            self._mat.indices = self._mat.indices.astype(mkl_int_dtype, copy=False)
         elif fmt == 'coo':
-            self._mat.row = self._mat.row.astype(int_dtype, copy=False)
-            self._mat.col = self._mat.col.astype(int_dtype, copy=False)
+            self._mat.row = self._mat.row.astype(mkl_int_dtype, copy=False)
+            self._mat.col = self._mat.col.astype(mkl_int_dtype, copy=False)
 
         # Ensure data is float64 C-contiguous
         self._mat.data = np.ascontiguousarray(self._mat.data, dtype=np.float64)
 
         # Create the MKL handle
-        INT_P = POINTER(ct_int)
+        INT_P = POINTER(mkl_ct_int)
         DBL_P = POINTER(c_double)
         m, n = self._mat.shape
 
@@ -298,7 +325,7 @@ class MklSparseHandle:
             _check(lib.mkl_sparse_d_create_csr(
                 byref(self._handle),
                 c_int(SPARSE_INDEX_BASE_ZERO),
-                ct_int(m), ct_int(n),
+                mkl_ct_int(m), mkl_ct_int(n),
                 indptr[:-1].ctypes.data_as(INT_P),
                 indptr[1:].ctypes.data_as(INT_P),
                 self._mat.indices.ctypes.data_as(INT_P),
@@ -310,7 +337,7 @@ class MklSparseHandle:
             _check(lib.mkl_sparse_d_create_csc(
                 byref(self._handle),
                 c_int(SPARSE_INDEX_BASE_ZERO),
-                ct_int(m), ct_int(n),
+                mkl_ct_int(m), mkl_ct_int(n),
                 indptr[:-1].ctypes.data_as(INT_P),
                 indptr[1:].ctypes.data_as(INT_P),
                 self._mat.indices.ctypes.data_as(INT_P),
@@ -321,8 +348,8 @@ class MklSparseHandle:
             nnz = self._mat.nnz
             _check(lib.mkl_sparse_d_create_coo(
                 byref(self._handle),
-                ct_int(SPARSE_INDEX_BASE_ZERO),
-                ct_int(m), ct_int(n), ct_int(nnz),
+                mkl_ct_int(SPARSE_INDEX_BASE_ZERO),
+                mkl_ct_int(m), mkl_ct_int(n), mkl_ct_int(nnz),
                 self._mat.row.ctypes.data_as(INT_P),
                 self._mat.col.ctypes.data_as(INT_P),
                 self._mat.data.ctypes.data_as(DBL_P),

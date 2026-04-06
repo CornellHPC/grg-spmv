@@ -10,10 +10,11 @@ import numpy as np
 import pygrgl
 import scipy.sparse as sp
 
+from pygrgl_spmv._rss import rss_checkpoint
 from pygrgl_spmv.backends import BackendBase, ReferenceBackend, ReferencePlanPair
 from pygrgl_spmv.backends.types import Direction, InitMode, parse_direction
 from pygrgl_spmv.grg.artifact import artifact_path_for_grg, load_grg_spmv, save_grg_spmv
-from pygrgl_spmv.grg.compile import CompiledOperatorState, _rss_checkpoint, compile_grg
+from pygrgl_spmv.grg.compile import CompiledOperatorState, compile_grg
 from pygrgl_spmv.memory import (
     MemoryLedger,
     alloc_field,
@@ -57,6 +58,7 @@ class OperatorCallMem:
     input_by_individual: np.ndarray | None = alloc_field(label="input_by_individual", kind="temporary", owner="operator", retention="call", activity="yes", default=None)
 
 _NUCLEOTIDE_DECODE = ["A", "T", "C", "G"]
+_COMPILE_LOGGER = logging.getLogger("pygrgl_spmv.grg.compile")
 
 
 def _decode_allele(data: np.ndarray, offsets: np.ndarray, idx: int) -> str:
@@ -76,11 +78,10 @@ class SpmvGRG:
         path,
         backend: BackendBase,
         dtype,
-        index_dtype,
+        *,
         artifact_dir: str | Path = "pygrgl_spmv_artifacts",
     ):
         self._dtype = np.dtype(dtype)
-        self._index_dtype = np.dtype(index_dtype)
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         if not isinstance(backend, BackendBase):
             raise TypeError(f"SpmvGRG backend must be a BackendBase instance, got {type(backend).__name__}")
@@ -95,7 +96,7 @@ class SpmvGRG:
             self._compiled = self._load_or_build_from_grg(source_path=source_path, artifact_path=self._artifact_path)
         elif source_path.suffix == ".grg_spmv":
             self._artifact_path = source_path
-            self._compiled = load_grg_spmv(self._artifact_path, self._dtype, self._index_dtype)
+            self._compiled = load_grg_spmv(self._artifact_path, self._dtype)
         else:
             raise ValueError(f"Unsupported SpmvGRG input path {source_path}; expected .grg or .grg_spmv")
 
@@ -110,7 +111,7 @@ class SpmvGRG:
         if artifact_path.exists():
             self._logger.info("Loading SpmvGRG artifact from %s", artifact_path)
             try:
-                return load_grg_spmv(artifact_path, self._dtype, self._index_dtype)
+                return load_grg_spmv(artifact_path, self._dtype)
             except (KeyError, ValueError) as exc:
                 self._logger.warning(
                     "SpmvGRG artifact at %s is invalid (%s); rebuilding from %s",
@@ -124,15 +125,15 @@ class SpmvGRG:
 
     def _build_and_save_artifact(self, *, source_path: Path, artifact_path: Path) -> CompiledOperatorState:
         grg = pygrgl.load_immutable_grg(str(source_path), load_up_edges=False)
-        prev_rss_bytes = _rss_checkpoint("artifact:grg_loaded", None)
-        compiled = compile_grg(grg, index_dtype=self._index_dtype)
-        prev_rss_bytes = _rss_checkpoint("artifact:compiled", prev_rss_bytes)
+        prev_rss_bytes = rss_checkpoint(_COMPILE_LOGGER, "artifact:grg_loaded", None)
+        compiled = compile_grg(grg)
+        prev_rss_bytes = rss_checkpoint(_COMPILE_LOGGER, "artifact:compiled", prev_rss_bytes)
         del grg
-        prev_rss_bytes = _rss_checkpoint("artifact:grg_dropped", prev_rss_bytes)
+        prev_rss_bytes = rss_checkpoint(_COMPILE_LOGGER, "artifact:grg_dropped", prev_rss_bytes)
         self._build_init_biases(compiled)
-        prev_rss_bytes = _rss_checkpoint("artifact:init_biases", prev_rss_bytes)
+        prev_rss_bytes = rss_checkpoint(_COMPILE_LOGGER, "artifact:init_biases", prev_rss_bytes)
         save_grg_spmv(compiled, artifact_path)
-        _rss_checkpoint("artifact:saved", prev_rss_bytes)
+        rss_checkpoint(_COMPILE_LOGGER, "artifact:saved", prev_rss_bytes)
         return compiled
 
     def _build_init_biases(self, compiled: CompiledOperatorState) -> None:

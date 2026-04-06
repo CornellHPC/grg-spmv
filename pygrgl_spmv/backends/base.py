@@ -12,9 +12,64 @@ import numpy as np
 import scipy.sparse as sp
 
 from pygrgl_spmv.memory import AllocKey, _alloc_keys_for_value
-from pygrgl_spmv.backends.types import Direction, InitMode
+from pygrgl_spmv.backends.types import Direction, InitMode, StoredMatrix
 
 _RESERVED_CAPTURE_META_KEYS = frozenset({"direction", "runtime_k", "active_alloc_keys"})
+
+
+def _require_struct_dtype(dtype: np.dtype, *, label: str) -> np.dtype:
+    dt = np.dtype(dtype)
+    if dt not in {np.dtype(np.int32), np.dtype(np.int64)}:
+        raise TypeError(f"{label} must use int32 or int64, got {dt}")
+    return dt
+
+
+def _struct_dtype_for_bound(max_value: int) -> np.dtype:
+    if int(max_value) < 0:
+        raise ValueError(f"structural bound must be non-negative, got {max_value}")
+    if int(max_value) > int(np.iinfo(np.int32).max):
+        return np.dtype(np.int64)
+    return np.dtype(np.int32)
+
+
+def _layout_struct_dtypes(fmt: str, *, nrows: int, ncols: int, nnz: int) -> tuple[np.dtype, np.dtype]:
+    token = str(fmt).strip().lower()
+    if token == "csr":
+        return _struct_dtype_for_bound(max(int(nnz), 0)), _struct_dtype_for_bound(max(int(ncols) - 1, 0))
+    if token == "csc":
+        return _struct_dtype_for_bound(max(int(nnz), 0)), _struct_dtype_for_bound(max(int(nrows) - 1, 0))
+    if token == "coo":
+        return _struct_dtype_for_bound(max(int(nrows) - 1, 0)), _struct_dtype_for_bound(max(int(ncols) - 1, 0))
+    raise ValueError(f"unknown sparse format for structural dtype bounds: {fmt!r}")
+
+
+def _copy_struct_checked(dst: Any, values: Any, *, label: str) -> None:
+    dst_arr = np.asarray(dst)
+    src_arr = np.asarray(values)
+    source = _require_struct_dtype(src_arr.dtype, label=label)
+    target = _require_struct_dtype(dst_arr.dtype, label=label)
+    if dst_arr.shape != src_arr.shape:
+        raise ValueError(f"{label} shape mismatch: expected {dst_arr.shape}, got {src_arr.shape}")
+    if source == target:
+        np.copyto(dst_arr, src_arr, casting="no")
+        return
+    if source.itemsize < target.itemsize:
+        np.copyto(dst_arr, src_arr, casting="safe")
+        return
+    if src_arr.size:
+        lo = int(np.asarray(src_arr).min())
+        hi = int(np.asarray(src_arr).max())
+        info = np.iinfo(target)
+        if lo < int(info.min) or hi > int(info.max):
+            raise ValueError(f"{label} exceeds {target} range")
+    np.copyto(dst_arr, src_arr, casting="unsafe")
+
+
+def _validate_struct_int_array(values: Any, *, label: str) -> None:
+    arr = np.asarray(values)
+    _require_struct_dtype(arr.dtype, label=label)
+    if arr.size and int(arr.min()) < 0:
+        raise ValueError(f"{label} must be non-negative")
 
 
 def _parse_optional_k_hint(value: Any) -> int | None:
@@ -218,12 +273,29 @@ class BackendBase:
             directions.append(Direction.DOWN)
         return tuple(directions)
 
+    def _stored_matrix(self, direction: Direction, *, dst_level: int, src_level: int) -> sp.spmatrix:
+        """Return the block in the exact sparse orientation retained by the direction plan."""
+        plan = self._require_plan(direction)
+        base = self._A_blocks[dst_level][src_level] if direction == Direction.UP else self._A_blocks[src_level][dst_level]
+        return base if plan.store == StoredMatrix.N else base.T
+
     def _apply_setup_state(self, setup: BackendSetup) -> None:
         self._require_memory_installed()
         if self._capture_active:
             raise RuntimeError(f"{self.__class__.__name__} cannot apply setup state while a call capture is active")
         if self._call_mem is not None:
             raise RuntimeError(f"{self.__class__.__name__} cannot apply setup state while call memory is live")
+        _validate_struct_int_array(setup.level_offsets, label="level_offsets")
+        for dst_level, row in enumerate(setup.A_blocks):
+            for src_level, block in enumerate(row):
+                if not sp.isspmatrix_csr(block):
+                    raise TypeError(f"A_blocks[{dst_level}][{src_level}] must be CSR, got {type(block).__name__}")
+                _validate_struct_int_array(block.indices, label=f"A_blocks[{dst_level}][{src_level}].indices")
+                _validate_struct_int_array(block.indptr, label=f"A_blocks[{dst_level}][{src_level}].indptr")
+        _validate_struct_int_array(setup.sel_mut.indices, label="sel_mut.indices")
+        _validate_struct_int_array(setup.sel_mut.indptr, label="sel_mut.indptr")
+        _validate_struct_int_array(setup.sel_miss.indices, label="sel_miss.indices")
+        _validate_struct_int_array(setup.sel_miss.indptr, label="sel_miss.indptr")
         self._A_blocks = setup.A_blocks
         self._level_offsets = np.asarray(setup.level_offsets)
         self._num_samples = int(setup.num_samples)
@@ -468,6 +540,10 @@ __all__ = [
     "CallCapture",
     "BackendSetup",
     "_parse_optional_k_hint",
+    "_copy_struct_checked",
+    "_layout_struct_dtypes",
+    "_require_struct_dtype",
+    "_struct_dtype_for_bound",
     "iter_direction_level_pairs",
     "selector_rows_unique_from_csr_indptr",
     "warn_k_hint_mismatch",

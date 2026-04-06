@@ -65,6 +65,14 @@ Setup:
 - autotunes the Triton kernel family for each configured direction
 - creates captured workspaces when the effective `k_hint` is present
 
+The backend resolves slot dtypes from each stored block's final CSR/CSC shape
+and `nnz`, then streams setup one block at a time: materialize one stored
+block, pin its sparse structure, drop the temporary SciPy block, and continue.
+It uses cheap bounds to choose `int32` when that is provably safe, otherwise
+keeps conservative `int64` structure, and preserves separate `indices` and
+`indptr` slot families. Pinned copies are range-checked against those chosen
+slot dtypes.
+
 Execution:
 
 - uses a single dense `node_state` tensor per workspace

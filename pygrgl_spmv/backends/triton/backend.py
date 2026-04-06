@@ -13,10 +13,14 @@ import scipy.sparse as sp
 import torch
 import triton
 
+from pygrgl_spmv._rss import rss_checkpoint
 from pygrgl_spmv.backends.base import (
     BackendBase,
     CallCapture,
     BackendSetup,
+    _copy_struct_checked,
+    _layout_struct_dtypes,
+    _require_struct_dtype,
     effective_k_hint,
     iter_direction_level_pairs,
     warn_instrumentation_ignores_k_hint,
@@ -59,22 +63,18 @@ def _torch_nbytes(value: torch.Tensor | None) -> int:
     return int(value.numel() * value.element_size())
 
 
-def _numpy_ptr(value: np.ndarray) -> int:
-    return int(np.asarray(value).__array_interface__["data"][0])
-
-
-def _ensure_int32_array(values: np.ndarray, *, label: str) -> np.ndarray:
-    arr = np.asarray(values)
-    if arr.size:
-        max_value = int(arr.max())
-        if max_value >= np.iinfo(np.int32).max:
-            raise ValueError(f"{label} exceeds int32 range required by Triton kernels")
-    return np.asarray(arr, dtype=np.int32)
+def _torch_int_dtype(dtype: np.dtype) -> torch.dtype:
+    dt = _require_struct_dtype(dtype, label="torch structural dtype")
+    return torch.int32 if dt == np.dtype(np.int32) else torch.int64
 
 
 def _selector_index_arrays(selector: sp.csr_matrix) -> tuple[np.ndarray, np.ndarray]:
     coo = selector.tocoo()
-    return np.asarray(coo.row, dtype=np.int64), np.asarray(coo.col, dtype=np.int64)
+    row = np.asarray(coo.row)
+    col = np.asarray(coo.col)
+    _require_struct_dtype(row.dtype, label="selector row indices")
+    _require_struct_dtype(col.dtype, label="selector col indices")
+    return row, col
 
 
 def _structure_signature(ops_by_level: list[list["_TritonOp"]]) -> str:
@@ -88,7 +88,6 @@ def _structure_signature(ops_by_level: list[list["_TritonOp"]]) -> str:
             digest.update(int(op.block.nnz).to_bytes(8, "little", signed=False))
     return digest.hexdigest()
 
-
 @dataclass(frozen=True)
 class _TritonHostBlock:
     indices: np.ndarray = alloc_field(label="host_blocks", kind="sparse")
@@ -98,7 +97,6 @@ class _TritonHostBlock:
     nnz: int = ignore_field()
     fmt: SparseFormat = ignore_field()
     keepalive_key: tuple[int, int] = ignore_field()
-    payload_key: tuple[int, int] = ignore_field()
 
     def nbytes(self) -> int:
         return int(self.indices.nbytes + self.indptr.nbytes)
@@ -112,7 +110,6 @@ class _TritonHostBlock:
             nnz=int(self.nnz),
             fmt=transpose_compatible_format(self.fmt),
             keepalive_key=self.keepalive_key,
-            payload_key=self.payload_key,
         )
 
 
@@ -303,6 +300,8 @@ class TritonBackend(BackendBase):
         self._sel_mut_cols_gpu = torch.empty(0, device=self._torch_device, dtype=torch.int64)
         self._sel_miss_rows_gpu = torch.empty(0, device=self._torch_device, dtype=torch.int64)
         self._sel_miss_cols_gpu = torch.empty(0, device=self._torch_device, dtype=torch.int64)
+        self._slot_indices_dtype = np.dtype(np.int32)
+        self._slot_indptr_dtype = np.dtype(np.int32)
         self._workspaces = _WorkspaceCache()
         self._staging_up: _DirectionStaging | None = None
         self._staging_down: _DirectionStaging | None = None
@@ -436,49 +435,97 @@ class TritonBackend(BackendBase):
             self._bump_retained_epoch()
         return value
 
-    def _operator_matrix(self, direction: Direction, *, dst_level: int, src_level: int) -> sp.spmatrix:
-        if direction == Direction.UP:
-            return self._A_blocks[dst_level][src_level]
-        return self._A_blocks[src_level][dst_level].T
+    def _materialize_stored_block(
+        self,
+        direction: Direction,
+        *,
+        dst_level: int,
+        src_level: int,
+    ) -> sp.spmatrix | None:
+        plan = self._plan_for(direction)
+        if plan is None:
+            return None
+        stored = self._stored_matrix(direction, dst_level=dst_level, src_level=src_level)
+        if stored.nnz == 0:
+            return None
+        match plan.fmt:
+            case SparseFormat.CSR:
+                return stored.tocsr()
+            case SparseFormat.CSC:
+                return stored.tocsc()
+            case _:
+                raise ValueError(f"Unsupported Triton sparse format: {plan.fmt.value}")
 
-    def _register_host_tensor(self, values: np.ndarray) -> tuple[np.ndarray, int]:
+    def _scan_slot_struct_dtypes(self) -> tuple[np.dtype, np.dtype]:
+        indices_dtype = np.dtype(np.int32)
+        indptr_dtype = np.dtype(np.int32)
+        H = len(self._level_offsets) - 1
+        for direction in self._configured_directions():
+            plan = self._plan_for(direction)
+            if plan is None:
+                continue
+            store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
+            if not store_actual:
+                continue
+            for dst_level, src_level, _row_index in iter_direction_level_pairs(direction, H):
+                stored = self._stored_matrix(direction, dst_level=dst_level, src_level=src_level)
+                if stored.nnz == 0:
+                    continue
+                block_indptr_dtype, block_indices_dtype = _layout_struct_dtypes(
+                    plan.fmt.value,
+                    nrows=int(stored.shape[0]),
+                    ncols=int(stored.shape[1]),
+                    nnz=int(stored.nnz),
+                )
+                if block_indices_dtype == np.dtype(np.int64):
+                    indices_dtype = np.dtype(np.int64)
+                if block_indptr_dtype == np.dtype(np.int64):
+                    indptr_dtype = np.dtype(np.int64)
+        return indices_dtype, indptr_dtype
+
+    def _register_host_tensor(self, values: np.ndarray, *, dtype: np.dtype, label: str) -> tuple[np.ndarray, int]:
         import cupyx
 
-        host = cupyx.empty_pinned(np.asarray(values).shape, dtype=np.int32)
-        np.copyto(host, np.asarray(values, dtype=np.int32))
+        arr = np.asarray(values)
+        _require_struct_dtype(arr.dtype, label=label)
+        host = cupyx.empty_pinned(arr.shape, dtype=_require_struct_dtype(dtype, label=label))
+        _copy_struct_checked(host, arr, label=label)
         tensor = torch.from_numpy(host)
         key = int(self._next_host_tensor_key)
         self._next_host_tensor_key += 1
         self._host_tensors[key] = tensor
         return host, key
 
-    def _pin_block(self, matrix: sp.spmatrix, *, fmt: SparseFormat) -> _TritonHostBlock | None:
-        if matrix.nnz == 0:
+    def _pin_host_block(
+        self,
+        sparse: sp.spmatrix,
+    ) -> _TritonHostBlock | None:
+        if sparse.nnz == 0:
             return None
-        match fmt:
-            case SparseFormat.CSR:
-                sparse = matrix.tocsr()
-                indices = _ensure_int32_array(sparse.indices, label="CSR indices")
-                indptr = _ensure_int32_array(sparse.indptr, label="CSR indptr")
-                nrows, ncols = sparse.shape
-            case SparseFormat.CSC:
-                sparse = matrix.tocsc()
-                indices = _ensure_int32_array(sparse.indices, label="CSC rowidx")
-                indptr = _ensure_int32_array(sparse.indptr, label="CSC colptr")
-                nrows, ncols = sparse.shape
-            case _:
-                raise ValueError(f"Unsupported Triton sparse format: {fmt.value}")
-        indices_host, indices_key = self._register_host_tensor(indices)
-        indptr_host, indptr_key = self._register_host_tensor(indptr)
+        fmt = str(getattr(sparse, "format", "")).lower()
+        if fmt not in {"csr", "csc"}:
+            raise ValueError(f"Unsupported Triton sparse format: {fmt!r}")
+        indices = np.asarray(sparse.indices)
+        indptr = np.asarray(sparse.indptr)
+        nrows, ncols = sparse.shape
+        indices_host, indices_key = self._register_host_tensor(
+            indices,
+            dtype=self._slot_indices_dtype,
+            label="Triton host block indices",
+        )
+        indptr_host, indptr_key = self._register_host_tensor(
+            indptr,
+            dtype=self._slot_indptr_dtype,
+            label="Triton host block indptr",
+        )
         return _TritonHostBlock(
             indices=indices_host,
             indptr=indptr_host,
             nrows=int(nrows),
             ncols=int(ncols),
             nnz=int(sparse.nnz),
-            fmt=fmt,
+            fmt=parse_sparse_format(fmt.upper()),
             keepalive_key=(indices_key, indptr_key),
-            payload_key=(_numpy_ptr(indices_host), _numpy_ptr(indptr_host)),
         )
 
     def _build_direction_host_blocks(self, direction: Direction) -> list[list[_TritonHostBlock | None]]:
@@ -494,8 +541,11 @@ class TritonBackend(BackendBase):
         store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
         if store_actual:
             for dst_level, src_level, row_index in iter_direction_level_pairs(direction, H):
-                matrix = self._operator_matrix(direction, dst_level=dst_level, src_level=src_level)
-                rows[dst_level][row_index] = self._pin_block(matrix, fmt=plan.fmt)
+                sparse = self._materialize_stored_block(direction, dst_level=dst_level, src_level=src_level)
+                if sparse is None:
+                    continue
+                rows[dst_level][row_index] = self._pin_host_block(sparse)
+                del sparse
             return rows
 
         owner_direction = Direction.UP if (self._up_ops_owner if direction == Direction.UP else self._down_ops_owner) == "up" else Direction.DOWN
@@ -526,8 +576,8 @@ class TritonBackend(BackendBase):
             return _TritonSlotPool(
                 slots=[
                     _TritonSlotBuffers(
-                        indices=torch.zeros((max_indices,), device=self._torch_device, dtype=torch.int32),
-                        indptr=torch.zeros((max_indptr,), device=self._torch_device, dtype=torch.int32),
+                        indices=torch.zeros((max_indices,), device=self._torch_device, dtype=_torch_int_dtype(self._slot_indices_dtype)),
+                        indptr=torch.zeros((max_indptr,), device=self._torch_device, dtype=_torch_int_dtype(self._slot_indptr_dtype)),
                     )
                     for _ in range(self._ring_buffer_size)
                 ]
@@ -580,6 +630,42 @@ class TritonBackend(BackendBase):
                 seq_idx += 1
         return ops
 
+    def _host_block_summary(self, direction: Direction) -> tuple[tuple[str, int], ...]:
+        plan = self._plan_for(direction)
+        if plan is None:
+            return (
+                ("stored_blocks", 0),
+                ("alias_blocks", 0),
+                ("empty_blocks", 0),
+                ("indices_bytes", 0),
+                ("indptr_bytes", 0),
+            )
+        store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
+        grid = self._grid_for(direction)
+        stored_blocks = 0
+        alias_blocks = 0
+        empty_blocks = 0
+        indices_bytes = 0
+        indptr_bytes = 0
+        for dst_level, src_level, row_index in iter_direction_level_pairs(direction, len(self._level_offsets) - 1):
+            block = grid[dst_level][row_index]
+            if block is None:
+                empty_blocks += 1
+                continue
+            if not store_actual:
+                alias_blocks += 1
+                continue
+            stored_blocks += 1
+            indices_bytes += int(block.indices.nbytes)
+            indptr_bytes += int(block.indptr.nbytes)
+        return (
+            ("stored_blocks", stored_blocks),
+            ("alias_blocks", alias_blocks),
+            ("empty_blocks", empty_blocks),
+            ("indices_bytes", indices_bytes),
+            ("indptr_bytes", indptr_bytes),
+        )
+
     def _log_block_memory(self, direction: Direction) -> None:
         if not self._logger.isEnabledFor(logging.DEBUG):
             return
@@ -589,19 +675,13 @@ class TritonBackend(BackendBase):
         store_actual = self._store_blocks_up if direction == Direction.UP else self._store_blocks_down
         grid = self._grid_for(direction)
         bucket = "host_blocks_up" if direction == Direction.UP else "host_blocks_down"
-        stored_blocks = 0
-        alias_blocks = 0
-        empty_blocks = 0
         total_rows = 0
         total_cols = 0
         total_nnz = 0
-        indices_bytes = 0
-        indptr_bytes = 0
 
         for dst_level, src_level, row_index in iter_direction_level_pairs(direction, len(self._level_offsets) - 1):
             block = grid[dst_level][row_index]
             if block is None:
-                empty_blocks += 1
                 continue
             alias = not store_actual
             total_rows += int(block.nrows)
@@ -609,12 +689,6 @@ class TritonBackend(BackendBase):
             total_nnz += int(block.nnz)
             block_indices = 0 if alias else int(block.indices.nbytes)
             block_indptr = 0 if alias else int(block.indptr.nbytes)
-            if alias:
-                alias_blocks += 1
-            else:
-                stored_blocks += 1
-                indices_bytes += block_indices
-                indptr_bytes += block_indptr
             self._logger.debug(
                 "Triton %s dir=%s dst=%d src=%d fmt=%s rows=%d cols=%d nnz=%d alias=%s indices_bytes=%d indptr_bytes=%d",
                 bucket,
@@ -630,6 +704,7 @@ class TritonBackend(BackendBase):
                 block_indptr,
             )
 
+        summary = dict(self._host_block_summary(direction))
         self._logger.debug(
             "Triton %s dir=%s rows=%d cols=%d nnz=%d stored_blocks=%d alias_blocks=%d empty_blocks=%d indices_bytes=%d indptr_bytes=%d",
             bucket,
@@ -637,11 +712,11 @@ class TritonBackend(BackendBase):
             total_rows,
             total_cols,
             total_nnz,
-            stored_blocks,
-            alias_blocks,
-            empty_blocks,
-            indices_bytes,
-            indptr_bytes,
+            int(summary["stored_blocks"]),
+            int(summary["alias_blocks"]),
+            int(summary["empty_blocks"]),
+            int(summary["indices_bytes"]),
+            int(summary["indptr_bytes"]),
         )
         if self._slot_pool is not None:
             slot_indices = int(sum(_torch_nbytes(slot.indices) for slot in self._slot_pool.slots))
@@ -757,6 +832,8 @@ class TritonBackend(BackendBase):
             int(device.major),
             int(device.minor),
             str(self._torch_dtype),
+            self._slot_indices_dtype.name,
+            self._slot_indptr_dtype.name,
             direction.value,
             plan.fmt.value,
             plan.scratch,
@@ -1299,6 +1376,8 @@ class TritonBackend(BackendBase):
             raise ValueError(f"Triton backend supports only float32/float64, got {setup.dtype}")
 
         H = len(self._level_offsets) - 1
+        prev_rss_bytes = rss_checkpoint(self._logger, "setup:start", None)
+        self._slot_indices_dtype, self._slot_indptr_dtype = self._scan_slot_struct_dtypes()
         self._host_blocks_up = [[] for _ in range(H)]
         self._host_blocks_down = [[] for _ in range(H)]
         self._ops_up = [[] for _ in range(H)]
@@ -1307,8 +1386,20 @@ class TritonBackend(BackendBase):
         with self._caller_root_scope():
             if self._plan_up is not None:
                 self._host_blocks_up = self._build_direction_host_blocks(Direction.UP)
+                prev_rss_bytes = rss_checkpoint(
+                    self._logger,
+                    "setup:host_blocks_up_ready",
+                    prev_rss_bytes,
+                    extras=self._host_block_summary(Direction.UP),
+                )
             if self._plan_down is not None:
                 self._host_blocks_down = self._build_direction_host_blocks(Direction.DOWN)
+                prev_rss_bytes = rss_checkpoint(
+                    self._logger,
+                    "setup:host_blocks_down_ready",
+                    prev_rss_bytes,
+                    extras=self._host_block_summary(Direction.DOWN),
+                )
             with torch.cuda.stream(self._root_stream):
                 self._slot_pool = self._alloc_slot_pool()
                 mut_rows, mut_cols = _selector_index_arrays(self._sel_mut)
@@ -1367,6 +1458,7 @@ class TritonBackend(BackendBase):
         self._sync_retained_root()
         self._bump_retained_epoch()
         self._assert_setup_memory_contract()
+        rss_checkpoint(self._logger, "setup:complete", prev_rss_bytes)
 
     def _run_direction(
         self,

@@ -9,6 +9,7 @@ import scipy.sparse as sp
 import pytest
 
 from pygrgl_spmv.backends import BackendBase, BackendSetup, CallCapture, ReferenceBackend, ReferencePlanPair
+from pygrgl_spmv.backends.base import _copy_struct_checked
 from pygrgl_spmv.backends.types import InitMode
 from pygrgl_spmv.memory import alloc_field, capture_snapshot, child_field
 
@@ -186,6 +187,25 @@ def test_call_capture_rejects_reserved_semantic_meta_keys():
             direction="up",
             runtime_k=1,
             meta={"active_alloc_keys": frozenset()},
+        )
+
+
+def test_copy_struct_checked_allows_safe_widen_and_safe_narrow():
+    values32 = np.array([0, 1], dtype=np.int32)
+    exact = np.empty(2, dtype=np.int32)
+    _copy_struct_checked(exact, values32, label="values")
+    np.testing.assert_array_equal(exact, values32)
+    widened = np.empty(2, dtype=np.int64)
+    _copy_struct_checked(widened, values32, label="values")
+    np.testing.assert_array_equal(widened, values32)
+    narrowed = np.empty(2, dtype=np.int32)
+    _copy_struct_checked(narrowed, np.array([0, 1], dtype=np.int64), label="values")
+    np.testing.assert_array_equal(narrowed, values32)
+    with pytest.raises(ValueError, match="exceeds"):
+        _copy_struct_checked(
+            np.empty(1, dtype=np.int32),
+            np.array([np.iinfo(np.int32).max + 1], dtype=np.int64),
+            label="values",
         )
 
 

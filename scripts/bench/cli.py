@@ -11,7 +11,6 @@ import numpy as np
 from scripts.bench.configs import PlanPairSpec, parse_plan_pair_literal
 
 DTYPE = np.float64
-INDEX_DTYPE = np.int32
 DEFAULT_MATMUL_OPTIONS = (
     "baseline",
     "by_individual",
@@ -39,7 +38,6 @@ class CommonBenchArgs:
     n_trials: int
     n_warmup: int
     dtype: np.dtype
-    index_dtype: np.dtype
     output_atol: float
     output_rtol: float
     log_level: str
@@ -86,13 +84,6 @@ def add_common_bench_args(parser: argparse.ArgumentParser) -> None:
         help="Input/output floating dtype",
     )
     parser.add_argument(
-        "--index-dtype",
-        type=str,
-        default=np.dtype(INDEX_DTYPE).name,
-        choices=["int32", "int64"],
-        help="Index dtype used by SpmvGRG",
-    )
-    parser.add_argument(
         "--matmul-options",
         type=str,
         default="all",
@@ -126,15 +117,6 @@ def parse_dtype(raw: str) -> np.dtype:
     raise ValueError(f"--dtype must be one of float32,float64; got {raw!r}")
 
 
-def parse_index_dtype(raw: str) -> np.dtype:
-    token = str(raw).strip().lower()
-    if token == "int32":
-        return np.dtype(np.int32)
-    if token == "int64":
-        return np.dtype(np.int64)
-    raise ValueError(f"--index-dtype must be one of int32,int64; got {raw!r}")
-
-
 def tolerances_for_dtype(dtype: np.dtype) -> tuple[float, float]:
     dt = np.dtype(dtype)
     if dt == np.float32:
@@ -164,7 +146,6 @@ def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
         raise ValueError("--ring-buffer-size must be >= 1")
     options = parse_matmul_options(args.matmul_options)
     dtype = parse_dtype(args.dtype)
-    index_dtype = parse_index_dtype(args.index_dtype)
     output_atol, output_rtol = tolerances_for_dtype(dtype)
     return CommonBenchArgs(
         grg=str(args.grg),
@@ -175,7 +156,6 @@ def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
         n_trials=int(args.trials),
         n_warmup=int(args.warmup),
         dtype=dtype,
-        index_dtype=index_dtype,
         output_atol=output_atol,
         output_rtol=output_rtol,
         log_level=str(args.log_level),
@@ -205,7 +185,6 @@ __all__ = [
     "DEFAULT_GRG_PATH",
     "DEFAULT_MATMUL_OPTIONS",
     "DTYPE",
-    "INDEX_DTYPE",
     "LOG_LEVEL_CHOICES",
     "OUTPUT_ATOL",
     "OUTPUT_ATOL_FLOAT32",
@@ -216,7 +195,6 @@ __all__ = [
     "parse_common_bench_args",
     "parse_csv_ints",
     "parse_dtype",
-    "parse_index_dtype",
     "parse_matmul_options",
     "progress",
     "tolerances_for_dtype",
