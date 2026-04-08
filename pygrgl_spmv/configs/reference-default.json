@@ -1,0 +1,16 @@
+{
+  "backend": "reference",
+  "reference": {
+    "log_level": "WARNING",
+    "up": {
+      "store": "N",
+      "fmt": "CSR",
+      "k_hint": null
+    },
+    "down": {
+      "store": "T",
+      "fmt": "CSC",
+      "k_hint": null
+    }
+  }
+}

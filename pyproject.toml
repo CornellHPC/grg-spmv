@@ -47,6 +47,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["pygrgl_spmv"]
+include = [
+    "pygrgl_spmv/configs/*.json",
+]
 exclude = [
     "pygrgl_spmv/tests/**",
     "pygrgl_spmv/**/__pycache__/**",

@@ -1,0 +1,21 @@
+{
+  "backend": "triton",
+  "triton": {
+    "device": 0,
+    "stream": 0,
+    "ring_buffer_size": 2,
+    "log_level": "WARNING",
+    "up": {
+      "k_hint": 1,
+      "store": "N",
+      "fmt": "CSR",
+      "scratch": "none"
+    },
+    "down": {
+      "k_hint": 1,
+      "store": "T",
+      "fmt": "CSC",
+      "scratch": "none"
+    }
+  }
+}

@@ -15,67 +15,106 @@ pip install "pygrgl-spmv[gpu]"
 pip install "pygrgl-spmv[dev]"
 ```
 
-## Quick usage
+## Quick start with `load()`
+
+`load()` is the explicit-config convenience API. It does not probe for a default
+backend. You must point `PYGRGL_SPMV_CONFIG` at a JSON file.
+
+```python
+import os
+from importlib.resources import as_file, files
+
+import numpy as np
+
+from pygrgl_spmv import load
+
+cfg = files("pygrgl_spmv.configs").joinpath("reference-default.json")
+with as_file(cfg) as cfg_path:
+    os.environ["PYGRGL_SPMV_CONFIG"] = str(cfg_path)
+    op = load(
+        "/path/to/file.grg",
+        np.float64,
+        artifact_dir="pygrgl_spmv_artifacts",
+    )
+```
+
+Bundled sample configs:
+
+- `reference-default.json`: base-install CPU reference backend
+- `mkl-default.json`: MKL backend, requires `libmkl_rt.so`
+- `cusparse-default.json`: cuSPARSE backend, requires CuPy + CUDA
+- `triton-default.json`: Triton backend, requires Torch + Triton + CUDA
+
+The JSON schema is strict:
+
+- `backend` must be one of `reference`, `mkl`, `cusparse`, or `triton`
+- the selected backend section must be present
+- each `up` / `down` entry must be either `null` or a full backend plan dict
+- all fields must be written explicitly; `load()` does not fill in omitted plan fields
+
+One-sided example:
+
+```json
+{
+  "backend": "reference",
+  "reference": {
+    "log_level": "WARNING",
+    "up": {
+      "store": "N",
+      "fmt": "CSR",
+      "k_hint": null
+    },
+    "down": null
+  }
+}
+```
+
+Successful backend selection is logged at INFO level on the `pygrgl_spmv` logger.
+
+## Manual backend construction
+
+If you want to construct backends directly, `SpmvGRG` still accepts an explicit
+backend instance.
 
 ```python
 import numpy as np
+
 from pygrgl_spmv import SpmvGRG
 from pygrgl_spmv.backends.mkl import MklBackend, MklPlanPair
 
-pair = MklPlanPair.from_dicts(
-    {"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1},
-    {"k_hint": None, "store": "T", "fmt": "CSC", "n_threads": 1},
+backend = MklBackend(
+    pair=MklPlanPair.from_dicts(
+        {"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1},
+        {"k_hint": None, "store": "T", "fmt": "CSC", "n_threads": 1},
+    ),
+    log_level="WARNING",
 )
-backend = MklBackend(pair=pair, instrumentation=False, log_level="WARNING")
 
-op = SpmvGRG(
-    "/path/to/file.grg",
-    backend,
-    np.float64,
-    artifact_dir="pygrgl_spmv_artifacts",
-)
+op = SpmvGRG("/path/to/file.grg", backend, np.float64, artifact_dir="pygrgl_spmv_artifacts")
 ```
 
 Set either side of the plan pair to `None` to build a one-sided operator.
 
-GPU backends (`CusparseBackend`, `TritonBackend`) additionally require
-mandatory `device=`, `stream=`, and `ring_buffer_size=` constructor arguments.
+GPU backends (`CusparseBackend`, `TritonBackend`) require explicit
+`device=`, `stream=`, and `ring_buffer_size=` constructor arguments.
 
-- `device` is a visible CUDA ordinal such as `0`
-- `stream` is either a raw `cudaStream_t` handle such as `0`, or a CUDA Stream
-  Protocol object such as `cupy.cuda.Stream.null`
-- `ring_buffer_size` is the number of streamed sparse-structure slots kept on
-  device and reused in round-robin order
+## `convert()`
 
-For cuSPARSE, graph and dynamic execution now use the same slot-backed sparse
-path. Sparse structure and SpMM external buffers are both bounded by
-`ring_buffer_size`; see the cuSPARSE backend docs for details.
+`convert()` compiles a `.grg` or loaded `pygrgl.ImmutableGRG` into a
+`CompiledOperatorState`, optionally saving a `.grg_spmv` artifact.
 
-`stream=0` means the null stream on the declared `device`. Non-null external
-streams must belong to that same device.
+```python
+from pygrgl_spmv import convert
 
-Backend `log_level` controls backend verbosity. `SpmvGRG` itself has no
-`log_level=` parameter and follows normal Python logger inheritance. Cache-miss
-`.grg` builds and GPU backend `setup()` can emit INFO-level RSS checkpoints
-through the normal logging path when the relevant logger level reaches `INFO`.
-The GPU `setup:host_blocks_*_ready` lines include compact host-block counts and
-byte totals.
-Set `instrumentation=True` when you want profiling/observability behavior that
-may reduce absolute performance.
+state = convert("/path/to/file.grg")
+saved = convert("/path/to/file.grg", output_dir="artifacts")
+```
 
 ## Artifact behavior
 
-- `SpmvGRG` stores/loads standalone `.grg_spmv` artifacts under `artifact_dir` when you construct from a `.grg`
-- default artifact root: `./pygrgl_spmv_artifacts`
-- derived artifact paths encode the full GRG path to avoid collisions between GRGs with the same filename in different directories
-- you can also construct `SpmvGRG` directly from a `.grg_spmv` file without the original `.grg`
-- compile uses scratch structural dtypes internally, then finalizes each stored structural array independently to `int32` or `int64`
-- zero-length structural arrays are canonicalized to `int32`
-- `.grg_spmv` load preserves those stored structural dtypes and logs them at INFO level
-- compile RSS checkpoints separate mutation-row materialization from post-selector retained state
-- binary sparse structure is stored as bool-backed CSR on the host to reduce RAM
-- non-empty `A_blocks` reuse one shared read-only zero-stride bool payload
-- selectors remain ordinary bool-backed CSR matrices
+- `.grg` input builds or reuses a cached `.grg_spmv` artifact under `artifact_dir`
+- `.grg_spmv` input loads the artifact directly
+- loaded `ImmutableGRG` input compiles in memory and leaves `artifact_path` unset
 
 ## Documentation
 
@@ -84,28 +123,20 @@ may reduce absolute performance.
 - [Benchmark Script Docs](scripts/README.md)
 - [Test Suite Docs](pygrgl_spmv/tests/README.md)
 
-## Package layout
-
-- `pygrgl_spmv/grg/`: operator construction, artifact I/O, and GRG compilation
-- `pygrgl_spmv/backends/`: backend implementations and backend-specific plan types
-- `pygrgl_spmv/memory.py`: additive live-memory ledger
-- `scripts/bench/`: benchmark runner, reporting, and CLI helpers
-
 ## Benchmarks
 
-Benchmark scripts:
+Benchmark entrypoints:
 
 - `python -m scripts.bench.mkl`
 - `python -m scripts.bench.cusparse`
 - `python -m scripts.bench.triton`
 
-See `scripts/README.md` for the explicit `--plan-up-down` syntax, wildcard
-expansion, search commands, and the shared `--instrumentation` flag.
+See `scripts/README.md` for explicit plan syntax, wildcard expansion, and benchmark-only flags.
 
 ## Tests
 
-See `pygrgl_spmv/tests/README.md` for test layout, marker policy, CLI options, and recommended commands.
+Recommended command:
 
-## Memory ledger
-
-See `pygrgl_spmv/backends/README.md` for the additive live-memory ledger, snapshot timing, and benchmark memory-table taxonomy.
+```bash
+uv run pytest -q pygrgl_spmv/tests --backend all
+```

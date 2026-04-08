@@ -1,0 +1,31 @@
+{
+  "backend": "cusparse",
+  "cusparse": {
+    "device": 0,
+    "stream": 0,
+    "ring_buffer_size": 2,
+    "log_level": "WARNING",
+    "up": {
+      "k_hint": null,
+      "store": "N",
+      "fmt": "CSR",
+      "opA": "N",
+      "opB": "N",
+      "orderB": "ROW",
+      "orderC": "ROW",
+      "algo": "DEFAULT",
+      "scratch": "none"
+    },
+    "down": {
+      "k_hint": null,
+      "store": "T",
+      "fmt": "CSC",
+      "opA": "N",
+      "opB": "N",
+      "orderB": "ROW",
+      "orderC": "ROW",
+      "algo": "DEFAULT",
+      "scratch": "none"
+    }
+  }
+}
