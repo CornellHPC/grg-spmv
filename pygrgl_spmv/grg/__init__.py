@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -70,12 +71,38 @@ def _decode_allele(data: np.ndarray, offsets: np.ndarray, idx: int) -> str:
     )
 
 
+def _build_init_biases(compiled: CompiledOperatorState, dtype: np.dtype) -> None:
+    helper = ReferenceBackend(
+        pair=ReferencePlanPair(
+            plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
+            plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
+        ),
+        log_level="WARNING",
+    )
+    helper.setup(compiled.to_backend_setup(dtype))
+    zeros_up = np.zeros((compiled.num_samples, 1), dtype=dtype)
+    zeros_down = np.zeros((compiled.num_mutations, 1), dtype=dtype)
+    init_vec = np.ones(1, dtype=dtype)
+
+    up_bias, _ = helper.run_up(zeros_up, init_mode=InitMode.VECTOR, init=init_vec, need_miss_output=False)
+    down_bias = helper.run_down(zeros_down, init_mode=InitMode.VECTOR, init=init_vec, miss=None)
+    compiled.init_vector_up_bias = np.asarray(up_bias[:, 0], dtype=dtype).reshape(compiled.num_mutations)
+    compiled.init_vector_down_bias = np.asarray(down_bias[:, 0], dtype=dtype).reshape(compiled.num_samples)
+    compiled.init_xtx_up_bias = None
+    compiled.init_xtx_down_bias = None
+    if compiled.coalescence_counts is not None:
+        up_xtx, _ = helper.run_up(zeros_up, init_mode=InitMode.XTX, init=None, need_miss_output=False)
+        down_xtx = helper.run_down(zeros_down, init_mode=InitMode.XTX, init=None, miss=None)
+        compiled.init_xtx_up_bias = np.asarray(up_xtx[:, 0], dtype=dtype).reshape(compiled.num_mutations)
+        compiled.init_xtx_down_bias = np.asarray(down_xtx[:, 0], dtype=dtype).reshape(compiled.num_samples)
+
+
 class SpmvGRG:
     """Matmul-focused GRG operator for genotype matrix G (num_samples x num_mutations)."""
 
     def __init__(
         self,
-        path,
+        source,
         backend: BackendBase,
         dtype,
         *,
@@ -87,18 +114,34 @@ class SpmvGRG:
             raise TypeError(f"SpmvGRG backend must be a BackendBase instance, got {type(backend).__name__}")
         self._backend = backend
 
-        source_path = Path(path)
-        self._artifact_path: Path
-        if source_path.suffix == ".grg":
-            artifact_root = Path(artifact_dir).expanduser()
-            self._artifact_path = artifact_path_for_grg(source_path, artifact_root)
-            self._artifact_path.parent.mkdir(parents=True, exist_ok=True)
-            self._compiled = self._load_or_build_from_grg(source_path=source_path, artifact_path=self._artifact_path)
-        elif source_path.suffix == ".grg_spmv":
-            self._artifact_path = source_path
-            self._compiled = load_grg_spmv(self._artifact_path, self._dtype)
+        self._artifact_path: Path | None
+        if isinstance(source, (str, os.PathLike)):
+            source_path = Path(os.fspath(source))
+            if source_path.suffix == ".grg":
+                artifact_root = Path(artifact_dir).expanduser()
+                artifact_path = artifact_path_for_grg(source_path, artifact_root)
+                self._artifact_path = artifact_path
+                if artifact_path.exists():
+                    self._logger.info("Loading SpmvGRG artifact from %s", artifact_path)
+                    try:
+                        self._compiled = load_grg_spmv(artifact_path, self._dtype)
+                    except (KeyError, ValueError) as exc:
+                        self._logger.warning(
+                            "SpmvGRG artifact at %s is invalid (%s); rebuilding from %s",
+                            artifact_path, exc, source_path,
+                        )
+                        self._compiled = convert(source_path, artifact_path.parent, dtype=self._dtype, name=artifact_path.stem)
+                else:
+                    self._logger.info("Building SpmvGRG from %s", source_path)
+                    self._compiled = convert(source_path, artifact_path.parent, dtype=self._dtype, name=artifact_path.stem)
+            elif source_path.suffix == ".grg_spmv":
+                self._artifact_path = source_path
+                self._compiled = load_grg_spmv(source_path, self._dtype)
+            else:
+                raise ValueError(f"Unsupported SpmvGRG input path {source_path}; expected .grg or .grg_spmv")
         else:
-            raise ValueError(f"Unsupported SpmvGRG input path {source_path}; expected .grg or .grg_spmv")
+            self._artifact_path = None
+            self._compiled = convert(source, dtype=self._dtype)
 
         self.memory = MemoryLedger()
         self._backend.setup(self._compiled.to_backend_setup(self._dtype))
@@ -106,60 +149,6 @@ class SpmvGRG:
         self._retained_mem = self._build_retained_mem()
         self._seen_retained_epoch = -1
         self._refresh_retained_snapshot(force=True)
-
-    def _load_or_build_from_grg(self, *, source_path: Path, artifact_path: Path) -> CompiledOperatorState:
-        if artifact_path.exists():
-            self._logger.info("Loading SpmvGRG artifact from %s", artifact_path)
-            try:
-                return load_grg_spmv(artifact_path, self._dtype)
-            except (KeyError, ValueError) as exc:
-                self._logger.warning(
-                    "SpmvGRG artifact at %s is invalid (%s); rebuilding from %s",
-                    artifact_path,
-                    exc,
-                    source_path,
-                )
-        else:
-            self._logger.info("Building SpmvGRG from %s", source_path)
-        return self._build_and_save_artifact(source_path=source_path, artifact_path=artifact_path)
-
-    def _build_and_save_artifact(self, *, source_path: Path, artifact_path: Path) -> CompiledOperatorState:
-        grg = pygrgl.load_immutable_grg(str(source_path), load_up_edges=False)
-        prev_rss_bytes = rss_checkpoint(_COMPILE_LOGGER, "artifact:grg_loaded", None)
-        compiled = compile_grg(grg)
-        prev_rss_bytes = rss_checkpoint(_COMPILE_LOGGER, "artifact:compiled", prev_rss_bytes)
-        del grg
-        prev_rss_bytes = rss_checkpoint(_COMPILE_LOGGER, "artifact:grg_dropped", prev_rss_bytes)
-        self._build_init_biases(compiled)
-        prev_rss_bytes = rss_checkpoint(_COMPILE_LOGGER, "artifact:init_biases", prev_rss_bytes)
-        save_grg_spmv(compiled, artifact_path)
-        rss_checkpoint(_COMPILE_LOGGER, "artifact:saved", prev_rss_bytes)
-        return compiled
-
-    def _build_init_biases(self, compiled: CompiledOperatorState) -> None:
-        helper = ReferenceBackend(
-            pair=ReferencePlanPair(
-                plan_up=ReferenceBackend.plan(fmt="CSR", store="N", k_hint=None),
-                plan_down=ReferenceBackend.plan(fmt="CSC", store="T", k_hint=None),
-            ),
-            log_level="WARNING",
-        )
-        helper.setup(compiled.to_backend_setup(self._dtype))
-        zeros_up = np.zeros((compiled.num_samples, 1), dtype=self._dtype)
-        zeros_down = np.zeros((compiled.num_mutations, 1), dtype=self._dtype)
-        init_vec = np.ones(1, dtype=self._dtype)
-
-        up_bias, _ = helper.run_up(zeros_up, init_mode=InitMode.VECTOR, init=init_vec, need_miss_output=False)
-        down_bias = helper.run_down(zeros_down, init_mode=InitMode.VECTOR, init=init_vec, miss=None)
-        compiled.init_vector_up_bias = np.asarray(up_bias[:, 0], dtype=self._dtype).reshape(compiled.num_mutations)
-        compiled.init_vector_down_bias = np.asarray(down_bias[:, 0], dtype=self._dtype).reshape(compiled.num_samples)
-        compiled.init_xtx_up_bias = None
-        compiled.init_xtx_down_bias = None
-        if compiled.coalescence_counts is not None:
-            up_xtx, _ = helper.run_up(zeros_up, init_mode=InitMode.XTX, init=None, need_miss_output=False)
-            down_xtx = helper.run_down(zeros_down, init_mode=InitMode.XTX, init=None, miss=None)
-            compiled.init_xtx_up_bias = np.asarray(up_xtx[:, 0], dtype=self._dtype).reshape(compiled.num_mutations)
-            compiled.init_xtx_down_bias = np.asarray(down_xtx[:, 0], dtype=self._dtype).reshape(compiled.num_samples)
 
     def _build_retained_mem(self) -> OperatorRetainedMem:
         return OperatorRetainedMem(
@@ -213,7 +202,7 @@ class SpmvGRG:
         return (self.num_samples, self.num_mutations)
 
     @property
-    def artifact_path(self) -> Path:
+    def artifact_path(self) -> Path | None:
         return self._artifact_path
 
     @property
@@ -580,4 +569,60 @@ class SpmvGRG:
             return output
 
 
-__all__ = ["SpmvGRG"]
+def convert(
+    source: str | os.PathLike[str] | pygrgl.ImmutableGRG,
+    output_dir: str | os.PathLike[str] | None = None,
+    *,
+    dtype=np.float64,
+    name: str | None = None,
+) -> CompiledOperatorState:
+    """Compile a GRG into a CompiledOperatorState, optionally saving to disk.
+
+    Args:
+        source: Path to a .grg file, any os.PathLike .grg source, or a loaded
+            ImmutableGRG object.
+        output_dir: Directory in which to save the .grg_spmv artifact. If None,
+            the result is returned in-memory only (no file written).
+        dtype: Dtype used for init bias computation. Default: float64.
+        name: Output filename stem. Required when source is an ImmutableGRG
+            object and output_dir is given; derived from the path stem otherwise.
+
+    Returns:
+        The compiled operator state (init biases included).
+    """
+    dtype = np.dtype(dtype)
+
+    if isinstance(source, (str, os.PathLike)):
+        source_path = Path(os.fspath(source))
+        if source_path.suffix != ".grg":
+            raise ValueError(f"Expected a .grg file, got {source_path}")
+        stem = source_path.stem if name is None else name
+        grg = pygrgl.load_immutable_grg(str(source_path), load_up_edges=False)
+        prev_rss = rss_checkpoint(_COMPILE_LOGGER, "artifact:grg_loaded", None)
+        own_grg = True
+    else:
+        if output_dir is not None and name is None:
+            raise ValueError("name is required when source is an ImmutableGRG object and output_dir is given")
+        stem = name
+        grg = source
+        own_grg = False
+        prev_rss = None
+
+    compiled = compile_grg(grg)
+    prev_rss = rss_checkpoint(_COMPILE_LOGGER, "artifact:compiled", prev_rss)
+    if own_grg:
+        del grg
+        prev_rss = rss_checkpoint(_COMPILE_LOGGER, "artifact:grg_dropped", prev_rss)
+    _build_init_biases(compiled, dtype)
+    prev_rss = rss_checkpoint(_COMPILE_LOGGER, "artifact:init_biases", prev_rss)
+
+    if output_dir is not None:
+        out = Path(output_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        save_grg_spmv(compiled, out / f"{stem}.grg_spmv")
+        rss_checkpoint(_COMPILE_LOGGER, "artifact:saved", prev_rss)
+
+    return compiled
+
+
+__all__ = ["SpmvGRG", "convert"]

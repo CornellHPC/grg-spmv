@@ -297,10 +297,10 @@ def test_cache_hit_skips_init_bias_rebuild(primary_grg_path, tmp_path, monkeypat
 
     import pygrgl_spmv.grg as grg_module
 
-    def _forbidden_rebuild(self, _state):
+    def _forbidden_rebuild(*_args, **_kwargs):
         raise AssertionError("cache hit should not rebuild init bias cache")
 
-    monkeypatch.setattr(grg_module.SpmvGRG, "_build_init_biases", _forbidden_rebuild)
+    monkeypatch.setattr(grg_module, "_build_init_biases", _forbidden_rebuild)
     second = SpmvGRG(
         dst,
         make_mkl_backend(fmt_up="csr", fmt_down=None, n_threads=1),
