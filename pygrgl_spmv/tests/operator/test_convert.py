@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import os
+from pathlib import Path, PurePath
 
 import numpy as np
 import pygrgl
@@ -12,13 +13,25 @@ from pygrgl_spmv import SpmvGRG, convert
 from pygrgl_spmv.grg.compile import CompiledOperatorState
 from pygrgl_spmv.tests.conftest import (
     DATA_DTYPE,
-    HAS_MKL_RUNTIME,
-    make_mkl_backend,
     matmul_expect_k_hint_warning,
     tol,
 )
 
-MKL_ONLY = pytest.mark.skipif(not HAS_MKL_RUNTIME, reason="MKL runtime unavailable (libmkl_rt.so not found)")
+
+class _PathWrapper(os.PathLike[str]):
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def __fspath__(self) -> str:
+        return self._value
+
+
+def _pure_path(value: str):
+    return PurePath(value)
+
+
+def _wrapped_path(value: str):
+    return _PathWrapper(value)
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +50,18 @@ def test_convert_from_path_in_memory(primary_grg_path, tmp_path):
     state = convert(primary_grg_path)
     assert isinstance(state, CompiledOperatorState)
     assert not any(tmp_path.iterdir()), "In-memory convert should not write any files"
+
+
+@pytest.mark.parametrize(
+    "path_factory",
+    [
+        pytest.param(_pure_path, id="purepath"),
+        pytest.param(_wrapped_path, id="pathlike-wrapper"),
+    ],
+)
+def test_convert_accepts_generic_pathlikes(primary_grg_path, path_factory):
+    state = convert(path_factory(primary_grg_path))
+    assert isinstance(state, CompiledOperatorState)
 
 
 def test_convert_from_grg_object_in_memory(grg_ref, tmp_path):
@@ -95,6 +120,19 @@ def test_spmvgrg_from_grg_path(backend_builder, primary_grg_path, spmv_cache_dir
     assert op.artifact_path is not None
     assert op.artifact_path.exists()
     assert op.artifact_path.suffix == ".grg_spmv"
+
+
+@pytest.mark.parametrize(
+    "path_factory",
+    [
+        pytest.param(_pure_path, id="purepath"),
+        pytest.param(_wrapped_path, id="pathlike-wrapper"),
+    ],
+)
+def test_spmvgrg_accepts_generic_pathlikes(backend_builder, primary_grg_path, spmv_cache_dir, path_factory):
+    op = SpmvGRG(path_factory(primary_grg_path), backend_builder(), DATA_DTYPE, artifact_dir=spmv_cache_dir)
+    assert op.artifact_path is not None
+    assert op.artifact_path.exists()
 
 
 @pytest.mark.smoke

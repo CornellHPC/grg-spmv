@@ -2,16 +2,37 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
+import logging
 import os
-import warnings
 from pathlib import Path
 
 import numpy as np
 
 from pygrgl_spmv.grg import SpmvGRG, convert
 
-_ENV_VAR = "PYGRGL_SPMV_CONFIG"
+_CONFIG_ENV_VAR = "PYGRGL_SPMV_CONFIG"
+_LOGGER = logging.getLogger(__name__)
+_KNOWN_ROOT_KEYS = ("backend", "reference", "mkl", "cusparse", "triton")
+_BACKEND_SPECS = {
+    "reference": {
+        "section_keys": ("log_level", "up", "down"),
+        "plan_keys": ("store", "fmt", "k_hint"),
+    },
+    "mkl": {
+        "section_keys": ("log_level", "up", "down"),
+        "plan_keys": ("store", "fmt", "n_threads", "k_hint"),
+    },
+    "cusparse": {
+        "section_keys": ("device", "stream", "ring_buffer_size", "log_level", "up", "down"),
+        "plan_keys": ("k_hint", "store", "fmt", "opA", "opB", "orderB", "orderC", "algo", "scratch"),
+    },
+    "triton": {
+        "section_keys": ("device", "stream", "ring_buffer_size", "log_level", "up", "down"),
+        "plan_keys": ("k_hint", "store", "fmt", "scratch"),
+    },
+}
 
 
 def load(
@@ -21,46 +42,28 @@ def load(
     artifact_dir: str | Path = "pygrgl_spmv_artifacts",
     shared_slot_pool=None,
 ) -> SpmvGRG:
-    """Load a SpmvGRG using backend configuration from the environment.
+    """Load a SpmvGRG using an explicit backend JSON config.
 
-    Reads ``PYGRGL_SPMV_CONFIG`` (path to a JSON config file) to determine
-    the backend and its plan parameters.  If the env var is not set, a default
-    backend is selected automatically (MKL preferred, cuSPARSE as fallback) and
-    a ``UserWarning`` is emitted.
-
-    The JSON file format is::
-
-        {
-          "backend": "mkl",
-          "mkl": {
-            "n_threads": 0,
-            "log_level": "WARNING",
-            "up":   {"fmt": "csr", "k_hint": null},
-            "down": {"fmt": "csc", "k_hint": null}
-          },
-          "cusparse": {
-            "device": 0, "stream": 0, "ring_buffer_size": 2,
-            "log_level": "WARNING",
-            "up":   {"fmt": "csr", "k_hint": null, "algo": "default", "scratch": "none"},
-            "down": {"fmt": "csc", "k_hint": null, "algo": "default", "scratch": "none"}
-          }
-        }
-
-    Both backend sections may be present; ``"backend"`` selects which is used.
-
-    Args:
-        source: Path to a ``.grg`` or ``.grg_spmv`` file, or a loaded
-            ``pygrgl.ImmutableGRG`` object.
-        dtype: Floating-point dtype for the operator. Default: ``float64``.
-        artifact_dir: Directory for caching compiled ``.grg_spmv`` artifacts.
-        shared_slot_pool: Optional :class:`~pygrgl_spmv.backends.cusparse.SharedSlotPool`
-            pre-allocated via :func:`load_shared_slot_pool`. Only valid with the
-            cuSPARSE backend; raises ``ValueError`` for other backends.
-
-    Returns:
-        A fully initialised :class:`SpmvGRG` instance.
+    ``PYGRGL_SPMV_CONFIG`` must point to a JSON file. Bundled sample configs in
+    ``pygrgl_spmv.configs`` show the exact schema; each backend section mirrors
+    the corresponding backend plan dictionaries and requires all fields
+    explicitly.
     """
-    backend = _backend_from_env(shared_slot_pool=shared_slot_pool)
+    config_path = os.environ.get(_CONFIG_ENV_VAR)
+    if config_path is None or not str(config_path).strip():
+        raise ValueError(
+            f"{_CONFIG_ENV_VAR} must point to a JSON config file. "
+            "Use one of the bundled samples: reference-default.json, "
+            "mkl-default.json, cusparse-default.json, or triton-default.json."
+        )
+    config_path = str(config_path).strip()
+    with open(config_path, encoding="utf-8") as handle:
+        config = json.load(handle)
+    backend_name, section, plan_up, plan_down = _parse_backend_config(config)
+    backend = _build_backend(
+        backend_name, section, plan_up, plan_down, shared_slot_pool=shared_slot_pool
+    )
+    _LOGGER.info("Selected %s backend from %s", backend_name, config_path)
     return SpmvGRG(source, backend, dtype, artifact_dir=artifact_dir)
 
 
@@ -105,10 +108,10 @@ def load_shared_slot_pool(
     """
     from pygrgl_spmv.backends.cusparse import cusparse_shared_slot_pool
 
-    config_path = os.environ.get(_ENV_VAR)
+    config_path = os.environ.get(_CONFIG_ENV_VAR)
     if config_path is None:
         raise RuntimeError(
-            f"{_ENV_VAR} is not set. load_shared_slot_pool requires an explicit "
+            f"{_CONFIG_ENV_VAR} is not set. load_shared_slot_pool requires an explicit "
             "cuSPARSE configuration file."
         )
     with open(config_path) as f:
@@ -116,7 +119,7 @@ def load_shared_slot_pool(
     backend_name = str(config.get("backend", "")).lower()
     if backend_name != "cusparse":
         raise RuntimeError(
-            f"load_shared_slot_pool requires backend='cusparse' in the {_ENV_VAR} "
+            f"load_shared_slot_pool requires backend='cusparse' in the {_CONFIG_ENV_VAR} "
             f"config, got {backend_name!r}."
         )
 
@@ -137,129 +140,156 @@ def load_shared_slot_pool(
 # ---------------------------------------------------------------------------
 
 
-def _backend_from_env(shared_slot_pool=None):
-    config_path = os.environ.get(_ENV_VAR)
-    if config_path is None:
-        warnings.warn(
-            f"{_ENV_VAR} is not set; using default backend configuration. "
-            "Set this env var to a JSON config file to silence this warning.",
-            UserWarning,
-            stacklevel=3,
+def _require_mapping(value: object, *, label: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    return dict(value)
+
+
+def _require_keys(
+    mapping: Mapping[str, object],
+    *,
+    label: str,
+    required_keys: tuple[str, ...],
+    allowed_keys: tuple[str, ...] | None = None,
+) -> None:
+    present = set(mapping)
+    required = set(required_keys)
+    allowed = required if allowed_keys is None else set(allowed_keys)
+    missing = sorted(required - present)
+    if missing:
+        raise ValueError(f"{label} is missing required field(s): {missing}")
+    extra = sorted(present - allowed)
+    if extra:
+        raise ValueError(f"{label} has unknown field(s): {extra}")
+
+
+def _require_optional_plan(
+    value: object,
+    *,
+    label: str,
+    required_keys: tuple[str, ...],
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    plan = _require_mapping(value, label=label)
+    _require_keys(plan, label=label, required_keys=required_keys)
+    return plan
+
+
+def _parse_backend_config(
+    config: object,
+) -> tuple[str, dict[str, object], dict[str, object] | None, dict[str, object] | None]:
+    root = _require_mapping(config, label="config")
+    _require_keys(root, label="config", required_keys=("backend",), allowed_keys=_KNOWN_ROOT_KEYS)
+
+    backend_name = str(root["backend"]).strip().lower()
+    if backend_name not in _BACKEND_SPECS:
+        raise ValueError(
+            f"config backend must be one of {sorted(_BACKEND_SPECS)}, got {root['backend']!r}"
         )
-        return _default_backend(shared_slot_pool=shared_slot_pool)
-    with open(config_path) as f:
-        config = json.load(f)
-    return _backend_from_config(config, shared_slot_pool=shared_slot_pool)
+    if backend_name not in root:
+        raise ValueError(f"config is missing required '{backend_name}' section")
+
+    spec = _BACKEND_SPECS[backend_name]
+    section = _require_mapping(root[backend_name], label=f"{backend_name} config")
+    _require_keys(section, label=f"{backend_name} config", required_keys=spec["section_keys"])
+
+    plan_up = _require_optional_plan(
+        section["up"],
+        label=f"{backend_name}.up",
+        required_keys=spec["plan_keys"],
+    )
+    plan_down = _require_optional_plan(
+        section["down"],
+        label=f"{backend_name}.down",
+        required_keys=spec["plan_keys"],
+    )
+    if plan_up is None and plan_down is None:
+        raise ValueError(f"{backend_name} config must enable at least one of up/down")
+    return backend_name, section, plan_up, plan_down
 
 
-def _default_backend(shared_slot_pool=None):
-    # 1. Try MKL
-    try:
-        from pygrgl_spmv.backends.mkl import MklBackend, MklPlanPair
-        from pygrgl_spmv.backends.mkl import ffi as mkl_ffi
+def _build_backend(
+    backend_name: str,
+    section: dict[str, object],
+    plan_up: dict[str, object] | None,
+    plan_down: dict[str, object] | None,
+    shared_slot_pool=None,
+):
+    match backend_name:
+        case "reference":
+            return _build_reference_backend(section, plan_up, plan_down)
+        case "mkl":
+            return _build_mkl_backend(section, plan_up, plan_down)
+        case "cusparse":
+            return _build_cusparse_backend(section, plan_up, plan_down, shared_slot_pool=shared_slot_pool)
+        case "triton":
+            return _build_triton_backend(section, plan_up, plan_down)
+        case _:
+            raise ValueError(f"Unsupported backend {backend_name!r}")
 
-        mkl_ffi._ensure_loaded()
-        if shared_slot_pool is not None:
-            raise ValueError(
-                "shared_slot_pool requires the cuSPARSE backend; "
-                "the default selected backend is MKL."
-            )
-        plan_up = {"store": "N", "fmt": "CSR", "k_hint": None, "n_threads": 0}
-        plan_down = {"store": "T", "fmt": "CSC", "k_hint": None, "n_threads": 0}
-        warnings.warn("Using default MKL backend configuration.")
-        return MklBackend(pair=MklPlanPair.from_dicts(plan_up, plan_down), log_level="WARNING")
-    except Exception as exc:
-        if shared_slot_pool is not None and "shared_slot_pool" in str(exc):
-            raise
 
-    # 2. Try cuSPARSE
-    try:
-        import cupy  # noqa: F401
+def _build_reference_backend(
+    section: dict[str, object],
+    plan_up: dict[str, object] | None,
+    plan_down: dict[str, object] | None,
+):
+    from pygrgl_spmv.backends import ReferenceBackend, ReferencePlan, ReferencePlanPair
 
-        from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlanPair
-
-        plan_up = {"k_hint": None, "store": "N", "fmt": "CSR",
-                   "opA": "N", "opB": "N", "orderB": "ROW", "orderC": "ROW",
-                   "algo": "DEFAULT", "scratch": "none"}
-        plan_down = {"k_hint": None, "store": "T", "fmt": "CSC",
-                     "opA": "N", "opB": "N", "orderB": "ROW", "orderC": "ROW",
-                     "algo": "DEFAULT", "scratch": "none"}
-        warnings.warn("Using default cuSPARSE backend configuration.")
-        return CusparseBackend(
-            device=0, stream=0,
-            pair=CusparsePlanPair.from_dicts(plan_up, plan_down),
-            ring_buffer_size=2, log_level="WARNING",
-            shared_slot_pool=shared_slot_pool,
-        )
-    except Exception:
-        pass
-
-    raise RuntimeError(
-        "No backend is available. Install MKL (libmkl_rt.so) or cuSPARSE (cupy) "
-        f"and set {_ENV_VAR} to a JSON config file."
+    return ReferenceBackend(
+        pair=ReferencePlanPair(
+            plan_up=None if plan_up is None else ReferencePlan.from_dict(plan_up),
+            plan_down=None if plan_down is None else ReferencePlan.from_dict(plan_down),
+        ),
+        log_level=str(section["log_level"]),
     )
 
 
-def _backend_from_config(config: dict, shared_slot_pool=None):
-    backend_name = str(config.get("backend", "")).lower()
-    if backend_name == "mkl":
-        if shared_slot_pool is not None:
-            raise ValueError(
-                "shared_slot_pool requires the cuSPARSE backend; "
-                f"the configured backend is 'mkl'."
-            )
-        warnings.warn("Using MKL backend configuration from JSON.")
-        return _mkl_backend_from_config(config)
-    if backend_name == "cusparse":
-        warnings.warn("Using cuSPARSE backend configuration from JSON.")
-        return _cusparse_backend_from_config(config, shared_slot_pool=shared_slot_pool)
-    raise ValueError(
-        f"Unknown backend {backend_name!r} in {_ENV_VAR} config; expected 'mkl' or 'cusparse'."
-    )
-
-
-def _mkl_backend_from_config(config: dict):
+def _build_mkl_backend(
+    section: dict[str, object],
+    plan_up: dict[str, object] | None,
+    plan_down: dict[str, object] | None,
+):
     from pygrgl_spmv.backends.mkl import MklBackend, MklPlanPair
 
-    c = config.get("mkl", {})
-    up = c.get("up", {})
-    down = c.get("down", {})
-    n_threads = c.get("n_threads", 0)
-    log_level = c.get("log_level", "WARNING")
-    plan_up = {"store": "N", "fmt": str(up.get("fmt", "csr")).upper(),
-               "k_hint": up.get("k_hint"), "n_threads": n_threads}
-    plan_down = {"store": "T", "fmt": str(down.get("fmt", "csc")).upper(),
-                 "k_hint": down.get("k_hint"), "n_threads": n_threads}
-    return MklBackend(pair=MklPlanPair.from_dicts(plan_up, plan_down), log_level=log_level)
+    return MklBackend(
+        pair=MklPlanPair.from_dicts(plan_up, plan_down),
+        log_level=str(section["log_level"]),
+    )
 
 
-def _cusparse_backend_from_config(config: dict, shared_slot_pool=None):
+def _build_cusparse_backend(
+    section: dict[str, object],
+    plan_up: dict[str, object] | None,
+    plan_down: dict[str, object] | None,
+    shared_slot_pool=None,
+):
     from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlanPair
 
-    c = config.get("cusparse", {})
-    up = c.get("up", {})
-    down = c.get("down", {})
-    plan_up = {
-        "k_hint": up.get("k_hint"), "store": "N",
-        "fmt": str(up.get("fmt", "csr")).upper(),
-        "opA": "N", "opB": "N", "orderB": "ROW", "orderC": "ROW",
-        "algo": str(up.get("algo", "default")).upper(),
-        "scratch": up.get("scratch", "none"),
-    }
-    plan_down = {
-        "k_hint": down.get("k_hint"), "store": "T",
-        "fmt": str(down.get("fmt", "csc")).upper(),
-        "opA": "N", "opB": "N", "orderB": "ROW", "orderC": "ROW",
-        "algo": str(down.get("algo", "default")).upper(),
-        "scratch": down.get("scratch", "none"),
-    }
     return CusparseBackend(
-        device=c.get("device", 0),
-        stream=c.get("stream", 0),
+        device=int(section["device"]),
+        stream=section["stream"],
         pair=CusparsePlanPair.from_dicts(plan_up, plan_down),
-        ring_buffer_size=c.get("ring_buffer_size", 2),
-        log_level=c.get("log_level", "WARNING"),
+        ring_buffer_size=int(section["ring_buffer_size"]),
+        log_level=str(section["log_level"]),
         shared_slot_pool=shared_slot_pool,
+    )
+
+
+def _build_triton_backend(
+    section: dict[str, object],
+    plan_up: dict[str, object] | None,
+    plan_down: dict[str, object] | None,
+):
+    from pygrgl_spmv.backends.triton import TritonBackend, TritonPlanPair
+
+    return TritonBackend(
+        device=int(section["device"]),
+        stream=section["stream"],
+        pair=TritonPlanPair.from_dicts(plan_up, plan_down),
+        ring_buffer_size=int(section["ring_buffer_size"]),
+        log_level=str(section["log_level"]),
     )
 
 

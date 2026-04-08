@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -114,8 +115,8 @@ class SpmvGRG:
         self._backend = backend
 
         self._artifact_path: Path | None
-        if isinstance(source, (str, Path)):
-            source_path = Path(source)
+        if isinstance(source, (str, os.PathLike)):
+            source_path = Path(os.fspath(source))
             if source_path.suffix == ".grg":
                 artifact_root = Path(artifact_dir).expanduser()
                 artifact_path = artifact_path_for_grg(source_path, artifact_root)
@@ -569,8 +570,8 @@ class SpmvGRG:
 
 
 def convert(
-    source: str | Path | pygrgl.ImmutableGRG,
-    output_dir: str | Path | None = None,
+    source: str | os.PathLike[str] | pygrgl.ImmutableGRG,
+    output_dir: str | os.PathLike[str] | None = None,
     *,
     dtype=np.float64,
     name: str | None = None,
@@ -578,7 +579,8 @@ def convert(
     """Compile a GRG into a CompiledOperatorState, optionally saving to disk.
 
     Args:
-        source: Path to a .grg file, or a loaded ImmutableGRG object.
+        source: Path to a .grg file, any os.PathLike .grg source, or a loaded
+            ImmutableGRG object.
         output_dir: Directory in which to save the .grg_spmv artifact. If None,
             the result is returned in-memory only (no file written).
         dtype: Dtype used for init bias computation. Default: float64.
@@ -590,8 +592,8 @@ def convert(
     """
     dtype = np.dtype(dtype)
 
-    if isinstance(source, (str, Path)):
-        source_path = Path(source)
+    if isinstance(source, (str, os.PathLike)):
+        source_path = Path(os.fspath(source))
         if source_path.suffix != ".grg":
             raise ValueError(f"Expected a .grg file, got {source_path}")
         stem = source_path.stem if name is None else name
