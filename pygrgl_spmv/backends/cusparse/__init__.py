@@ -2,7 +2,13 @@
 
 from . import plan as plan
 cusparse_plan = plan
-from .backend import CusparseBackend, is_valid_combo
+from .backend import (
+    CusparseBackend,
+    SharedSlotPool,
+    cusparse_shared_slot_pool,
+    cusparse_slot_pool_requirements,
+    is_valid_combo,
+)
 from .plan import (
     CusparsePlan,
     CusparsePlanPair,
@@ -18,9 +24,12 @@ __all__ = [
     "CusparsePlanPair",
     "DenseOrder",
     "Operation",
+    "SharedSlotPool",
     "SparseFormat",
     "SpMMAlgorithm",
     "cusparse_plan",
+    "cusparse_shared_slot_pool",
+    "cusparse_slot_pool_requirements",
     "plan",
     "is_valid_combo",
 ]

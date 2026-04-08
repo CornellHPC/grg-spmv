@@ -41,7 +41,7 @@ from pygrgl_spmv.backends.cusparse.ffi import (
     cuda_dtype,
 )
 from pygrgl_spmv.memory import VmmAliasedAlloc, alloc_field, child_field, ignore_field
-from pygrgl_spmv.backends.types import Direction, InitMode, SparseFormat, parse_init_mode
+from pygrgl_spmv.backends.types import Direction, InitMode, SparseFormat, StoredMatrix, parse_init_mode
 from . import plan as cusparse_plan
 from .plan import CusparsePlan, CusparsePlanPair, DenseOrder, Operation, SpMMAlgorithm
 
@@ -89,6 +89,120 @@ def is_valid_combo(fmt: str, transpose_bool: bool, algo: str) -> bool:
     return plan.supported
 
 
+def _struct_element_counts(fmt: str, nrows: int, ncols: int, nnz: int) -> tuple[int, int]:
+    """Return (struct0_len, struct1_len) for a sparse block in the given format."""
+    token = str(fmt).strip().lower()
+    if token == "csr":
+        return nrows + 1, nnz
+    if token == "csc":
+        return ncols + 1, nnz
+    if token == "coo":
+        return nnz, nnz
+    raise ValueError(f"unknown sparse format for element counts: {fmt!r}")
+
+
+def _setup_slot_requirements(
+    setup: BackendSetup,
+    *,
+    plan_up: CusparsePlan | None,
+    plan_down: CusparsePlan | None,
+) -> tuple[int, int, np.dtype, np.dtype]:
+    """Compute slot struct sizes and dtypes for a single BackendSetup.
+
+    Returns ``(max_struct0_len, max_struct1_len, struct0_dtype, struct1_dtype)``.
+    """
+    A_blocks = setup.A_blocks
+    H = len(setup.level_offsets) - 1
+
+    # Replicate storage-sharing logic from BackendBase.__init__
+    if plan_up is None:
+        store_blocks_up = False
+        store_blocks_down = True
+    elif plan_down is None:
+        store_blocks_up = True
+        store_blocks_down = False
+    else:
+        share_storage = plan_up.can_share_storage_with(plan_down)
+        store_blocks_up = True
+        store_blocks_down = not share_storage
+
+    max0 = 0
+    max1 = 0
+    struct0_dtype = np.dtype(np.int32)
+    struct1_dtype = np.dtype(np.int32)
+    require_common = False
+
+    for direction, plan, store_actual in (
+        (Direction.UP, plan_up, store_blocks_up),
+        (Direction.DOWN, plan_down, store_blocks_down),
+    ):
+        if plan is None or not store_actual:
+            continue
+        fmt = plan.fmt.value.lower()
+        if plan.fmt == SparseFormat.COO:
+            require_common = True
+        for dst_level, src_level, _row_index in iter_direction_level_pairs(direction, H):
+            base = (
+                A_blocks[dst_level][src_level]
+                if direction == Direction.UP
+                else A_blocks[src_level][dst_level]
+            )
+            if base.nnz == 0:
+                continue
+            if plan.store == StoredMatrix.T:
+                nrows, ncols = int(base.shape[1]), int(base.shape[0])
+            else:
+                nrows, ncols = int(base.shape[0]), int(base.shape[1])
+            nnz = int(base.nnz)
+
+            s0, s1 = _struct_element_counts(fmt, nrows, ncols, nnz)
+            max0 = max(max0, s0)
+            max1 = max(max1, s1)
+
+            d0, d1 = _layout_struct_dtypes(fmt, nrows=nrows, ncols=ncols, nnz=nnz)
+            if d0 == np.dtype(np.int64):
+                struct0_dtype = np.dtype(np.int64)
+            if d1 == np.dtype(np.int64):
+                struct1_dtype = np.dtype(np.int64)
+
+    if require_common and (struct0_dtype == np.dtype(np.int64) or struct1_dtype == np.dtype(np.int64)):
+        struct0_dtype = np.dtype(np.int64)
+        struct1_dtype = np.dtype(np.int64)
+
+    return max0, max1, struct0_dtype, struct1_dtype
+
+
+def cusparse_slot_pool_requirements(
+    setups,
+    *,
+    pair: CusparsePlanPair,
+) -> tuple[int, int, np.dtype, np.dtype]:
+    """Compute max slot buffer sizes and dtypes across multiple backend setups.
+
+    Args:
+        setups: Iterable of :class:`BackendSetup` instances.
+        pair: The :class:`CusparsePlanPair` that all backends will share.
+
+    Returns:
+        ``(max_struct0_len, max_struct1_len, struct0_dtype, struct1_dtype)``
+    """
+    global_max0 = 0
+    global_max1 = 0
+    global_dtype0 = np.dtype(np.int32)
+    global_dtype1 = np.dtype(np.int32)
+    for setup in setups:
+        m0, m1, d0, d1 = _setup_slot_requirements(
+            setup, plan_up=pair.plan_up, plan_down=pair.plan_down,
+        )
+        global_max0 = max(global_max0, m0)
+        global_max1 = max(global_max1, m1)
+        if d0 == np.dtype(np.int64):
+            global_dtype0 = np.dtype(np.int64)
+        if d1 == np.dtype(np.int64):
+            global_dtype1 = np.dtype(np.int64)
+    return global_max0, global_max1, global_dtype0, global_dtype1
+
+
 @dataclass(frozen=True)
 class _CuHostBlock:
     """Pinned host sparse structure.
@@ -118,6 +232,79 @@ class _CuSlotBuffers:
 @dataclass
 class _CuSlotPool:
     slots: list[_CuSlotBuffers] = child_field(default_factory=list)
+
+
+@dataclass
+class SharedSlotPool:
+    """Pre-allocated slot pool shared across multiple CusparseBackend instances.
+
+    Create via :func:`cusparse_shared_slot_pool` and pass to
+    ``CusparseBackend(..., shared_slot_pool=pool)``.
+
+    **Sequential use only.** All backends sharing a pool must execute their
+    matmul operations sequentially (never concurrently). Concurrent access
+    from multiple threads will corrupt the shared slot buffers and cause
+    ``CUDA_ERROR_ILLEGAL_ADDRESS``.  If you need concurrent execution, each
+    concurrent worker must use a separate ``SharedSlotPool`` (or no pool at
+    all, letting each backend allocate its own slots).
+
+    The ``SharedSlotPool`` must outlive all backends that reference it.
+    """
+
+    _pool: _CuSlotPool
+    _struct0_dtype: np.dtype
+    _struct1_dtype: np.dtype
+    _max_struct0_len: int
+    _max_struct1_len: int
+    _ring_buffer_size: int
+
+
+def cusparse_shared_slot_pool(
+    setups,
+    *,
+    pair: CusparsePlanPair,
+    ring_buffer_size: int,
+    device: int = 0,
+) -> SharedSlotPool:
+    """Pre-allocate a shared slot pool sized for all provided backend setups.
+
+    The returned pool is passed to ``CusparseBackend(..., shared_slot_pool=pool)``.
+    All backends sharing this pool must use the same *pair* and *ring_buffer_size*.
+
+    Args:
+        setups: Iterable of :class:`BackendSetup` instances (one per ``.grg_spmv`` file).
+        pair: The :class:`CusparsePlanPair` that all backends will share.
+        ring_buffer_size: Number of reusable sparse-structure slots.
+        device: CUDA device ordinal. Default ``0``.
+
+    Returns:
+        A :class:`SharedSlotPool` ready for injection into backends.
+    """
+    import cupy as cp
+
+    if int(ring_buffer_size) < 1:
+        raise ValueError(f"ring_buffer_size must be >= 1, got {ring_buffer_size}")
+    max0, max1, dtype0, dtype1 = cusparse_slot_pool_requirements(setups, pair=pair)
+    if max0 == 0 and max1 == 0:
+        raise ValueError("No non-empty blocks found across the provided setups")
+    with cp.cuda.Device(parse_cuda_device(device)):
+        pool = _CuSlotPool(
+            slots=[
+                _CuSlotBuffers(
+                    struct0=cp.zeros((max0,), dtype=dtype0),
+                    struct1=cp.zeros((max1,), dtype=dtype1),
+                )
+                for _ in range(int(ring_buffer_size))
+            ]
+        )
+    return SharedSlotPool(
+        _pool=pool,
+        _struct0_dtype=dtype0,
+        _struct1_dtype=dtype1,
+        _max_struct0_len=max0,
+        _max_struct1_len=max1,
+        _ring_buffer_size=int(ring_buffer_size),
+    )
 
 
 @dataclass(frozen=True)
@@ -488,6 +675,7 @@ class CusparseBackend(BackendBase):
         ring_buffer_size: int,
         log_level: str = "WARNING",
         instrumentation: bool = False,
+        shared_slot_pool: SharedSlotPool | None = None,
     ):
         for name, plan in (("UP", pair.plan_up), ("DOWN", pair.plan_down)):
             if plan is not None and not plan.supported:
@@ -504,6 +692,17 @@ class CusparseBackend(BackendBase):
 
         if int(ring_buffer_size) < 1:
             raise ValueError(f"ring_buffer_size must be >= 1, got {ring_buffer_size}")
+
+        if shared_slot_pool is not None:
+            if not isinstance(shared_slot_pool, SharedSlotPool):
+                raise TypeError(
+                    f"shared_slot_pool must be a SharedSlotPool instance, got {type(shared_slot_pool).__name__}"
+                )
+            if int(ring_buffer_size) != shared_slot_pool._ring_buffer_size:
+                raise ValueError(
+                    f"ring_buffer_size={ring_buffer_size} does not match "
+                    f"shared_slot_pool ring_buffer_size={shared_slot_pool._ring_buffer_size}"
+                )
 
         super().__init__(
             plan_up=pair.plan_up,
@@ -556,6 +755,7 @@ class CusparseBackend(BackendBase):
         self._wavefront_up: list[list[_CuWavefrontOp]] = []
         self._wavefront_down: list[list[_CuWavefrontOp]] = []
         self._slot_pool: _CuSlotPool | None = None
+        self._shared_slot_pool = shared_slot_pool
         self._scratch_plan_up: list[_ScratchLevelPlan] = []
         self._scratch_plan_down: list[_ScratchLevelPlan] = []
 
@@ -944,7 +1144,11 @@ class CusparseBackend(BackendBase):
         self._cuda_dtype = cuda_dtype(self._dtype)
         self._H = len(self._level_offsets) - 1
         prev_rss_bytes = rss_checkpoint(self._logger, "setup:start", None)
-        self._slot_struct0_dtype, self._slot_struct1_dtype = self._scan_slot_struct_dtypes()
+        if self._shared_slot_pool is not None:
+            self._slot_struct0_dtype = self._shared_slot_pool._struct0_dtype
+            self._slot_struct1_dtype = self._shared_slot_pool._struct1_dtype
+        else:
+            self._slot_struct0_dtype, self._slot_struct1_dtype = self._scan_slot_struct_dtypes()
         self._host_blocks_up = [[] for _ in range(self._H)]
         self._host_blocks_down = [[] for _ in range(self._H)]
 
@@ -980,7 +1184,17 @@ class CusparseBackend(BackendBase):
                 )
 
             with self._root_stream:
-                self._slot_pool = self._alloc_slot_pool()
+                if self._shared_slot_pool is not None:
+                    needed0, needed1 = self._slot_struct_lengths()
+                    pool = self._shared_slot_pool
+                    if needed0 > pool._max_struct0_len or needed1 > pool._max_struct1_len:
+                        raise ValueError(
+                            f"Shared slot pool too small: need ({needed0}, {needed1}), "
+                            f"have ({pool._max_struct0_len}, {pool._max_struct1_len})"
+                        )
+                    self._slot_pool = pool._pool
+                else:
+                    self._slot_pool = self._alloc_slot_pool()
 
                 self._mut_selector = _SelectorLevels.from_csr(
                     cp=self._cp,
@@ -1824,6 +2038,22 @@ class CusparseBackend(BackendBase):
         copy_stream = self._slot_copy_streams[op.slot]
         slot_buffers = self._slot_pool.slots[op.slot]
         host0, host1 = op.host_block.struct_buffers
+        if int(host0.nbytes) > int(slot_buffers.struct0.nbytes):
+            raise RuntimeError(
+                f"Slot struct0 buffer too small: need {host0.nbytes} bytes "
+                f"({host0.size} × {host0.dtype}), have {slot_buffers.struct0.nbytes} bytes "
+                f"({slot_buffers.struct0.size} × {slot_buffers.struct0.dtype}); "
+                f"block fmt={op.host_block.fmt} nrows={op.host_block.nrows} "
+                f"ncols={op.host_block.ncols} nnz={op.host_block.nnz}"
+            )
+        if int(host1.nbytes) > int(slot_buffers.struct1.nbytes):
+            raise RuntimeError(
+                f"Slot struct1 buffer too small: need {host1.nbytes} bytes "
+                f"({host1.size} × {host1.dtype}), have {slot_buffers.struct1.nbytes} bytes "
+                f"({slot_buffers.struct1.size} × {slot_buffers.struct1.dtype}); "
+                f"block fmt={op.host_block.fmt} nrows={op.host_block.nrows} "
+                f"ncols={op.host_block.ncols} nnz={op.host_block.nnz}"
+            )
         with copy_stream:
             prev_event = self._prev_compute_event(ws, op)
             if prev_event is not None:
