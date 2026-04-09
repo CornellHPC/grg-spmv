@@ -402,6 +402,9 @@ class SpmvGRG:
         init=None,
         miss=None,
     ):
+        
+        import time
+
         if not isinstance(input, np.ndarray):
             raise TypeError(f"matmul() requires input to be a numpy.ndarray, got {type(input).__name__}")
         X_in = input
@@ -410,6 +413,14 @@ class SpmvGRG:
         rows, cols = X_in.shape
         if rows == 0 or cols == 0:
             raise ValueError("matmul() requires non-zero dimensions.")
+
+        _grg_label = (
+            self._artifact_path.name
+            if self._artifact_path is not None
+            else f"<SpmvGRG {self.num_mutations:,}mut>"
+        )
+        print(f"matmul: {_grg_label}  dir={direction}  shape=({rows}, {cols})", flush=True)
+        _t0 = time.perf_counter()
 
         direction_name = self._parse_direction(direction)
         expected_input_cols = self.num_individuals if by_individual and direction_name == Direction.UP else (
@@ -473,6 +484,7 @@ class SpmvGRG:
                         backend_call=self._backend._call_mem,
                         capture=capture,
                     )
+                    print(f"  -> {time.perf_counter() - _t0:.3f}s", flush=True)
                     return output
 
                 miss_output = None
@@ -508,6 +520,7 @@ class SpmvGRG:
                     backend_call=self._backend._call_mem,
                     capture=capture,
                 )
+                print(f"  -> {time.perf_counter() - _t0:.3f}s", flush=True)
                 return output
 
             if emit_all_nodes:
@@ -530,6 +543,7 @@ class SpmvGRG:
                     backend_call=self._backend._call_mem,
                     capture=capture,
                 )
+                print(f"  -> {time.perf_counter() - _t0:.3f}s", flush=True)
                 return output
 
             miss_internal = None
@@ -570,6 +584,7 @@ class SpmvGRG:
                 backend_call=self._backend._call_mem,
                 capture=capture,
             )
+            print(f"  -> {time.perf_counter() - _t0:.3f}s", flush=True)
             return output
 
 
