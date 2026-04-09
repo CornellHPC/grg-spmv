@@ -10,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
+from dataclasses import dataclass
+
 from pygrgl_spmv.grg import SpmvGRG, convert
 
 _CONFIG_ENV_VAR = "PYGRGL_SPMV_CONFIG"
@@ -35,12 +37,29 @@ _BACKEND_SPECS = {
 }
 
 
+@dataclass
+class SharedPools:
+    """Combined slot + dense pre-allocated pools for sharing across chromosomes.
+
+    Created by :func:`load_shared_slot_pool` and passed to :func:`load` via
+    ``shared_pools=``.  Both pools must be used together; the slot pool holds
+    the ring-buffer sparse-structure slots and the dense pool holds the
+    level accumulator buffers and I/O matrices.
+
+    **Sequential use only.** See :class:`~pygrgl_spmv.backends.cusparse.SharedSlotPool`.
+    """
+
+    slot_pool: object  # SharedSlotPool
+    dense_pool: object  # SharedDensePool
+
+
 def load(
     source,
     dtype=np.float64,
     *,
     artifact_dir: str | Path = "pygrgl_spmv_artifacts",
     shared_slot_pool=None,
+    shared_pools=None,
 ) -> SpmvGRG:
     """Load a SpmvGRG using an explicit backend JSON config.
 
@@ -49,6 +68,15 @@ def load(
     the corresponding backend plan dictionaries and requires all fields
     explicitly.
     """
+    if shared_pools is not None and shared_slot_pool is not None:
+        raise ValueError("Pass either shared_pools= or shared_slot_pool=, not both")
+    if shared_pools is not None:
+        _slot_pool = shared_pools.slot_pool
+        _dense_pool = shared_pools.dense_pool
+    else:
+        _slot_pool = shared_slot_pool
+        _dense_pool = None
+
     config_path = os.environ.get(_CONFIG_ENV_VAR)
     if config_path is None or not str(config_path).strip():
         raise ValueError(
@@ -61,7 +89,9 @@ def load(
         config = json.load(handle)
     backend_name, section, plan_up, plan_down = _parse_backend_config(config)
     backend = _build_backend(
-        backend_name, section, plan_up, plan_down, shared_slot_pool=shared_slot_pool
+        backend_name, section, plan_up, plan_down,
+        shared_slot_pool=_slot_pool,
+        shared_dense_pool=_dense_pool,
     )
     _LOGGER.info("Selected %s backend from %s", backend_name, config_path)
     return SpmvGRG(source, backend, dtype, artifact_dir=artifact_dir)
@@ -71,42 +101,51 @@ def load_shared_slot_pool(
     sources,
     dtype=np.float64,
     *,
+    k: int,
     ring_buffer_size=None,
     artifact_dir: str | Path = "pygrgl_spmv_artifacts",
-):
-    """Create a SharedSlotPool sized for multiple sources using the env config.
+) -> "SharedPools":
+    """Create shared slot + dense pools sized for multiple sources using the env config.
 
     Reads ``PYGRGL_SPMV_CONFIG`` to determine the cuSPARSE plan pair, device,
     and default ring buffer size.  Loads each source's compiled operator state,
-    computes the maximum slot buffer dimensions across all sources, and
-    pre-allocates the pool on the GPU.
+    computes the maximum dimensions across all sources, and pre-allocates both
+    the slot pool (sparse-structure ring buffers) and the dense pool (level
+    accumulator buffers + I/O matrices) on the GPU.
 
-    The returned pool is passed to :func:`load` via ``shared_slot_pool=``.
-    All :func:`load` calls that share this pool must use the same backend
-    configuration and the same ``ring_buffer_size``.  The pool must outlive all
-    :class:`SpmvGRG` instances that reference it.
+    The returned :class:`SharedPools` is passed to :func:`load` via
+    ``shared_pools=``.  All :func:`load` calls sharing these pools must use the
+    same backend configuration, ``ring_buffer_size``, ``k``, and ``dtype``.
+    The pools must outlive all :class:`SpmvGRG` instances that reference them.
 
-    **Sequential use only.** Backends sharing a pool must call ``matmul``
+    **Sequential use only.** Backends sharing pools must call ``matmul``
     sequentially — never from concurrent threads.  Concurrent access corrupts
-    the shared slot buffers and causes ``CUDA_ERROR_ILLEGAL_ADDRESS``.  For
-    concurrent workloads, create one pool per concurrent worker.
+    the shared buffers and causes ``CUDA_ERROR_ILLEGAL_ADDRESS``.  For
+    concurrent workloads, create one :class:`SharedPools` per concurrent worker.
 
     Args:
         sources: Iterable of paths to ``.grg`` or ``.grg_spmv`` files, or
             loaded ``pygrgl.ImmutableGRG`` objects.
         dtype: Floating-point dtype. Default: ``float64``.
+        k: Batch size (number of columns) that the dense pool is sized for.
+            All :func:`load` + ``matmul`` calls sharing this pool must use
+            exactly this ``k``.
         ring_buffer_size: Number of reusable sparse-structure slots.
             ``None`` reads the value from the env config (default ``2``).
         artifact_dir: Directory for caching compiled ``.grg_spmv`` artifacts.
 
     Returns:
-        A :class:`~pygrgl_spmv.backends.cusparse.SharedSlotPool` instance.
+        A :class:`SharedPools` instance containing both the slot pool and
+        the dense pool.
 
     Raises:
         RuntimeError: If ``PYGRGL_SPMV_CONFIG`` is not set.
         RuntimeError: If the configured backend is not ``"cusparse"``.
     """
-    from pygrgl_spmv.backends.cusparse import cusparse_shared_slot_pool
+    from pygrgl_spmv.backends.cusparse import (
+        cusparse_shared_slot_pool,
+        cusparse_shared_dense_pool,
+    )
 
     config_path = os.environ.get(_CONFIG_ENV_VAR)
     if config_path is None:
@@ -130,9 +169,13 @@ def load_shared_slot_pool(
     compiled = [_load_compiled_state(s, dtype, artifact_dir) for s in sources]
     setups = [c.to_backend_setup(dtype) for c in compiled]
 
-    return cusparse_shared_slot_pool(
+    slot_pool = cusparse_shared_slot_pool(
         setups, pair=pair, ring_buffer_size=effective_rbs, device=device,
     )
+    dense_pool = cusparse_shared_dense_pool(
+        setups, k=int(k), dtype=dtype, device=device,
+    )
+    return SharedPools(slot_pool=slot_pool, dense_pool=dense_pool)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +259,7 @@ def _build_backend(
     plan_up: dict[str, object] | None,
     plan_down: dict[str, object] | None,
     shared_slot_pool=None,
+    shared_dense_pool=None,
 ):
     match backend_name:
         case "reference":
@@ -223,7 +267,11 @@ def _build_backend(
         case "mkl":
             return _build_mkl_backend(section, plan_up, plan_down)
         case "cusparse":
-            return _build_cusparse_backend(section, plan_up, plan_down, shared_slot_pool=shared_slot_pool)
+            return _build_cusparse_backend(
+                section, plan_up, plan_down,
+                shared_slot_pool=shared_slot_pool,
+                shared_dense_pool=shared_dense_pool,
+            )
         case "triton":
             return _build_triton_backend(section, plan_up, plan_down)
         case _:
@@ -264,6 +312,7 @@ def _build_cusparse_backend(
     plan_up: dict[str, object] | None,
     plan_down: dict[str, object] | None,
     shared_slot_pool=None,
+    shared_dense_pool=None,
 ):
     from pygrgl_spmv.backends.cusparse import CusparseBackend, CusparsePlanPair
 
@@ -274,6 +323,7 @@ def _build_cusparse_backend(
         ring_buffer_size=int(section["ring_buffer_size"]),
         log_level=str(section["log_level"]),
         shared_slot_pool=shared_slot_pool,
+        shared_dense_pool=shared_dense_pool,
     )
 
 
@@ -592,4 +642,4 @@ def print_gpu_memory(
     print(_SEP, file=out)
 
 
-__all__ = ["SpmvGRG", "convert", "load", "load_shared_slot_pool", "print_gpu_memory"]
+__all__ = ["SpmvGRG", "SharedPools", "convert", "load", "load_shared_slot_pool", "print_gpu_memory"]

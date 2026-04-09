@@ -307,6 +307,117 @@ def cusparse_shared_slot_pool(
     )
 
 
+@dataclass
+class SharedDensePool:
+    """Pre-allocated dense state pool shared across multiple CusparseBackend instances.
+
+    Create via :func:`cusparse_shared_dense_pool` and pass to
+    ``CusparseBackend(..., shared_dense_pool=pool)``.
+
+    **Sequential use only.** All backends sharing a pool must execute matmul
+    sequentially (never concurrently). Concurrent access corrupts the shared
+    dense state buffers.
+
+    The pool is tied to a specific ``k`` (batch size). Backends using this pool
+    must only be called with that exact k.
+
+    The pool must outlive all backends that reference it.
+    """
+
+    _level_bufs: list  # list[CupyArray] — max_H buffers, shape (max_level_sizes[h], k)
+    _input_up: object  # CupyArray — shape (max_num_samples, k)
+    _input_down: object  # CupyArray — shape (max_num_mutations, k)
+    _max_level_sizes: list  # list[int] — per-level row maxima across all chromosomes
+    _max_H: int
+    _max_num_samples: int
+    _max_num_mutations: int
+    _k: int
+    _dtype: np.dtype
+
+
+def cusparse_dense_pool_requirements(
+    setups,
+) -> tuple[int, list[int], int, int]:
+    """Compute max dense state dimensions across multiple backend setups.
+
+    Args:
+        setups: Iterable of :class:`BackendSetup` instances.
+
+    Returns:
+        ``(max_H, max_level_sizes, max_num_samples, max_num_mutations)``
+    """
+    max_H = 0
+    max_level_sizes: list[int] = []
+    max_num_samples = 0
+    max_num_mutations = 0
+    for setup in setups:
+        H = int(len(setup.level_offsets) - 1)
+        level_sizes = [int(setup.level_offsets[h + 1]) - int(setup.level_offsets[h]) for h in range(H)]
+        if H > max_H:
+            max_H = H
+            # extend max_level_sizes with zeros for new levels
+            max_level_sizes.extend([0] * (H - len(max_level_sizes)))
+        for h, sz in enumerate(level_sizes):
+            max_level_sizes[h] = max(max_level_sizes[h], sz)
+        max_num_samples = max(max_num_samples, int(setup.num_samples))
+        max_num_mutations = max(max_num_mutations, int(setup.num_mutations))
+    return max_H, max_level_sizes, max_num_samples, max_num_mutations
+
+
+def cusparse_shared_dense_pool(
+    setups,
+    *,
+    k: int,
+    dtype: np.dtype,
+    device: int = 0,
+) -> SharedDensePool:
+    """Pre-allocate a shared dense state pool sized for all provided backend setups.
+
+    The returned pool is passed to ``CusparseBackend(..., shared_dense_pool=pool)``.
+    All backends sharing this pool must use the same ``k`` and ``dtype``.
+
+    The pool holds one set of dense state buffers (level accumulators + I/O buffers)
+    sized to the maximum across all provided setups, allowing sequential reuse across
+    chromosomes without per-chromosome allocation.
+
+    **Sequential use only.** See :class:`SharedDensePool`.
+
+    Args:
+        setups: Iterable of :class:`BackendSetup` instances (one per ``.grg_spmv`` file).
+        k: Batch size (number of columns). The pool is sized and locked to this value.
+        dtype: Floating-point dtype for all buffers.
+        device: CUDA device ordinal. Default ``0``.
+
+    Returns:
+        A :class:`SharedDensePool` ready for injection into backends.
+    """
+    import cupy as cp
+
+    dtype = np.dtype(dtype)
+    k = int(k)
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+    setups = list(setups)
+    max_H, max_level_sizes, max_num_samples, max_num_mutations = cusparse_dense_pool_requirements(setups)
+    if max_H == 0:
+        raise ValueError("No levels found across the provided setups")
+    with cp.cuda.Device(parse_cuda_device(device)):
+        level_bufs = [cp.zeros((nrows, k), dtype=dtype, order="C") for nrows in max_level_sizes]
+        input_up = cp.zeros((max_num_samples, k), dtype=dtype, order="C")
+        input_down = cp.zeros((max_num_mutations, k), dtype=dtype, order="C")
+    return SharedDensePool(
+        _level_bufs=level_bufs,
+        _input_up=input_up,
+        _input_down=input_down,
+        _max_level_sizes=max_level_sizes,
+        _max_H=max_H,
+        _max_num_samples=max_num_samples,
+        _max_num_mutations=max_num_mutations,
+        _k=k,
+        _dtype=dtype,
+    )
+
+
 @dataclass(frozen=True)
 class _CuWavefrontOp:
     src_level: int
@@ -676,6 +787,7 @@ class CusparseBackend(BackendBase):
         log_level: str = "WARNING",
         instrumentation: bool = False,
         shared_slot_pool: SharedSlotPool | None = None,
+        shared_dense_pool: SharedDensePool | None = None,
     ):
         for name, plan in (("UP", pair.plan_up), ("DOWN", pair.plan_down)):
             if plan is not None and not plan.supported:
@@ -702,6 +814,12 @@ class CusparseBackend(BackendBase):
                 raise ValueError(
                     f"ring_buffer_size={ring_buffer_size} does not match "
                     f"shared_slot_pool ring_buffer_size={shared_slot_pool._ring_buffer_size}"
+                )
+
+        if shared_dense_pool is not None:
+            if not isinstance(shared_dense_pool, SharedDensePool):
+                raise TypeError(
+                    f"shared_dense_pool must be a SharedDensePool instance, got {type(shared_dense_pool).__name__}"
                 )
 
         super().__init__(
@@ -756,6 +874,7 @@ class CusparseBackend(BackendBase):
         self._wavefront_down: list[list[_CuWavefrontOp]] = []
         self._slot_pool: _CuSlotPool | None = None
         self._shared_slot_pool = shared_slot_pool
+        self._shared_dense_pool = shared_dense_pool
         self._scratch_plan_up: list[_ScratchLevelPlan] = []
         self._scratch_plan_down: list[_ScratchLevelPlan] = []
 
@@ -1700,15 +1819,103 @@ class CusparseBackend(BackendBase):
             raise RuntimeError("cuSPARSE runtime constants are uninitialized")
         plan = self._require_plan(direction)
         level_sizes = [int(self._level_offsets[h + 1]) - int(self._level_offsets[h]) for h in range(self._H)]
-        dense = _build_dense_state(
-            cp=self._cp,
-            cslib=self._cslib,
-            plan=plan,
-            level_sizes=level_sizes,
-            k=k,
-            dtype=self._dtype,
-            cuda_dtype_id=self._cuda_dtype,
-        )
+
+        pool = self._shared_dense_pool
+        if pool is not None and int(k) == pool._k:
+            # Validate compatibility
+            if self._H > pool._max_H:
+                raise ValueError(
+                    f"SharedDensePool has {pool._max_H} levels but this backend needs {self._H}"
+                )
+            for h, sz in enumerate(level_sizes):
+                if sz > pool._max_level_sizes[h]:
+                    raise ValueError(
+                        f"SharedDensePool level {h} size {pool._max_level_sizes[h]} is too small "
+                        f"for this backend (needs {sz})"
+                    )
+            input_len = self._num_samples if direction == Direction.UP else self._num_mutations
+            max_input = pool._max_num_samples if direction == Direction.UP else pool._max_num_mutations
+            if input_len > max_input:
+                raise ValueError(
+                    f"SharedDensePool {'samples' if direction == Direction.UP else 'mutations'} "
+                    f"size {max_input} is too small (needs {input_len})"
+                )
+            # Build _DenseState using views into the pool's pre-allocated buffers.
+            # Views have the exact shape for this chromosome; descriptors embed the view ptr.
+            level_bufs = [pool._level_bufs[h][:level_sizes[h], :] for h in range(self._H)]
+            dst_descs = [
+                _create_dense_desc(
+                    cslib=self._cslib,
+                    buf=buf,
+                    rows=buf.shape[0],
+                    cols=buf.shape[1],
+                    order=plan.order_c,
+                    cuda_dtype_id=self._cuda_dtype,
+                )
+                for buf in level_bufs
+            ]
+            if plan.op_b == Operation.N and plan.order_b == plan.order_c:
+                dense = _DenseState(level_bufs=level_bufs, dst_descs=dst_descs, src_descs=dst_descs, src_bufs=None)
+            elif plan.op_b == Operation.T and plan.order_b != plan.order_c:
+                src_descs = [
+                    _create_dense_desc(
+                        cslib=self._cslib,
+                        buf=buf,
+                        rows=int(k),
+                        cols=buf.shape[0],
+                        order=plan.order_b,
+                        cuda_dtype_id=self._cuda_dtype,
+                    )
+                    for buf in level_bufs
+                ]
+                dense = _DenseState(level_bufs=level_bufs, dst_descs=dst_descs, src_descs=src_descs, src_bufs=None)
+            else:
+                # Unusual op_b/order_b combination requires separate src_bufs —
+                # share level_bufs but allocate private src_bufs for this backend.
+                self._logger.debug(
+                    "SharedDensePool: op_b/order_b mismatch; src_bufs allocated privately dir=%s",
+                    direction.value,
+                )
+                dense = _build_dense_state(
+                    cp=self._cp,
+                    cslib=self._cslib,
+                    plan=plan,
+                    level_sizes=level_sizes,
+                    k=k,
+                    dtype=self._dtype,
+                    cuda_dtype_id=self._cuda_dtype,
+                )
+                # Replace level_bufs with pool views (same shapes, shared memory)
+                for old_desc in dense.dst_descs:
+                    self._cslib.destroy_dn_mat(old_desc)
+                dense = _DenseState(
+                    level_bufs=level_bufs,
+                    dst_descs=dst_descs,
+                    src_descs=dense.src_descs,
+                    src_bufs=dense.src_bufs,
+                )
+            input_buf = (
+                pool._input_up[:input_len, :] if direction == Direction.UP
+                else pool._input_down[:input_len, :]
+            )
+        else:
+            if pool is not None and int(k) != pool._k:
+                self._logger.warning(
+                    "SharedDensePool k=%d does not match requested k=%d; allocating private dense state",
+                    pool._k,
+                    k,
+                )
+            dense = _build_dense_state(
+                cp=self._cp,
+                cslib=self._cslib,
+                plan=plan,
+                level_sizes=level_sizes,
+                k=k,
+                dtype=self._dtype,
+                cuda_dtype_id=self._cuda_dtype,
+            )
+            input_len = self._num_samples if direction == Direction.UP else self._num_mutations
+            input_buf = self._cp.zeros((input_len, k), dtype=self._dtype, order="C")
         scratch_plans = self._scratch_plans_for(direction)
         ops_by_level = self._ops_for(direction)
         scratch_views_by_level: list[list[CupyArray]] = []
@@ -1788,7 +1995,6 @@ class CusparseBackend(BackendBase):
                 buffer_mismatches[0],
             )
 
-        input_len = self._num_samples if direction == Direction.UP else self._num_mutations
         ws = _DirectionWorkspace(
             direction=direction,
             k=int(k),
@@ -1801,7 +2007,7 @@ class CusparseBackend(BackendBase):
             scratch_views_by_level=scratch_views_by_level,
             scratch_dst_descs_by_level=scratch_dst_descs_by_level,
             scratch_done_events_by_level=scratch_done_events_by_level,
-            input_primary=self._cp.zeros((input_len, k), dtype=self._dtype, order="C"),
+            input_primary=input_buf,
         )
         self._logger.debug("workspace ready dir=%s k=%d", direction.value, k)
         return ws
