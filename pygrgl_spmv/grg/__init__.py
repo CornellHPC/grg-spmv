@@ -230,6 +230,10 @@ class SpmvGRG:
         return self._compiled.num_edges
 
     @property
+    def dtype(self) -> np.dtype:
+        return self._dtype
+
+    @property
     def has_missing_data(self):
         return self._compiled.has_missing_data
 

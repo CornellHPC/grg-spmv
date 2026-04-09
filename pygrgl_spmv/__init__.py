@@ -354,4 +354,242 @@ def _load_compiled_state(source, dtype, artifact_dir):
         return convert(source, dtype=dtype)
 
 
-__all__ = ["SpmvGRG", "convert", "load", "load_shared_slot_pool"]
+def _fmt_mib(nbytes: int) -> str:
+    mib = nbytes / (1024 * 1024)
+    if mib >= 1000:
+        return f"{mib / 1024:,.1f} GiB"
+    if mib >= 1:
+        return f"{mib:,.1f} MiB"
+    return f"{nbytes / 1024:,.1f} KiB"
+
+
+def print_gpu_memory(
+    spmv: SpmvGRG,
+    *,
+    k: int | None = None,
+    shared_slot_pool=None,
+    file=None,
+) -> None:
+    """Print a GPU VRAM summary for a loaded SpmvGRG.
+
+    Prints three sections:
+    1. **Persistent GPU VRAM** — always loaded after :func:`load`.
+    2. **Runtime GPU VRAM** — additional memory needed per matmul call (scales with k).
+       If a ``k_hint`` was used, actual captured sizes are shown; otherwise an estimate
+       is printed.
+    3. **Shared Ring Buffer Pool** — only if ``shared_slot_pool`` is provided; shown
+       with a distinct prefix to indicate it is shared across backends.
+
+    Args:
+        spmv: A loaded :class:`SpmvGRG` instance.
+        k: Optional column count for concrete runtime estimates.
+        shared_slot_pool: A :class:`~pygrgl_spmv.backends.cusparse.SharedSlotPool`
+            passed at load time.  When provided the ring-buffer bytes are excluded
+            from the persistent total and shown in their own section.
+        file: Output stream.  Defaults to ``sys.stdout``.
+    """
+    import sys
+
+    out = file if file is not None else sys.stdout
+
+    snapshot = spmv.memory.retained
+    if snapshot is None:
+        print("(no memory snapshot available — backend may not have been set up yet)", file=out)
+        return
+
+    # --- Partition allocations -----------------------------------------------
+    ring_buffer = []
+    persistent_gpu = []
+    workspace_gpu = []   # CUDA graph captured
+    staging_gpu = []     # pre-allocated staging (output_main, input_miss, …)
+    cpu_pinned = []
+
+    _HOST_BLOCK_LABELS = {"host_blocks_up", "host_blocks_down"}
+    for alloc in snapshot.allocations:
+        if alloc.space == "cuda" and "slot_buffers" in alloc.labels:
+            ring_buffer.append(alloc)
+        elif alloc.space == "cuda" and "persistent" in alloc.retentions:
+            persistent_gpu.append(alloc)
+        elif alloc.space == "cuda" and "captured" in alloc.retentions:
+            workspace_gpu.append(alloc)
+        elif alloc.space == "cuda" and "staging" in alloc.retentions:
+            staging_gpu.append(alloc)
+        elif alloc.space == "cpu" and alloc.labels & _HOST_BLOCK_LABELS:
+            cpu_pinned.append(alloc)
+
+    # --- Helper: sub-group persistent allocations by label -------------------
+    _SELECTOR_LABELS = {"selector_mut", "selector_miss"}
+    _SCALAR_LABELS = {"alpha", "beta_zero", "beta_one"}
+
+    def _group_persistent(allocs):
+        groups = {
+            "shared_values": [],
+            "selectors": [],
+            "scalars": [],
+            "other": [],
+        }
+        for a in allocs:
+            if "shared_values" in a.labels:
+                groups["shared_values"].append(a)
+            elif a.labels & _SELECTOR_LABELS:
+                groups["selectors"].append(a)
+            elif a.labels & _SCALAR_LABELS:
+                groups["scalars"].append(a)
+            else:
+                groups["other"].append(a)
+        return groups
+
+    # --- Source name for header -----------------------------------------------
+    try:
+        source_name = Path(spmv._compiled.source_path).name
+    except Exception:
+        source_name = repr(spmv)
+
+    _W = 57
+    _SEP = "\u2500" * _W
+    _INNER_SEP = "  " + "\u2500" * (_W - 4)
+
+    def _row(label, nbytes, indent=2):
+        pad = " " * indent
+        return f"{pad}{label:<42}{_fmt_mib(nbytes):>12}"
+
+    print(f"GPU Memory: {source_name}", file=out)
+    print(_SEP, file=out)
+
+    # =========================================================================
+    # Section 1 — Persistent GPU VRAM
+    # =========================================================================
+    groups = _group_persistent(persistent_gpu)
+
+    rows = []
+    if groups["shared_values"]:
+        sv_bytes = sum(a.nbytes for a in groups["shared_values"])
+        sv_vmm = any(a.storage == "cuda_vmm" for a in groups["shared_values"])
+        sv_label = "Ones array (VMM-compressed, physical)" if sv_vmm else "Ones array (shared_values)"
+        rows.append((sv_label, sv_bytes))
+    if groups["selectors"]:
+        rows.append(("Selectors (mut + miss)", sum(a.nbytes for a in groups["selectors"])))
+    if groups["scalars"]:
+        rows.append(("Scalar constants (\u03b1, \u03b2\u2080, \u03b2\u2081)", sum(a.nbytes for a in groups["scalars"])))
+    if groups["other"]:
+        rows.append(("Other GPU allocations", sum(a.nbytes for a in groups["other"])))
+    # When no shared pool, the backend owns its ring-buffer slots — count them here
+    if shared_slot_pool is None and ring_buffer:
+        # Each slot has struct0 + struct1 → 2 allocs per slot
+        n_slots = len(ring_buffer) // 2
+        rows.append((f"Ring buffer slots ({n_slots} slots, private)", sum(a.nbytes for a in ring_buffer)))
+
+    total_persistent = sum(nbytes for _, nbytes in rows)
+
+    print("Persistent GPU VRAM (always loaded):", file=out)
+    for label, nbytes in rows:
+        print(_row(label, nbytes), file=out)
+    print(_INNER_SEP, file=out)
+    print(_row("Total", total_persistent), file=out)
+    print(file=out)
+
+    # =========================================================================
+    # Section 2 — Runtime GPU VRAM per matmul
+    # =========================================================================
+    if workspace_gpu or staging_gpu:
+        # k_hint / graph-capture mode: show actual captured + staging sizes
+        print("Runtime GPU VRAM per matmul (graph-capture, pre-allocated):", file=out)
+        _WORKSPACE_ORDER = ["dense_state", "source_state", "input_primary", "spmm_ext", "scratch_views"]
+        _WORKSPACE_LABELS = {
+            "dense_state": "Dense state buffers",
+            "source_state": "Source state buffers",
+            "input_primary": "Input buffer",
+            "spmm_ext": "SpMM extension buffer",
+            "scratch_views": "Scratch views",
+        }
+        listed = set()
+        for key in _WORKSPACE_ORDER:
+            matched = [a for a in workspace_gpu if key in a.labels]
+            if matched:
+                nbytes = sum(a.nbytes for a in matched)
+                print(_row(_WORKSPACE_LABELS.get(key, key), nbytes), file=out)
+                listed.update(id(a) for a in matched)
+        other_ws = [a for a in workspace_gpu if id(a) not in listed]
+        if other_ws:
+            print(_row("Other graph workspace", sum(a.nbytes for a in other_ws)), file=out)
+        # Staging buffers (output_main, input_miss, init_*, xtx_bias)
+        _STAGING_ORDER = ["output_main", "output_miss", "input_miss", "init_vector", "init_matrix", "xtx_bias"]
+        _STAGING_LABELS = {
+            "output_main": "Output matrix",
+            "output_miss": "Output (missing)",
+            "input_miss": "Input (missing)",
+            "init_vector": "Init vector",
+            "init_matrix": "Init matrix",
+            "xtx_bias": "XtX bias",
+        }
+        listed_s = set()
+        for key in _STAGING_ORDER:
+            matched = [a for a in staging_gpu if key in a.labels]
+            if matched:
+                nbytes = sum(a.nbytes for a in matched)
+                print(_row(_STAGING_LABELS.get(key, key), nbytes), file=out)
+                listed_s.update(id(a) for a in matched)
+        other_s = [a for a in staging_gpu if id(a) not in listed_s]
+        if other_s:
+            print(_row("Other staging", sum(a.nbytes for a in other_s)), file=out)
+        print(_INNER_SEP, file=out)
+        total_rt = sum(a.nbytes for a in workspace_gpu) + sum(a.nbytes for a in staging_gpu)
+        print(_row("Total (pre-allocated)", total_rt), file=out)
+    else:
+        # Dynamic mode: estimate from public properties
+        dtype = spmv.dtype
+        num_nodes = spmv.num_nodes
+        num_samples = spmv.num_samples
+        num_mutations = spmv.num_mutations
+        dense_per_k = num_nodes * dtype.itemsize
+        io_per_k = (num_samples + num_mutations) * dtype.itemsize
+
+        print("Runtime GPU VRAM per matmul (dynamic, not pre-allocated):", file=out)
+        if k is not None:
+            ds_label = f"Dense state ({num_nodes:,} nodes \u00d7 {dtype})"
+            io_label = f"I/O buffers ({num_samples:,} samples + {num_mutations:,} mutations)"
+            print(_row(ds_label, dense_per_k * k), file=out)
+            print(_row(io_label, io_per_k * k), file=out)
+            print(_INNER_SEP, file=out)
+            print(_row(f"Total @ k={k}  (estimate)", (dense_per_k + io_per_k) * k), file=out)
+        else:
+            ds_label = f"Dense state  ~{_fmt_mib(dense_per_k)}/col   ({num_nodes:,} nodes \u00d7 {dtype})"
+            io_label = f"I/O buffers   ~{_fmt_mib(io_per_k)}/col   ({num_samples:,} samples + {num_mutations:,} mutations)"
+            print(f"  {ds_label}", file=out)
+            print(f"  {io_label}", file=out)
+            print(_INNER_SEP, file=out)
+            total_per_k = dense_per_k + io_per_k
+            print(f"  Total  ~{_fmt_mib(total_per_k)}/col   (pass k= for a concrete value)", file=out)
+    print(file=out)
+
+    # =========================================================================
+    # Section 3 — CPU Pinned
+    # =========================================================================
+    if cpu_pinned:
+        print("CPU Pinned (host blocks, not GPU VRAM):", file=out)
+        print(_row("Sparse structure", sum(a.nbytes for a in cpu_pinned)), file=out)
+        print(file=out)
+
+    # =========================================================================
+    # Section 4 — Shared Ring Buffer Pool
+    # =========================================================================
+    if shared_slot_pool is not None:
+        pool = shared_slot_pool
+        try:
+            pool_bytes = pool._ring_buffer_size * (
+                pool._max_struct0_len * pool._struct0_dtype.itemsize
+                + pool._max_struct1_len * pool._struct1_dtype.itemsize
+            )
+            n_slots = pool._ring_buffer_size
+        except AttributeError:
+            pool_bytes = sum(a.nbytes for a in ring_buffer)
+            n_slots = "?"
+        slot_label = f"Slot pool ({n_slots} slots \u00d7 2 struct arrays)"
+        print(f"\u25b6 Shared Ring Buffer Pool (not owned by this backend):", file=out)
+        print(_row(slot_label, pool_bytes, indent=2), file=out)
+        print(file=out)
+
+    print(_SEP, file=out)
+
+
+__all__ = ["SpmvGRG", "convert", "load", "load_shared_slot_pool", "print_gpu_memory"]

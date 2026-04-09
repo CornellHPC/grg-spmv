@@ -6,7 +6,7 @@
     "ring_buffer_size": 2,
     "log_level": "WARNING",
     "up": {
-      "k_hint": null,
+      "k_hint": 1,
       "store": "N",
       "fmt": "CSR",
       "opA": "N",
@@ -17,7 +17,7 @@
       "scratch": "none"
     },
     "down": {
-      "k_hint": null,
+      "k_hint": 1,
       "store": "T",
       "fmt": "CSC",
       "opA": "N",
