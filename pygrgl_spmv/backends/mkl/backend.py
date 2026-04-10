@@ -90,6 +90,9 @@ class MklRetained:
     xtx_host: np.ndarray | None = alloc_field(
         label="xtx_host", kind="init", owner="backend", retention="persistent", activity="always", default=None
     )
+    shared_ones: np.ndarray | None = alloc_field(
+        label="shared_ones", kind="sparse", owner="backend", retention="persistent", activity="always", default=None
+    )
 
 
 def _needs_transpose(direction: Direction, store: StoredMatrix) -> bool:
@@ -265,7 +268,8 @@ class MklBackend(BackendBase):
         for dst_level, src_level, row_index in iter_direction_level_pairs(spec.direction, num_levels):
             stored = self._stored_matrix(spec.direction, dst_level=dst_level, src_level=src_level)
             rows[dst_level][row_index] = (
-                None if stored.nnz == 0 else MklSparseHandle(stored, spec.plan.fmt.value.lower())
+                None if stored.nnz == 0
+                else MklSparseHandle(stored, spec.plan.fmt.value.lower(), shared_values=self._shared_ones)
             )
         return rows
 
@@ -306,6 +310,7 @@ class MklBackend(BackendBase):
         retained.selector_miss_rows = self._selector_rows.get("miss")
         retained.selector_miss_cols = self._selector_cols.get("miss")
         retained.xtx_host = self._xtx_host
+        retained.shared_ones = self._shared_ones
 
     def _build_direction_ops(self, spec: _MklDirectionSpec) -> list[list[_MklBlockOp]]:
         num_levels = len(self._level_offsets) - 1
@@ -411,6 +416,12 @@ class MklBackend(BackendBase):
 
         a_blocks_data, a_blocks_idx, a_blocks_iptr = _a_blocks_nbytes(self._A_blocks)
 
+        max_nnz = max(
+            (mat.nnz for row in self._A_blocks for mat in row if mat is not None and mat.nnz > 0),
+            default=0,
+        )
+        self._shared_ones = np.ones(max(max_nnz, 1), dtype=np.float64)
+
         up_spec = self._direction_spec(Direction.UP)
         down_spec = self._direction_spec(Direction.DOWN)
         if up_spec is not None:
@@ -494,7 +505,8 @@ class MklBackend(BackendBase):
         )
         xtx_bytes = self._xtx_host.nbytes if self._xtx_host is not None else 0
 
-        theoretical = up_val + up_idx + up_iptr + dn_val + dn_idx + dn_iptr + sel_mut_bytes + sel_miss_bytes + xtx_bytes
+        shared_actual_bytes = self._shared_ones.nbytes if self._shared_ones is not None else 0
+        theoretical = shared_actual_bytes + up_idx + up_iptr + dn_idx + dn_iptr + sel_mut_bytes + sel_miss_bytes + xtx_bytes
 
         self._logger.info(
             "MklBackend memory components: "
@@ -504,6 +516,12 @@ class MklBackend(BackendBase):
             up_val / MiB, up_idx / MiB, up_iptr / MiB,
             dn_val / MiB, dn_idx / MiB, dn_iptr / MiB,
             sel_mut_bytes / MiB, sel_miss_bytes / MiB, xtx_bytes / MiB,
+        )
+        self._logger.info(
+            "MklBackend memory shared_values: logical_values=%.1fMiB actual_buffer=%.1fMiB savings=%.1fMiB",
+            (up_val + dn_val) / MiB,
+            shared_actual_bytes / MiB,
+            (up_val + dn_val - shared_actual_bytes) / MiB,
         )
 
         a_blocks_total = a_blocks_data + a_blocks_idx + a_blocks_iptr

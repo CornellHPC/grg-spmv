@@ -289,7 +289,7 @@ class MklSparseHandle:
         Target format: 'csr', 'csc', 'coo'.
     """
 
-    def __init__(self, mat, fmt='csr'):
+    def __init__(self, mat, fmt='csr', shared_values: np.ndarray | None = None):
         lib, mkl_int_dtype, mkl_ct_int = _ensure_loaded()
         self._lib = lib
         self._ct_int = mkl_ct_int
@@ -312,8 +312,15 @@ class MklSparseHandle:
             self._mat.row = self._mat.row.astype(mkl_int_dtype, copy=False)
             self._mat.col = self._mat.col.astype(mkl_int_dtype, copy=False)
 
-        # Ensure data is float64 C-contiguous
-        self._mat.data = np.ascontiguousarray(self._mat.data, dtype=np.float64)
+        # Ensure data is float64 C-contiguous.
+        # If a shared all-ones buffer is provided (binary matrices), use a view
+        # into it so all handles share one allocation; MKL borrows the pointer.
+        if shared_values is not None:
+            self._mat.data = shared_values[: self._nnz]
+            self._shared_values = shared_values  # keep base alive explicitly
+        else:
+            self._mat.data = np.ascontiguousarray(self._mat.data, dtype=np.float64)
+            self._shared_values = None
 
         # Create the MKL handle
         INT_P = POINTER(mkl_ct_int)
