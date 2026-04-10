@@ -31,6 +31,7 @@ LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
 @dataclass(frozen=True)
 class CommonBenchArgs:
     grg: str
+    grg_ref: str | None
     ks: list[int]
     plan_pair_specs: list[PlanPairSpec]
     ring_buffer_size: int
@@ -48,6 +49,13 @@ class CommonBenchArgs:
 
 def add_common_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--grg", default=DEFAULT_GRG_PATH)
+    parser.add_argument(
+        "--grg-ref",
+        type=str,
+        default=None,
+        help="Path to the source .grg file for reference output validation. "
+             "Required when --grg is a .grg_spmv; omit to skip accuracy checks.",
+    )
     parser.add_argument(
         "--ks",
         type=str,
@@ -149,6 +157,7 @@ def parse_common_bench_args(args: argparse.Namespace, *, require_plan: bool = Tr
     output_atol, output_rtol = tolerances_for_dtype(dtype)
     return CommonBenchArgs(
         grg=str(args.grg),
+        grg_ref=str(args.grg_ref) if args.grg_ref is not None else None,
         ks=ks,
         plan_pair_specs=plan_pair_specs,
         ring_buffer_size=int(args.ring_buffer_size),

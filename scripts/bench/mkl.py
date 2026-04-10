@@ -78,6 +78,7 @@ def main() -> None:
 
     run_benchmark_suite(
         grg_path=common.grg,
+        grg_ref_path=common.grg_ref,
         configs=configs,
         ks=common.ks,
         options=common.options,
