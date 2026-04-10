@@ -137,10 +137,10 @@ def parse_matmul_options(raw: str) -> list[str]:
     return tokens
 
 
-def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
+def parse_common_bench_args(args: argparse.Namespace, *, require_plan: bool = True) -> CommonBenchArgs:
     ks = parse_csv_ints(args.ks, "--ks")
     plan_pair_specs = list(args.plan_up_down or [])
-    if not plan_pair_specs:
+    if require_plan and not plan_pair_specs:
         raise ValueError("--plan-up-down must be provided at least once")
     if int(args.ring_buffer_size) < 1:
         raise ValueError("--ring-buffer-size must be >= 1")

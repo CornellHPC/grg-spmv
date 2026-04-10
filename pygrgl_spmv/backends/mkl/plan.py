@@ -16,6 +16,19 @@ from pygrgl_spmv.backends.types import (
 )
 
 
+def _parse_bool_field(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no"):
+        return False
+    raise ValueError(f"Expected boolean (true/false), got {value!r}")
+
+
 @dataclass(frozen=True)
 class MklPlan:
     """Explicit MKL traversal/storage plan."""
@@ -24,13 +37,14 @@ class MklPlan:
     fmt: SparseFormat
     n_threads: int = 0
     k_hint: int | None = None
+    optimize: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "k_hint", _parse_optional_k_hint(self.k_hint))
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "MklPlan":
-        allowed_keys = {"store", "fmt", "n_threads", "k_hint"}
+        allowed_keys = {"store", "fmt", "n_threads", "k_hint", "optimize"}
         extra = sorted(set(value) - allowed_keys)
         if extra:
             raise ValueError(f"Unknown MklPlan field(s): {extra}")
@@ -39,6 +53,7 @@ class MklPlan:
             fmt=parse_sparse_format(value["fmt"]),
             n_threads=int(value.get("n_threads", 0)),
             k_hint=_parse_optional_k_hint(value.get("k_hint")),
+            optimize=_parse_bool_field(value.get("optimize"), True),
         )
 
     def can_share_storage_with(self, other: "MklPlan") -> bool:
@@ -51,7 +66,8 @@ class MklPlan:
             "["
             f"k_hint={'none' if self.k_hint is None else self.k_hint},"
             f"store={self.store.value},fmt={self.fmt.value},"
-            f"n_threads={self.n_threads}"
+            f"n_threads={self.n_threads},"
+            f"optimize={self.optimize}"
             "]"
         )
 

@@ -24,6 +24,7 @@ from pygrgl_spmv.backends.mkl.ffi import (
     mkl_get_max_threads,
     mkl_set_num_threads,
 )
+from pygrgl_spmv._rss import rss_bytes
 from pygrgl_spmv.backends.types import (
     Direction,
     InitMode,
@@ -133,6 +134,39 @@ def _log_level_timing(
             call_count,
             nnz_count,
         )
+
+
+def _a_blocks_nbytes(a_blocks: list[list[sp.spmatrix]]) -> tuple[int, int, int]:
+    """Return (data_bytes, indices_bytes, indptr_bytes) across all A_blocks scipy matrices."""
+    data = indices = indptr = 0
+    for row in a_blocks:
+        for mat in row:
+            if mat is None or mat.nnz == 0:
+                continue
+            data += mat.data.nbytes
+            if hasattr(mat, "indices"):
+                indices += mat.indices.nbytes
+                indptr += mat.indptr.nbytes
+            else:
+                indices += mat.row.nbytes + mat.col.nbytes
+    return data, indices, indptr
+
+
+def _blocks_nbytes(blocks: list[list[MklSparseHandle | None]]) -> tuple[int, int, int]:
+    """Return (values_bytes, indices_bytes, indptr_bytes) across all handles in the grid."""
+    values = indices = indptr = 0
+    for row in blocks:
+        for handle in row:
+            if handle is None:
+                continue
+            mat = handle._mat
+            values += mat.data.nbytes
+            if hasattr(mat, "indices"):  # CSR or CSC
+                indices += mat.indices.nbytes
+                indptr += mat.indptr.nbytes
+            else:  # COO
+                indices += mat.row.nbytes + mat.col.nbytes
+    return values, indices, indptr
 
 
 class MklBackend(BackendBase):
@@ -325,6 +359,7 @@ class MklBackend(BackendBase):
                             "handle": op.handle,
                             "transpose": bool(op.transpose),
                             "k_hint": plan.k_hint,
+                            "optimize": plan.optimize,
                         }
                         usage[key] = entry
                         continue
@@ -336,21 +371,24 @@ class MklBackend(BackendBase):
                             "Incompatible MKL k_hint values share the same handle and transpose mode: "
                             f"{direction.value} requested {plan.k_hint}, existing {existing_hint}"
                         )
+                    entry["optimize"] = entry["optimize"] or plan.optimize
         expected = 1000
         for entry in usage.values():
             handle = entry["handle"]
             assert isinstance(handle, MklSparseHandle)
             transpose = bool(entry["transpose"])
-            handle.set_mv_hint(transpose=transpose, expected_calls=expected)
-            hint_k = entry["k_hint"]
-            if hint_k is not None and int(hint_k) > 1:
-                handle.set_mm_hint(int(hint_k), transpose=transpose, expected_calls=expected)
-            handle.optimize()
+            if entry["optimize"]:
+                handle.set_mv_hint(transpose=transpose, expected_calls=expected)
+                hint_k = entry["k_hint"]
+                if hint_k is not None and int(hint_k) > 1:
+                    handle.set_mm_hint(int(hint_k), transpose=transpose, expected_calls=expected)
+                handle.optimize()
 
     def setup(
         self,
         setup: BackendSetup,
     ) -> None:
+        rss_before = rss_bytes()
         mkl_set_num_threads(self._n_threads_setup)
         self._apply_setup_state(setup)
         self._dtype = np.float64
@@ -371,6 +409,8 @@ class MklBackend(BackendBase):
         self._ops_up = [[] for _ in range(num_levels)]
         self._ops_down = [[] for _ in range(num_levels)]
 
+        a_blocks_data, a_blocks_idx, a_blocks_iptr = _a_blocks_nbytes(self._A_blocks)
+
         up_spec = self._direction_spec(Direction.UP)
         down_spec = self._direction_spec(Direction.DOWN)
         if up_spec is not None:
@@ -379,6 +419,7 @@ class MklBackend(BackendBase):
         if down_spec is not None:
             self._blocks_down = self._build_direction_handles(down_spec)
             self._ops_down = self._build_direction_ops(down_spec)
+        rss_after_handles = rss_bytes()
 
         self._selector_rows = {}
         self._selector_cols = {}
@@ -390,11 +431,17 @@ class MklBackend(BackendBase):
             self._build_selector_indices(self._sel_miss)
         )
         self._configure_handle_hints()
+        rss_after_hints = rss_bytes()
+
+        self._log_memory_stats(
+            rss_before, rss_after_handles, rss_after_hints,
+            a_blocks_data, a_blocks_idx, a_blocks_iptr,
+        )
 
         self._logger.info(
             (
                 "MklBackend setup: fmt_up=%s fmt_down=%s k_hint=%s n_threads=%s (actual=%d) "
-                "store_up=%s store_down=%s up_owner=%s down_owner=%s"
+                "store_up=%s store_down=%s up_owner=%s down_owner=%s optimize_up=%s optimize_down=%s"
             ),
             "<unspecified>" if self._plan_up is None else self._fmt_up,
             "<unspecified>" if self._plan_down is None else self._fmt_down,
@@ -405,6 +452,8 @@ class MklBackend(BackendBase):
             self._store_blocks_down,
             self._up_ops_owner,
             self._down_ops_owner,
+            None if self._plan_up is None else self._plan_up.optimize,
+            None if self._plan_down is None else self._plan_down.optimize,
         )
         self._refresh_level_stats()
         self._sync_retained_root()
@@ -417,6 +466,75 @@ class MklBackend(BackendBase):
     def _refresh_level_stats(self) -> None:
         self._ops_up_calls, self._ops_up_nnz = _level_call_stats(self._ops_up)
         self._ops_down_calls, self._ops_down_nnz = _level_call_stats(self._ops_down)
+
+    def _log_memory_stats(
+        self,
+        rss_before: int | None,
+        rss_after_handles: int | None,
+        rss_after_hints: int | None,
+        a_blocks_data: int,
+        a_blocks_idx: int,
+        a_blocks_iptr: int,
+    ) -> None:
+        if not self._logger.isEnabledFor(logging.INFO):
+            return
+
+        MiB = 1024.0 * 1024.0
+
+        up_val, up_idx, up_iptr = _blocks_nbytes(self._blocks_up)
+        dn_val, dn_idx, dn_iptr = _blocks_nbytes(self._blocks_down)
+
+        sel_mut_bytes = sum(
+            a.nbytes for a in (self._selector_rows.get("mut"), self._selector_cols.get("mut"))
+            if a is not None
+        )
+        sel_miss_bytes = sum(
+            a.nbytes for a in (self._selector_rows.get("miss"), self._selector_cols.get("miss"))
+            if a is not None
+        )
+        xtx_bytes = self._xtx_host.nbytes if self._xtx_host is not None else 0
+
+        theoretical = up_val + up_idx + up_iptr + dn_val + dn_idx + dn_iptr + sel_mut_bytes + sel_miss_bytes + xtx_bytes
+
+        self._logger.info(
+            "MklBackend memory components: "
+            "blocks_up_values=%.1fMiB blocks_up_indices=%.1fMiB blocks_up_indptr=%.1fMiB "
+            "blocks_down_values=%.1fMiB blocks_down_indices=%.1fMiB blocks_down_indptr=%.1fMiB "
+            "selector_mut=%.1fMiB selector_miss=%.1fMiB xtx_host=%.1fMiB",
+            up_val / MiB, up_idx / MiB, up_iptr / MiB,
+            dn_val / MiB, dn_idx / MiB, dn_iptr / MiB,
+            sel_mut_bytes / MiB, sel_miss_bytes / MiB, xtx_bytes / MiB,
+        )
+
+        a_blocks_total = a_blocks_data + a_blocks_idx + a_blocks_iptr
+        self._logger.info(
+            "MklBackend memory a_blocks_input: data=%.1fMiB indices=%.1fMiB indptr=%.1fMiB total=%.1fMiB (freed after setup)",
+            a_blocks_data / MiB, a_blocks_idx / MiB, a_blocks_iptr / MiB, a_blocks_total / MiB,
+        )
+
+        if all(v is not None for v in (rss_before, rss_after_handles, rss_after_hints)):
+            delta_handles = rss_after_handles - rss_before
+            delta_optimize = rss_after_hints - rss_after_handles
+            self._logger.info(
+                "MklBackend memory stages: rss_delta_handles=%+.1fMiB rss_delta_mkl_optimize=%+.1fMiB",
+                delta_handles / MiB,
+                delta_optimize / MiB,
+            )
+
+        rss_after = rss_after_hints
+        if rss_after is not None and rss_before is not None:
+            delta = rss_after - rss_before
+            self._logger.info(
+                "MklBackend memory summary: theoretical=%.1fMiB rss=%.1fMiB rss_delta=%+.1fMiB",
+                theoretical / MiB,
+                rss_after / MiB,
+                delta / MiB,
+            )
+        else:
+            self._logger.info(
+                "MklBackend memory summary: theoretical=%.1fMiB rss=unavailable",
+                theoretical / MiB,
+            )
 
     def _log_wavefront_levels(self, direction: Direction, level_ms: np.ndarray) -> None:
         match direction:
