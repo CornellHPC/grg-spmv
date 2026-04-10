@@ -664,7 +664,9 @@ class MklBackend(BackendBase):
 
         track_wave = self._instrumentation and self._logger.isEnabledFor(logging.DEBUG)
         level_ms = np.zeros(len(self._level_offsets) - 1, dtype=np.float64) if track_wave else None
+        t0 = perf_counter()
         self._propagate_direction_inplace(spec, node_values, level_ms=level_ms)
+        self._logger.info("grg=%s direction=%s time=%.3fms", self._grg_name or "<unknown>", spec.direction.value, (perf_counter() - t0) * 1000.0)
 
         if emit_all_nodes:
             if track_wave and level_ms is not None:

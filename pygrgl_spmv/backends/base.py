@@ -243,6 +243,7 @@ class BackendBase:
         self._call_mem_type = None
         self._call_mem = None
         self._retained_epoch = 0
+        self._grg_name: str | None = None
 
     def _require_plan(self, direction: Direction):
         plan = self._plan_for(direction)
