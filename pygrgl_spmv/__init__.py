@@ -22,7 +22,7 @@ _BACKEND_SPECS = {
     },
     "mkl": {
         "section_keys": ("log_level", "up", "down"),
-        "plan_keys": ("store", "fmt", "n_threads", "k_hint"),
+        "plan_keys": ("store", "fmt", "n_threads", "k_hint", "optimize"),
     },
     "cusparse": {
         "section_keys": ("device", "stream", "ring_buffer_size", "log_level", "up", "down"),

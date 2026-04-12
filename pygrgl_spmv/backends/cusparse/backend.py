@@ -7,6 +7,7 @@ import warnings
 from contextlib import contextmanager
 from ctypes import c_void_p
 from dataclasses import dataclass
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -2203,6 +2204,7 @@ class CusparseBackend(BackendBase):
                 init_payload=init_payload,
             )
 
+            t0 = perf_counter()
             tracer = self._nvtx
             if tracer is not None:
                 exec_mode = "instrumented"
@@ -2232,6 +2234,7 @@ class CusparseBackend(BackendBase):
                     if emit_all_nodes
                     else self._collect_outputs(ws, staging, need_miss_output=need_miss_output)
                 )
+            self._logger.info("grg=%s direction=%s time=%.3fms", self._grg_name or "<unknown>", direction.value, (perf_counter() - t0) * 1000.0)
 
         if self._capture_active:
             call = self._call_mem

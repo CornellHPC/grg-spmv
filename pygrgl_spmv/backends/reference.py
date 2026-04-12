@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Mapping
 
 import numpy as np
@@ -132,6 +133,7 @@ class ReferenceBackend(BackendBase):
         retained.xtx_host = self._xtx_host
 
     def _propagate_up_inplace(self, node_values: np.ndarray) -> None:
+        t0 = perf_counter()
         off = self._level_offsets
         for h in range(1, len(off) - 1):
             lo, hi = int(off[h]), int(off[h + 1])
@@ -140,8 +142,10 @@ class ReferenceBackend(BackendBase):
                     continue
                 jlo, jhi = int(off[j]), int(off[j + 1])
                 node_values[lo:hi] += blk @ node_values[jlo:jhi]
+        self._logger.info("grg=%s direction=up time=%.3fms", self._grg_name or "<unknown>", (perf_counter() - t0) * 1000.0)
 
     def _propagate_down_inplace(self, node_values: np.ndarray) -> None:
+        t0 = perf_counter()
         off = self._level_offsets
         for h in range(len(off) - 2, -1, -1):
             lo, hi = int(off[h]), int(off[h + 1])
@@ -151,6 +155,7 @@ class ReferenceBackend(BackendBase):
                     continue
                 src_lo, src_hi = int(off[src]), int(off[src + 1])
                 node_values[lo:hi] += blk.T @ node_values[src_lo:src_hi]
+        self._logger.info("grg=%s direction=down time=%.3fms", self._grg_name or "<unknown>", (perf_counter() - t0) * 1000.0)
 
     def run_up(
         self,

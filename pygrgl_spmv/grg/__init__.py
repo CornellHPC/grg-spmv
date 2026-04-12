@@ -145,6 +145,7 @@ class SpmvGRG:
 
         self.memory = MemoryLedger()
         self._backend.setup(self._compiled.to_backend_setup(self._dtype))
+        self._backend._grg_name = Path(source).stem if isinstance(source, (str, os.PathLike)) else None
         self._compiled.A_blocks = None
         self._retained_mem = self._build_retained_mem()
         self._seen_retained_epoch = -1
