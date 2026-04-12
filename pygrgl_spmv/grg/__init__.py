@@ -151,6 +151,36 @@ class SpmvGRG:
         self._seen_retained_epoch = -1
         self._refresh_retained_snapshot(force=True)
 
+    @classmethod
+    def from_compiled_state(
+        cls,
+        compiled: CompiledOperatorState,
+        backend: BackendBase,
+        dtype,
+        *,
+        grg_name: str | None = None,
+    ) -> "SpmvGRG":
+        """Construct from a pre-loaded CompiledOperatorState, skipping disk I/O.
+
+        A_blocks is NOT nulled — the caller is responsible for keeping the
+        compiled state alive across all backend setups, then discarding it.
+        """
+        instance = object.__new__(cls)
+        instance._dtype = np.dtype(dtype)
+        instance._logger = logging.getLogger(f"{__name__}.{cls.__name__}")
+        if not isinstance(backend, BackendBase):
+            raise TypeError(f"SpmvGRG backend must be a BackendBase instance, got {type(backend).__name__}")
+        instance._backend = backend
+        instance._artifact_path = None
+        instance._compiled = compiled
+        instance.memory = MemoryLedger()
+        instance._backend.setup(compiled.to_backend_setup(instance._dtype))
+        instance._backend._grg_name = grg_name
+        instance._retained_mem = instance._build_retained_mem()
+        instance._seen_retained_epoch = -1
+        instance._refresh_retained_snapshot(force=True)
+        return instance
+
     def _build_retained_mem(self) -> OperatorRetainedMem:
         return OperatorRetainedMem(
             level_offsets=self._compiled.level_offsets,

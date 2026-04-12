@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 from dataclasses import dataclass, field
+from pathlib import Path
 from time import perf_counter
 
 import numpy as np
@@ -511,6 +512,7 @@ def run_benchmark_suite(
     output_rtol: float,
     skip_note: bool,
     skip_memory_table: bool = False,
+    compiled_state=None,
     seed_base: int = 2026,
 ) -> list[dict[str, object]]:
     from pygrgl_spmv import SpmvGRG
@@ -521,13 +523,19 @@ def run_benchmark_suite(
     all_memory_rows: list[dict[str, object]] = []
     all_outputs: list[dict[str, object]] = []
     grg_ref = pygrgl.load_immutable_grg(grg_ref_path) if grg_ref_path is not None else None
+    grg_name = Path(grg_path).stem
     for entry in configs:
         label = entry.label
 
         progress(f"{'=' * 72}")
         progress(f"loading operator {label}")
         t_load = perf_counter()
-        op = SpmvGRG(grg_path, entry.build_backend(), dtype)
+        if compiled_state is not None:
+            op = SpmvGRG.from_compiled_state(
+                compiled_state, entry.build_backend(), dtype, grg_name=grg_name
+            )
+        else:
+            op = SpmvGRG(grg_path, entry.build_backend(), dtype)
         progress(f"{label}: operator ready in {(perf_counter() - t_load) * 1000.0:.2f} ms")
 
         cfg_runtime_rows, cfg_memory_rows, cfg_outputs = benchmark_config(

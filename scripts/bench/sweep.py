@@ -33,6 +33,7 @@ from .cli import (
 )
 from .configs import BenchConfig, PlanPairSpec, expand_mkl_configs, format_dry_run_line
 from .run import run_benchmark_suite
+from pygrgl_spmv.grg.artifact import load_grg_spmv
 
 # ---------------------------------------------------------------------------
 # Hardware detection
@@ -255,9 +256,16 @@ def run_file(
     all_rows: list[dict[str, object]] = []
     errors: list[str] = []
 
+    # Load compiled state once — reused across all backend configs.
+    try:
+        compiled = load_grg_spmv(grg_path, dtype)
+    except Exception as exc:
+        return {"file": meta, "errors": [f"load: {exc}"], "rows": []}
+
     common_kwargs: dict[str, object] = dict(
         grg_path=grg_path,
         grg_ref_path=None,
+        compiled_state=compiled,
         ks=ks,
         options=options,
         n_trials=n_trials,
@@ -288,6 +296,8 @@ def run_file(
             all_rows.extend(rows)
         except Exception as exc:
             errors.append(f"cusparse: {exc}")
+
+    compiled.A_blocks = None  # all backends set up; release sparse blocks
 
     return {
         "file": meta,
@@ -440,6 +450,11 @@ def parse_args() -> argparse.Namespace:
         help="CUDA device ordinal.",
     )
     parser.add_argument(
+        "--no-mkl",
+        action="store_true",
+        help="Skip MKL benchmarks entirely.",
+    )
+    parser.add_argument(
         "--no-cusparse",
         action="store_true",
         help="Skip cuSPARSE benchmarks entirely",
@@ -510,9 +525,9 @@ def main() -> None:
         else [False] if args.optimize == "off"
         else [True]
     )
-    mkl_configs = build_mkl_sweep_configs(
-        threads, optimize_variants, args.log_level
-    )
+    mkl_configs: list[BenchConfig] = []
+    if not args.no_mkl:
+        mkl_configs = build_mkl_sweep_configs(threads, optimize_variants, args.log_level)
 
     cusparse_configs: list[BenchConfig] = []
     if not args.no_cusparse:
