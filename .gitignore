@@ -263,3 +263,5 @@ investigation/
 pygrgl_spmv_artifacts/
 # symlink
 pygrgl_spmv_artifacts
+
+results.json

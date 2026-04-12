@@ -510,8 +510,9 @@ def run_benchmark_suite(
     output_atol: float,
     output_rtol: float,
     skip_note: bool,
+    skip_memory_table: bool = False,
     seed_base: int = 2026,
-) -> None:
+) -> list[dict[str, object]]:
     from pygrgl_spmv import SpmvGRG
 
     progress(f"GRG file: {grg_path}")
@@ -553,7 +554,8 @@ def run_benchmark_suite(
     ref_errors, ref_checked, ref_abs_max, ref_rel_max = _summarize_reference_diagnostics(all_runtime_rows)
     print_common_config(common_config_lines)
     print_runtime_table(all_runtime_rows, config_display=config_display, skip_note=skip_note)
-    print_memory_table(all_memory_rows, config_display=config_display, skip_note=skip_note)
+    if not skip_memory_table:
+        print_memory_table(all_memory_rows, config_display=config_display, skip_note=skip_note)
     print(
         "\nCorrectness diagnostics: "
         f"intra_errors={intra_errors}/{intra_trials}, "
@@ -577,6 +579,8 @@ def run_benchmark_suite(
         trials = int(stats.get("trials", 0))
         rate = 0.0 if trials == 0 else 100.0 * float(failures) / float(trials)
         print(f"  {config_display.get(cfg, cfg)}: {failures}/{trials} ({rate:.1f}%)")
+
+    return all_runtime_rows
 
 
 __all__ = [
