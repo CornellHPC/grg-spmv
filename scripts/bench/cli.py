@@ -31,7 +31,6 @@ LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
 @dataclass(frozen=True)
 class CommonBenchArgs:
     grg: str
-    grg_ref: str | None
     ks: list[int]
     plan_pair_specs: list[PlanPairSpec]
     ring_buffer_size: int
@@ -49,13 +48,6 @@ class CommonBenchArgs:
 
 def add_common_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--grg", default=DEFAULT_GRG_PATH)
-    parser.add_argument(
-        "--grg-ref",
-        type=str,
-        default=None,
-        help="Path to the source .grg file for reference output validation. "
-             "Required when --grg is a .grg_spmv; omit to skip accuracy checks.",
-    )
     parser.add_argument(
         "--ks",
         type=str,
@@ -145,10 +137,10 @@ def parse_matmul_options(raw: str) -> list[str]:
     return tokens
 
 
-def parse_common_bench_args(args: argparse.Namespace, *, require_plan: bool = True) -> CommonBenchArgs:
+def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
     ks = parse_csv_ints(args.ks, "--ks")
     plan_pair_specs = list(args.plan_up_down or [])
-    if require_plan and not plan_pair_specs:
+    if not plan_pair_specs:
         raise ValueError("--plan-up-down must be provided at least once")
     if int(args.ring_buffer_size) < 1:
         raise ValueError("--ring-buffer-size must be >= 1")
@@ -157,7 +149,6 @@ def parse_common_bench_args(args: argparse.Namespace, *, require_plan: bool = Tr
     output_atol, output_rtol = tolerances_for_dtype(dtype)
     return CommonBenchArgs(
         grg=str(args.grg),
-        grg_ref=str(args.grg_ref) if args.grg_ref is not None else None,
         ks=ks,
         plan_pair_specs=plan_pair_specs,
         ring_buffer_size=int(args.ring_buffer_size),

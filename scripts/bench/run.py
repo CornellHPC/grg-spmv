@@ -185,9 +185,7 @@ def _ground_truth_output(
     matrix: np.ndarray,
     direction: str,
     kwargs: dict[str, object],
-) -> np.ndarray | None:
-    if grg_ref is None:
-        return None
+) -> np.ndarray:
     traversal = pygrgl.TraversalDirection.UP if direction == "up" else pygrgl.TraversalDirection.DOWN
     return np.asarray(pygrgl.matmul(grg_ref, matrix, traversal, **kwargs))
 
@@ -312,7 +310,7 @@ def _run_case(
     n_warmup: int,
     output_atol: float,
     output_rtol: float,
-    reference_output: np.ndarray | None,
+    reference_output: np.ndarray,
 ) -> _CaseResult:
     progress(f"{label}: scenario={scenario} direction={direction} k={k} start")
 
@@ -356,17 +354,13 @@ def _run_case(
     mean_ms = float(np.mean(ms))
     std_ms = float(np.std(ms))
     abs_err_avg, abs_err_max, rel_err_avg, rel_err_max = diagnostics.summary()
-    if reference_output is not None:
-        ref_ok, ref_shape_ok, ref_abs_err_max, ref_rel_err_max = compare_outputs(
-            reference_output,
-            diagnostics.steady_output,
-            atol=output_atol,
-            rtol=output_rtol,
-        )
-        ref_error = 0 if ref_ok and ref_shape_ok else 1
-    else:
-        ref_abs_err_max = ref_rel_err_max = None
-        ref_error = 0
+    ref_ok, ref_shape_ok, ref_abs_err_max, ref_rel_err_max = compare_outputs(
+        reference_output,
+        diagnostics.steady_output,
+        atol=output_atol,
+        rtol=output_rtol,
+    )
+    ref_error = 0 if ref_ok and ref_shape_ok else 1
 
     return _CaseResult(
         output=np.array(diagnostics.steady_output, copy=True),
@@ -500,7 +494,6 @@ def benchmark_config(
 def run_benchmark_suite(
     *,
     grg_path: str,
-    grg_ref_path: str | None = None,
     configs: list[BenchConfig],
     ks: list[int],
     options: list[str],
@@ -519,7 +512,7 @@ def run_benchmark_suite(
     all_runtime_rows: list[dict[str, object]] = []
     all_memory_rows: list[dict[str, object]] = []
     all_outputs: list[dict[str, object]] = []
-    grg_ref = pygrgl.load_immutable_grg(grg_ref_path) if grg_ref_path is not None else None
+    grg_ref = pygrgl.load_immutable_grg(grg_path)
     for entry in configs:
         label = entry.label
 

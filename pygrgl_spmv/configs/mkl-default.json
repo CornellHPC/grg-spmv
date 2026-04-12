@@ -6,15 +6,13 @@
       "store": "N",
       "fmt": "CSR",
       "n_threads": 0,
-      "k_hint": null,
-      "optimize": true
+      "k_hint": null
     },
     "down": {
       "store": "T",
       "fmt": "CSC",
       "n_threads": 0,
-      "k_hint": null,
-      "optimize": true
+      "k_hint": null
     }
   }
 }

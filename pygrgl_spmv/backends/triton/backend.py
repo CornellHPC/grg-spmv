@@ -6,7 +6,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha1
 import logging
-from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -1490,7 +1489,6 @@ class TritonBackend(BackendBase):
             assert payload is not None
             init_value = payload[:, 0]
 
-        t0 = perf_counter()
         result = self._run_column(
             direction,
             primary_col=x[:, 0],
@@ -1500,7 +1498,6 @@ class TritonBackend(BackendBase):
             need_miss_output=need_miss_output,
             emit_all_nodes=emit_all_nodes,
         )
-        self._logger.info("grg=%s direction=%s time=%.3fms", self._grg_name or "<unknown>", direction.value, (perf_counter() - t0) * 1000.0)
         if emit_all_nodes:
             out = np.asarray(result, dtype=self._dtype).reshape(-1, 1)
             out_miss = None
