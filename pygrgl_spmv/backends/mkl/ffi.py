@@ -209,12 +209,15 @@ def _setup_mkl_signatures(lib, ct_int):
     lib.mkl_sparse_optimize.argtypes = [c_void_p]
     lib.mkl_sparse_optimize.restype = c_int
 
-    # MKL_Set_Num_Threads / MKL_Get_Max_Threads
+    # MKL_Set_Num_Threads / MKL_Get_Max_Threads / MKL_Set_Num_Threads_Local
     lib.MKL_Set_Num_Threads.argtypes = [c_int]
     lib.MKL_Set_Num_Threads.restype = None
 
     lib.MKL_Get_Max_Threads.argtypes = []
     lib.MKL_Get_Max_Threads.restype = c_int
+
+    lib.MKL_Set_Num_Threads_Local.argtypes = [c_int]
+    lib.MKL_Set_Num_Threads_Local.restype = c_int
 
 
 # ---------------------------------------------------------------------------
@@ -468,3 +471,13 @@ def mkl_get_max_threads():
     """Query the current MKL thread count."""
     lib, _, _ = _ensure_loaded()
     return lib.MKL_Get_Max_Threads()
+
+
+def mkl_set_num_threads_local(n):
+    """Set the MKL thread count for the calling OS thread only.
+
+    Returns the previous local thread count (0 means 'use global setting').
+    Call with n=0 to revert to the global setting.
+    """
+    lib, _, _ = _ensure_loaded()
+    return int(lib.MKL_Set_Num_Threads_Local(c_int(n)))

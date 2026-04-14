@@ -23,6 +23,7 @@ from pygrgl_spmv.backends.mkl.ffi import (
     MklSparseHandle,
     mkl_get_max_threads,
     mkl_set_num_threads,
+    mkl_set_num_threads_local,
 )
 from pygrgl_spmv._rss import rss_bytes
 from pygrgl_spmv.backends.types import (
@@ -637,7 +638,7 @@ class MklBackend(BackendBase):
         need_miss_output: bool,
         emit_all_nodes: bool,
     ) -> tuple[np.ndarray, np.ndarray | None] | np.ndarray:
-        mkl_set_num_threads(spec.thread_count)
+        mkl_set_num_threads_local(spec.thread_count)
         x, k = self._normalize_primary_input(direction=spec.direction, primary=primary)
         if spec.plan.k_hint is not None and int(k) != int(spec.plan.k_hint):
             warn_k_hint_mismatch(
