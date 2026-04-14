@@ -90,9 +90,9 @@ def _load_archive(artifact_path) -> np.lib.npyio.NpzFile:
 
 
 def _log_struct_array(key: str, arr: np.ndarray) -> None:
-    if not _LOGGER.isEnabledFor(logging.INFO):
+    if not _LOGGER.isEnabledFor(logging.DEBUG):
         return
-    _LOGGER.info(
+    _LOGGER.debug(
         "artifact array key=%s dtype=%s shape=%s nbytes=%d",
         key,
         np.asarray(arr).dtype,
