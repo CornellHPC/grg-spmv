@@ -380,37 +380,41 @@ def _print_markdown_table(file_results: list[dict[str, object]]) -> None:
         print("\n## Benchmark Summary\n\n(no results)\n")
         return
 
-    # Build display rows.
-    fixed_headers = ["File", "Scenario", "Dir", "k"]
+    fixed_headers = ["File", "Scenario", "k"]
     headers = fixed_headers + col_order
 
-    display_rows: list[list[str]] = []
-    for (filename, scenario, direction, k), cells in pivot.items():
-        dir_display = "dn" if direction == "down" else direction
-        display_rows.append(
-            [filename, scenario, dir_display, k]
-            + [cells.get(col, "-") for col in col_order]
-        )
+    def _sorted_rows(direction: str) -> list[list[str]]:
+        rows = []
+        for (filename, scenario, d, k), cells in sorted(
+            pivot.items(),
+            key=lambda item: (item[0][0], item[0][1], item[0][3]),
+        ):
+            if d != direction:
+                continue
+            rows.append([filename, scenario, k] + [cells.get(col, "-") for col in col_order])
+        return rows
 
-    # Compute column widths and print.
-    col_widths = [len(h) for h in headers]
-    for row in display_rows:
-        for i, cell in enumerate(row):
-            col_widths[i] = max(col_widths[i], len(cell))
+    def _print_section(title: str, display_rows: list[list[str]]) -> None:
+        if not display_rows:
+            return
+        col_widths = [len(h) for h in headers]
+        for row in display_rows:
+            for i, cell in enumerate(row):
+                col_widths[i] = max(col_widths[i], len(cell))
+        fmt = lambda cells: "| " + " | ".join(c.ljust(col_widths[i]) for i, c in enumerate(cells)) + " |"
+        sep = "| " + " | ".join("-" * w for w in col_widths) + " |"
+        has_errors = any("*" in cell for row in display_rows for cell in row[len(fixed_headers):])
+        print(f"\n{title}\n")
+        if has_errors:
+            print("(`*` = intra-trial errors > 0)\n")
+        print(fmt(headers))
+        print(sep)
+        for row in display_rows:
+            print(fmt(row))
+        print()
 
-    def fmt_row(cells: list[str]) -> str:
-        return "| " + " | ".join(c.ljust(col_widths[i]) for i, c in enumerate(cells)) + " |"
-
-    sep = "| " + " | ".join("-" * w for w in col_widths) + " |"
-
-    print("\n## Benchmark Summary\n")
-    if col_order:
-        print("(`*` = intra-trial errors > 0)\n")
-    print(fmt_row(headers))
-    print(sep)
-    for row in display_rows:
-        print(fmt_row(row))
-    print()
+    _print_section("## Benchmark Summary — Up", _sorted_rows("up"))
+    _print_section("## Benchmark Summary — Down", _sorted_rows("down"))
 
 
 # ---------------------------------------------------------------------------

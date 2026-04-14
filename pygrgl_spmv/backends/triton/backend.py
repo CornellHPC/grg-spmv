@@ -229,6 +229,8 @@ class TritonRetained:
 class TritonBackend(BackendBase):
     """GPU backend using Triton naive CSR/CSC kernels on singleton vectors."""
 
+    lock: int = 1
+
     _SETUP_MEMORY_POLICY = {
         "_A_blocks": "dropped",
         "_sel_mut": "dropped",

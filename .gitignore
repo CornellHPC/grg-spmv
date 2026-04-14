@@ -265,3 +265,4 @@ pygrgl_spmv_artifacts/
 pygrgl_spmv_artifacts
 
 results.json
+results/

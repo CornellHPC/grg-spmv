@@ -184,6 +184,8 @@ def warn_instrumentation_ignores_k_hint(*, backend: str, direction: Direction, k
 class BackendBase:
     """Shared backend state, validation, and fail-fast call-capture hooks."""
 
+    lock: int = 0
+
     _SETUP_MEMORY_FIELDS = (
         "_A_blocks",
         "_sel_mut",

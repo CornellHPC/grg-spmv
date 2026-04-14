@@ -267,6 +267,109 @@ def test_load_from_triton_sample(monkeypatch, primary_grg_path, tmp_path):
     assert op.num_samples > 0
 
 
+_REFERENCE_SUB_CONFIG = {
+    "backend": "reference",
+    "reference": {
+        "log_level": "WARNING",
+        "up": {"store": "N", "fmt": "CSR", "k_hint": None},
+        "down": {"store": "T", "fmt": "CSC", "k_hint": None},
+    },
+}
+
+
+def _hybrid_config(*stems: str) -> dict:
+    return {
+        "backend": "hybrid",
+        "hybrid": {stem: _REFERENCE_SUB_CONFIG for stem in stems},
+    }
+
+
+def test_parse_hybrid_config_dispatches_by_source_name():
+    config = _hybrid_config("file-a", "file-b")
+    backend_name, section, plan_up, plan_down = pygrgl_spmv._parse_backend_config(
+        config, source_name="file-a"
+    )
+    assert backend_name == "reference"
+    assert plan_up is not None
+    assert plan_down is not None
+
+
+def test_parse_hybrid_config_missing_source_name_raises():
+    config = _hybrid_config("file-a")
+    with pytest.raises(ValueError, match="hybrid backend requires a file-path source"):
+        pygrgl_spmv._parse_backend_config(config, source_name=None)
+
+
+def test_parse_hybrid_config_unknown_stem_raises():
+    config = _hybrid_config("file-a", "file-b")
+    with pytest.raises(ValueError, match="no entry for 'missing-stem'"):
+        pygrgl_spmv._parse_backend_config(config, source_name="missing-stem")
+
+
+def test_parse_hybrid_config_unknown_stem_lists_available_keys():
+    config = _hybrid_config("file-a", "file-b")
+    with pytest.raises(ValueError, match="file-a") as exc_info:
+        pygrgl_spmv._parse_backend_config(config, source_name="missing-stem")
+    assert "file-b" in str(exc_info.value)
+
+
+def test_parse_hybrid_config_missing_hybrid_section_raises():
+    config = {"backend": "hybrid"}
+    with pytest.raises(ValueError, match="missing required 'hybrid' section"):
+        pygrgl_spmv._parse_backend_config(config, source_name="file-a")
+
+
+def test_parse_hybrid_config_validates_sub_config():
+    config = {
+        "backend": "hybrid",
+        "hybrid": {
+            "file-a": {
+                "backend": "reference",
+                "reference": {
+                    "log_level": "WARNING",
+                    "up": {"store": "N", "fmt": "CSR", "k_hint": None, "extra_key": True},
+                    "down": None,
+                },
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="unknown field"):
+        pygrgl_spmv._parse_backend_config(config, source_name="file-a")
+
+
+def test_parse_shipped_hybrid_example():
+    config = _sample_config("hybrid-example.json")
+    backend_name, section, plan_up, plan_down = pygrgl_spmv._parse_backend_config(
+        config, source_name="chr1.final"
+    )
+    assert backend_name == "reference"
+    assert plan_up is not None
+
+    backend_name2, section2, plan_up2, plan_down2 = pygrgl_spmv._parse_backend_config(
+        config, source_name="chr2.final"
+    )
+    assert backend_name2 == "mkl"
+    assert plan_up2 is not None
+
+
+def test_load_hybrid_config_routes_by_grg_stem(monkeypatch, primary_grg_path, tmp_path):
+    stem = Path(primary_grg_path).stem
+    config = {
+        "backend": "hybrid",
+        "hybrid": {stem: _REFERENCE_SUB_CONFIG},
+    }
+    monkeypatch.setenv("PYGRGL_SPMV_CONFIG", str(_write_config(tmp_path, config)))
+    op = load(primary_grg_path, artifact_dir=tmp_path / "artifacts")
+    assert isinstance(op, SpmvGRG)
+
+
+def test_load_hybrid_config_missing_stem_raises(monkeypatch, primary_grg_path, tmp_path):
+    config = _hybrid_config("some-other-file")
+    monkeypatch.setenv("PYGRGL_SPMV_CONFIG", str(_write_config(tmp_path, config)))
+    with pytest.raises(ValueError, match="no entry for"):
+        load(primary_grg_path, artifact_dir=tmp_path / "artifacts")
+
+
 def test_load_missing_config_file_raises(monkeypatch, primary_grg_path, tmp_path):
     monkeypatch.setenv("PYGRGL_SPMV_CONFIG", str(tmp_path / "nonexistent.json"))
     with pytest.raises((FileNotFoundError, OSError)):

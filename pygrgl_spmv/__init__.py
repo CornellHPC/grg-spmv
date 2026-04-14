@@ -14,7 +14,7 @@ from pygrgl_spmv.grg import SpmvGRG, convert
 
 _CONFIG_ENV_VAR = "PYGRGL_SPMV_CONFIG"
 _LOGGER = logging.getLogger(__name__)
-_KNOWN_ROOT_KEYS = ("backend", "reference", "mkl", "cusparse", "triton")
+_KNOWN_ROOT_KEYS = ("backend", "reference", "mkl", "cusparse", "triton", "hybrid")
 _BACKEND_SPECS = {
     "reference": {
         "section_keys": ("log_level", "up", "down"),
@@ -58,7 +58,8 @@ def load(
     config_path = str(config_path).strip()
     with open(config_path, encoding="utf-8") as handle:
         config = json.load(handle)
-    backend_name, section, plan_up, plan_down = _parse_backend_config(config)
+    source_name = Path(source).stem if isinstance(source, (str, os.PathLike)) else None
+    backend_name, section, plan_up, plan_down = _parse_backend_config(config, source_name=source_name)
     backend = _build_backend(backend_name, section, plan_up, plan_down)
     _LOGGER.info("Selected %s backend from %s", backend_name, config_path)
     return SpmvGRG(source, backend, dtype, artifact_dir=artifact_dir)
@@ -101,16 +102,42 @@ def _require_optional_plan(
     return plan
 
 
+def _parse_hybrid_config(
+    root: dict[str, object],
+    source_name: str | None,
+) -> tuple[str, dict[str, object], dict[str, object] | None, dict[str, object] | None]:
+    if "hybrid" not in root:
+        raise ValueError("config is missing required 'hybrid' section")
+    hybrid_map = _require_mapping(root["hybrid"], label="hybrid config")
+    if source_name is None:
+        raise ValueError(
+            "hybrid backend requires a file-path source so the GRG stem can be looked up; "
+            "in-memory ImmutableGRG sources are not supported with hybrid configs"
+        )
+    if source_name not in hybrid_map:
+        available = sorted(hybrid_map)
+        raise ValueError(
+            f"hybrid config has no entry for {source_name!r}; "
+            f"available keys: {available}"
+        )
+    sub_config = _require_mapping(hybrid_map[source_name], label=f"hybrid[{source_name!r}]")
+    return _parse_backend_config(sub_config)
+
+
 def _parse_backend_config(
     config: object,
+    *,
+    source_name: str | None = None,
 ) -> tuple[str, dict[str, object], dict[str, object] | None, dict[str, object] | None]:
     root = _require_mapping(config, label="config")
     _require_keys(root, label="config", required_keys=("backend",), allowed_keys=_KNOWN_ROOT_KEYS)
 
     backend_name = str(root["backend"]).strip().lower()
+    if backend_name == "hybrid":
+        return _parse_hybrid_config(root, source_name)
     if backend_name not in _BACKEND_SPECS:
         raise ValueError(
-            f"config backend must be one of {sorted(_BACKEND_SPECS)}, got {root['backend']!r}"
+            f"config backend must be one of {sorted([*_BACKEND_SPECS, 'hybrid'])}, got {root['backend']!r}"
         )
     if backend_name not in root:
         raise ValueError(f"config is missing required '{backend_name}' section")

@@ -1,0 +1,41 @@
+{
+  "backend": "hybrid",
+  "hybrid": {
+    "chr1.final": {
+      "backend": "reference",
+      "reference": {
+        "log_level": "WARNING",
+        "up": {
+          "store": "N",
+          "fmt": "CSR",
+          "k_hint": null
+        },
+        "down": {
+          "store": "T",
+          "fmt": "CSC",
+          "k_hint": null
+        }
+      }
+    },
+    "chr2.final": {
+      "backend": "mkl",
+      "mkl": {
+        "log_level": "WARNING",
+        "up": {
+          "store": "N",
+          "fmt": "CSR",
+          "n_threads": 0,
+          "k_hint": null,
+          "optimize": true
+        },
+        "down": {
+          "store": "T",
+          "fmt": "CSC",
+          "n_threads": 0,
+          "k_hint": null,
+          "optimize": true
+        }
+      }
+    }
+  }
+}

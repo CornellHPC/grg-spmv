@@ -229,6 +229,10 @@ class SpmvGRG:
         self._refresh_retained_snapshot()
 
     @property
+    def lock(self) -> int:
+        return self._backend.lock
+
+    @property
     def shape(self) -> tuple[int, int]:
         return (self.num_samples, self.num_mutations)
 

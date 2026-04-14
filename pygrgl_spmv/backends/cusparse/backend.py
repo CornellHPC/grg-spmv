@@ -471,6 +471,8 @@ def _destroy_wavefront_ops(ops_by_level: list[list[_CuWavefrontOp]], *, cslib: C
 class CusparseBackend(BackendBase):
     """GPU backend using cuSPARSE for block-wise level traversal."""
 
+    lock: int = 1
+
     _SETUP_MEMORY_POLICY = {
         "_A_blocks": "dropped",
         "_sel_mut": "dropped",
@@ -2204,6 +2206,7 @@ class CusparseBackend(BackendBase):
                 init_payload=init_payload,
             )
 
+            self._logger.info("grg=%s direction=%s Begin", self._grg_name or "<unknown>", direction.value)
             t0 = perf_counter()
             tracer = self._nvtx
             if tracer is not None:
