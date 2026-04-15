@@ -53,6 +53,7 @@ class _MklDirectionSpec:
     store_blocks: bool
     ops_owner: Direction
     stage_name: str
+    cpu_affinity: "tuple[int, ...] | None"
 
 
 @dataclass
@@ -221,10 +222,12 @@ class MklBackend(BackendBase):
     def _resolve_thread_count(self, plan: MklPlan | None) -> int | None:
         if plan is None:
             return None
+        if plan.n_threads != 0:
+            return int(plan.n_threads)
+        if plan.cpu_affinity is not None:
+            return len(plan.cpu_affinity)
         cpu_count = os.cpu_count()
-        if cpu_count is None:
-            cpu_count = 1
-        return cpu_count if plan.n_threads == 0 else int(plan.n_threads)
+        return cpu_count if cpu_count is not None else 1
 
     def _thread_count_for(self, direction: Direction) -> int:
         count = self._n_threads_up if direction == Direction.UP else self._n_threads_down
@@ -243,6 +246,7 @@ class MklBackend(BackendBase):
             store_blocks=self._store_blocks_up if direction == Direction.UP else self._store_blocks_down,
             ops_owner=Direction.UP if (self._up_ops_owner if direction == Direction.UP else self._down_ops_owner) == "up" else Direction.DOWN,
             stage_name="run_up" if direction == Direction.UP else "run_down",
+            cpu_affinity=plan.cpu_affinity,
         )
 
     def _require_direction_spec(self, direction: Direction) -> _MklDirectionSpec:
@@ -628,6 +632,29 @@ class MklBackend(BackendBase):
         np.add.at(node_values, cols, source[rows])
 
     def _run_direction(
+        self,
+        spec: _MklDirectionSpec,
+        primary: np.ndarray,
+        *,
+        miss: np.ndarray | None,
+        init_mode: InitMode,
+        init: np.ndarray | None,
+        need_miss_output: bool,
+        emit_all_nodes: bool,
+    ) -> tuple[np.ndarray, np.ndarray | None] | np.ndarray:
+        _old_affinity = None
+        if spec.cpu_affinity is not None:
+            _old_affinity = os.sched_getaffinity(0)
+            os.sched_setaffinity(0, spec.cpu_affinity)
+        try:
+            return self._run_direction_inner(spec, primary, miss=miss, init_mode=init_mode,
+                                             init=init, need_miss_output=need_miss_output,
+                                             emit_all_nodes=emit_all_nodes)
+        finally:
+            if _old_affinity is not None:
+                os.sched_setaffinity(0, _old_affinity)
+
+    def _run_direction_inner(
         self,
         spec: _MklDirectionSpec,
         primary: np.ndarray,

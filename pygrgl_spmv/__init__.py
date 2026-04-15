@@ -23,6 +23,7 @@ _BACKEND_SPECS = {
     "mkl": {
         "section_keys": ("log_level", "up", "down"),
         "plan_keys": ("store", "fmt", "n_threads", "k_hint", "optimize"),
+        "optional_plan_keys": ("cpu_affinity",),
     },
     "cusparse": {
         "section_keys": ("device", "stream", "ring_buffer_size", "log_level", "up", "down"),
@@ -94,11 +95,13 @@ def _require_optional_plan(
     *,
     label: str,
     required_keys: tuple[str, ...],
+    optional_keys: tuple[str, ...] = (),
 ) -> dict[str, object] | None:
     if value is None:
         return None
     plan = _require_mapping(value, label=label)
-    _require_keys(plan, label=label, required_keys=required_keys)
+    _require_keys(plan, label=label, required_keys=required_keys,
+                  allowed_keys=required_keys + optional_keys)
     return plan
 
 
@@ -146,15 +149,18 @@ def _parse_backend_config(
     section = _require_mapping(root[backend_name], label=f"{backend_name} config")
     _require_keys(section, label=f"{backend_name} config", required_keys=spec["section_keys"])
 
+    optional_keys = tuple(spec.get("optional_plan_keys", ()))
     plan_up = _require_optional_plan(
         section["up"],
         label=f"{backend_name}.up",
         required_keys=spec["plan_keys"],
+        optional_keys=optional_keys,
     )
     plan_down = _require_optional_plan(
         section["down"],
         label=f"{backend_name}.down",
         required_keys=spec["plan_keys"],
+        optional_keys=optional_keys,
     )
     if plan_up is None and plan_down is None:
         raise ValueError(f"{backend_name} config must enable at least one of up/down")
