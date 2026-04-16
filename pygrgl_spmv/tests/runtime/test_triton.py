@@ -39,6 +39,7 @@ from pygrgl_spmv.tests.runtime._streaming_cases import (
 pytestmark = [pytest.mark.gpu, pytest.mark.triton]
 
 _MODE_BY_NAME = {mode.name: mode for mode in THREE_BLOCK_TRANSITION_MODES}
+_THREE_BLOCK_KEYS = ((1, 0), (2, 0), (2, 1))
 
 
 def _requirements(runtime_k: int):
@@ -85,12 +86,13 @@ def _nonzero_slot_count(layout) -> int:
     return sum(1 for slot in layout.slot_plans if slot.nbytes > 0)
 
 
-def _build_layout(artifact, *, runtime_k: int, ring_buffer_size: int, budget_bytes: int):
+def _build_layout(artifact, *, runtime_k: int, ring_buffer_size: int, budget_bytes: int, allow_residency: bool = True):
     return build_triton_layout(
         [artifact],
         requirements=_requirements(runtime_k),
         ring_buffer_size=int(ring_buffer_size),
         vram_budget_bytes=int(budget_bytes),
+        allow_residency=bool(allow_residency),
     )
 
 
@@ -108,6 +110,21 @@ def _assert_budget_accounting(layout, *, chosen_budget: int, fixed_bytes: int, b
     assert sum(item.nbytes for item in layout.budget_items) == layout.bytes_total
     assert layout.required_budget_for_full_residency == int(fixed_bytes + 3 * block_bytes)
     assert layout.bytes_total <= int(chosen_budget) <= layout.required_budget_for_full_residency
+
+
+def _assert_all_streamed_no_residency(layout, *, requested_ring_buffer_size: int, expected_slot_count: int, fixed_bytes: int, block_bytes: int) -> None:
+    assert layout.allow_residency is False
+    assert layout.requested_ring_buffer_size == int(requested_ring_buffer_size)
+    assert layout.allocated_ring_buffer_size == int(expected_slot_count)
+    assert _owner_keys(layout, resident=True) == ()
+    assert _owner_keys(layout, resident=False) == _THREE_BLOCK_KEYS
+    assert layout.bytes_by_category["resident_sparse"] == 0
+    resident_items = [item for item in layout.budget_items if item.kind == "resident_sparse"]
+    slot_items = [item for item in layout.budget_items if item.kind == "ring_slot"]
+    assert resident_items == []
+    assert len(slot_items) == int(expected_slot_count)
+    assert layout.bytes_total == int(fixed_bytes + expected_slot_count * block_bytes)
+    assert layout.required_budget_for_full_residency == int(fixed_bytes + 3 * block_bytes)
 
 
 def _assert_three_block_mode(layout, mode: ThreeBlockMode, *, chosen_budget: int, fixed_bytes: int, block_bytes: int) -> None:
@@ -526,6 +543,63 @@ def test_triton_small_int64_artifact_compacts_slot_dtypes(tmp_path):
         assert runtime._slot_indptr[0].dtype == torch.int32
 
 
+@pytest.mark.parametrize("requested_ring_buffer_size", [1, 2, 3], ids=["ring1", "ring2", "ring3"])
+def test_triton_allow_residency_false_forces_all_streamed_layout(triton_small_stream_artifact, requested_ring_buffer_size):
+    fixed_bytes, block_bytes, owner_block_count = _full_budget_components(triton_small_stream_artifact, runtime_k=2)
+    assert owner_block_count == 3
+    budget_bytes = fixed_bytes + 3 * block_bytes
+    layout = _build_layout(
+        triton_small_stream_artifact,
+        runtime_k=2,
+        ring_buffer_size=requested_ring_buffer_size,
+        budget_bytes=budget_bytes,
+        allow_residency=False,
+    )
+    _assert_all_streamed_no_residency(
+        layout,
+        requested_ring_buffer_size=requested_ring_buffer_size,
+        expected_slot_count=requested_ring_buffer_size,
+        fixed_bytes=fixed_bytes,
+        block_bytes=block_bytes,
+    )
+    if requested_ring_buffer_size < 3:
+        assert layout.bytes_total < layout.required_budget_for_full_residency
+    else:
+        assert layout.bytes_total == layout.required_budget_for_full_residency
+
+
+def test_triton_allow_residency_false_rejects_ring_zero(triton_small_stream_artifact):
+    with pytest.raises(ValueError, match="ring_buffer_size"):
+        _build_layout(
+            triton_small_stream_artifact,
+            runtime_k=1,
+            ring_buffer_size=0,
+            budget_bytes=1_000_000_000_000,
+            allow_residency=False,
+        )
+
+
+def test_triton_allow_residency_false_warns_when_requested_ring_exceeds_streamed_blocks(triton_small_stream_artifact):
+    fixed_bytes, block_bytes, owner_block_count = _full_budget_components(triton_small_stream_artifact, runtime_k=2)
+    assert owner_block_count == 3
+    budget_bytes = fixed_bytes + 3 * block_bytes
+    with pytest.warns(RuntimeWarning, match="requested ring_buffer_size"):
+        layout = _build_layout(
+            triton_small_stream_artifact,
+            runtime_k=2,
+            ring_buffer_size=4,
+            budget_bytes=budget_bytes,
+            allow_residency=False,
+        )
+    _assert_all_streamed_no_residency(
+        layout,
+        requested_ring_buffer_size=4,
+        expected_slot_count=3,
+        fixed_bytes=fixed_bytes,
+        block_bytes=block_bytes,
+    )
+
+
 @pytest.mark.parametrize("runtime_k", [1, 2, 4], ids=["k1", "k2", "k4"])
 def test_triton_primary_grg_exact_binary(primary_artifact, primary_grg, runtime_k):
     layout = build_triton_layout([primary_artifact], requirements=_requirements(runtime_k))
@@ -581,6 +655,42 @@ def test_triton_large_three_block_planner_transitions(triton_stream_stress_artif
 def test_triton_small_three_block_exactness(order, runtime_k, mode, gpu_small_stream_case, triton_small_stream_artifact):
     clear_torch_state()
     _run_exactness_case(triton_small_stream_artifact, gpu_small_stream_case, runtime_k=runtime_k, mode=mode, order=order)
+    clear_torch_state()
+
+
+@pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
+@pytest.mark.parametrize("runtime_k", [1, 2], ids=["k1", "k2"])
+@pytest.mark.parametrize("requested_ring_buffer_size", [1, 2, 3], ids=["ring1", "ring2", "ring3"])
+def test_triton_small_three_block_exactness_allow_residency_false(order, runtime_k, requested_ring_buffer_size, gpu_small_stream_case, triton_small_stream_artifact):
+    fixed_bytes, block_bytes, owner_block_count = _full_budget_components(triton_small_stream_artifact, runtime_k=runtime_k)
+    assert owner_block_count == 3
+    budget_bytes = fixed_bytes + requested_ring_buffer_size * block_bytes
+    clear_torch_state()
+    layout = _build_layout(
+        triton_small_stream_artifact,
+        runtime_k=runtime_k,
+        ring_buffer_size=requested_ring_buffer_size,
+        budget_bytes=budget_bytes,
+        allow_residency=False,
+    )
+    _assert_all_streamed_no_residency(
+        layout,
+        requested_ring_buffer_size=requested_ring_buffer_size,
+        expected_slot_count=requested_ring_buffer_size,
+        fixed_bytes=fixed_bytes,
+        block_bytes=block_bytes,
+    )
+    with TritonRuntime(layout) as runtime:
+        (grg,) = runtime.grgs
+        for run_idx, direction in enumerate(order):
+            seed = 63_000 + 1_000 * runtime_k + 100 * run_idx + 10 * requested_ring_buffer_size
+            rng = np.random.default_rng(seed)
+            primary = rng.choice(np.array([-1.0, 1.0], dtype=DATA_DTYPE), size=(int(runtime_k), gpu_small_stream_case.n))
+            if direction == "up":
+                expected = expected_up(primary.T, shifts=gpu_small_stream_case.shifts, bandwidth=gpu_small_stream_case.bandwidth).T
+            else:
+                expected = expected_down(primary.T, shifts=gpu_small_stream_case.shifts, bandwidth=gpu_small_stream_case.bandwidth).T
+            np.testing.assert_array_equal(grg.matmul(primary, direction), expected)
     clear_torch_state()
 
 

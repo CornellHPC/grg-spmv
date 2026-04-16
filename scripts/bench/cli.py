@@ -20,6 +20,7 @@ class BenchArgs:
     stream: int
     ring_buffer_size: int
     vram_budget_bytes: int
+    allow_residency: bool
 
 
 def add_common_args(parser: argparse.ArgumentParser, *, gpu: bool) -> None:
@@ -34,6 +35,7 @@ def add_common_args(parser: argparse.ArgumentParser, *, gpu: bool) -> None:
         parser.add_argument("--stream", type=int, default=0)
         parser.add_argument("--ring-buffer-size", type=int, default=2)
         parser.add_argument("--vram-budget-bytes", type=int, required=True)
+        parser.add_argument("--allow-residency", action=argparse.BooleanOptionalAction, default=True)
 
 
 def parse_args(args: argparse.Namespace, *, gpu: bool) -> BenchArgs:
@@ -55,4 +57,5 @@ def parse_args(args: argparse.Namespace, *, gpu: bool) -> BenchArgs:
         stream=0 if not gpu else int(args.stream),
         ring_buffer_size=0 if not gpu else int(args.ring_buffer_size),
         vram_budget_bytes=0 if not gpu else int(args.vram_budget_bytes),
+        allow_residency=True if not gpu else bool(args.allow_residency),
     )

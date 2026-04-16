@@ -29,6 +29,7 @@ def main() -> None:
         requirements=baseline_requirements(direction=args.direction, k=args.k),
         vram_budget_bytes=args.vram_budget_bytes,
         ring_buffer_size=args.ring_buffer_size,
+        allow_residency=args.allow_residency,
         device=args.device,
         stream=args.stream,
     )

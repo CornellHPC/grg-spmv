@@ -148,6 +148,7 @@ def build_triton_layout(
     pair=None,
     vram_budget_bytes: int = DEFAULT_GPU_BUDGET,
     ring_buffer_size: int = 0,
+    allow_residency: bool = True,
     device: int = 0,
     stream=0,
 ):
@@ -160,6 +161,7 @@ def build_triton_layout(
         requirements=full_requirements() if requirements is None else requirements,
         vram_budget_bytes=int(vram_budget_bytes),
         ring_buffer_size=int(ring_buffer_size),
+        allow_residency=bool(allow_residency),
         device=device,
         stream=stream,
     )
@@ -173,6 +175,7 @@ def build_cusparse_layout(
     pair=None,
     vram_budget_bytes: int = DEFAULT_GPU_BUDGET,
     ring_buffer_size: int = 0,
+    allow_residency: bool = True,
     device: int = 0,
     stream=0,
 ):
@@ -185,6 +188,7 @@ def build_cusparse_layout(
         requirements=full_requirements() if requirements is None else requirements,
         vram_budget_bytes=int(vram_budget_bytes),
         ring_buffer_size=int(ring_buffer_size),
+        allow_residency=bool(allow_residency),
         device=device,
         stream=stream,
     )

@@ -96,6 +96,7 @@ class CusparseLayout:
     device: int
     stream_ptr: int
     stream_owner: object | None
+    allow_residency: bool
     requested_ring_buffer_size: int
     allocated_ring_buffer_size: int
     vram_budget_bytes: int
@@ -580,6 +581,7 @@ def plan_cusparse_layout(
     requirements: RuntimeRequirements,
     vram_budget_bytes: int,
     ring_buffer_size: int,
+    allow_residency: bool = True,
     device,
     stream,
 ) -> CusparseLayout:
@@ -592,6 +594,7 @@ def plan_cusparse_layout(
         raise ImportError("CuPy required: pip install cupy-cuda12x") from exc
 
     requested_ring_buffer_size = int(ring_buffer_size)
+    allow_residency = bool(allow_residency)
     device_id = parse_cuda_device(device)
     stream_ptr, stream_owner = parse_cuda_stream(stream)
     if stream_ptr != 0:
@@ -714,7 +717,21 @@ def plan_cusparse_layout(
     )
     resident_bytes_full = int(sum(block.nbytes for block in blocks))
     required_budget_for_full_residency = int(fixed_bytes + resident_bytes_full)
-    if required_budget_for_full_residency <= int(vram_budget_bytes):
+    if not allow_residency:
+        if blocks and requested_ring_buffer_size < 1:
+            raise ValueError("ring_buffer_size must be >= 1 when any cuSPARSE block is streamed")
+        for block in blocks:
+            block.resident = False
+        slot_plans, ring_bytes = _assign_slots(blocks, requested_ring_buffer_size) if blocks else ((), 0)
+        resident_bytes = 0
+        total_bytes = int(fixed_bytes + ring_bytes)
+        if total_bytes > int(vram_budget_bytes):
+            raise ValueError(
+                f"cuSPARSE layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={vram_budget_bytes}"
+            )
+        if len(slot_plans) != requested_ring_buffer_size:
+            _warn_ring_mismatch(requested=requested_ring_buffer_size, allocated=len(slot_plans))
+    elif required_budget_for_full_residency <= int(vram_budget_bytes):
         for block in blocks:
             block.resident = True
         slot_plans = ()
@@ -799,6 +816,7 @@ def plan_cusparse_layout(
         device=device_id,
         stream_ptr=stream_ptr,
         stream_owner=stream_owner,
+        allow_residency=allow_residency,
         requested_ring_buffer_size=requested_ring_buffer_size,
         allocated_ring_buffer_size=len(slot_plans),
         vram_budget_bytes=int(vram_budget_bytes),

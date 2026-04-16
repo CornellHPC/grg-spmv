@@ -91,6 +91,7 @@ class TritonLayout:
     device: int
     stream_ptr: int
     stream_owner: object | None
+    allow_residency: bool
     requested_ring_buffer_size: int
     allocated_ring_buffer_size: int
     vram_budget_bytes: int
@@ -305,6 +306,7 @@ def plan_triton_layout(
     requirements: RuntimeRequirements,
     vram_budget_bytes: int,
     ring_buffer_size: int,
+    allow_residency: bool = True,
     device,
     stream,
 ) -> TritonLayout:
@@ -315,6 +317,7 @@ def plan_triton_layout(
     device_id = parse_cuda_device(device)
     stream_ptr, stream_owner = parse_cuda_stream(stream)
     requested_ring_buffer_size = int(ring_buffer_size)
+    allow_residency = bool(allow_residency)
     if stream_ptr != 0:
         stream_device = _cuda_stream_device(stream_ptr)
         if stream_device != device_id:
@@ -403,7 +406,22 @@ def plan_triton_layout(
     fixed_bytes = int(selector_bytes + xtx_bias_bytes + staging_bytes + workspace_up + workspace_down + scratch_bytes)
     resident_bytes_full = int(sum(block.nbytes for block in blocks))
     required_budget_for_full_residency = int(fixed_bytes + resident_bytes_full)
-    if required_budget_for_full_residency <= int(vram_budget_bytes):
+    if not allow_residency:
+        if blocks and requested_ring_buffer_size < 1:
+            raise ValueError("ring_buffer_size must be >= 1 when any Triton block is streamed")
+        for block in blocks:
+            block.resident = False
+        slot_plans, ring_bytes = _assign_slots(blocks, requested_ring_buffer_size) if blocks else ((), 0)
+        resident_bytes = 0
+        total_bytes = int(fixed_bytes + ring_bytes)
+        allocated_ring_buffer_size = len(slot_plans)
+        if total_bytes > int(vram_budget_bytes):
+            raise ValueError(
+                f"Triton layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={vram_budget_bytes}"
+            )
+        if allocated_ring_buffer_size != requested_ring_buffer_size:
+            _warn_ring_mismatch(requested=requested_ring_buffer_size, allocated=allocated_ring_buffer_size)
+    elif required_budget_for_full_residency <= int(vram_budget_bytes):
         for block in blocks:
             block.resident = True
         slot_plans = ()
@@ -484,6 +502,7 @@ def plan_triton_layout(
         device=device_id,
         stream_ptr=stream_ptr,
         stream_owner=stream_owner,
+        allow_residency=allow_residency,
         requested_ring_buffer_size=requested_ring_buffer_size,
         allocated_ring_buffer_size=len(slot_plans),
         vram_budget_bytes=int(vram_budget_bytes),

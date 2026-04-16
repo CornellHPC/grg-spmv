@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import numpy as np
 
+from scripts.bench.cli import add_common_args, parse_args
 from scripts.bench.run import benchmark_runtime
 
 
@@ -44,3 +46,21 @@ def test_benchmark_runtime_honors_warmup_and_trials(capsys):
     )
     assert calls == [("up", (3, 5))] * 7
     assert "mean_ms=" in capsys.readouterr().out
+
+
+def _parse_gpu_bench_args(argv: list[str]):
+    parser = argparse.ArgumentParser()
+    add_common_args(parser, gpu=True)
+    return parse_args(parser.parse_args(argv), gpu=True)
+
+
+def test_gpu_bench_parser_defaults_allow_residency():
+    args = _parse_gpu_bench_args(["--artifact", "/tmp/a.grg_spmv", "--vram-budget-bytes", "123"])
+    assert args.allow_residency is True
+
+
+def test_gpu_bench_parser_accepts_no_allow_residency():
+    args = _parse_gpu_bench_args(
+        ["--artifact", "/tmp/a.grg_spmv", "--vram-budget-bytes", "123", "--no-allow-residency"]
+    )
+    assert args.allow_residency is False

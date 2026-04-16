@@ -31,5 +31,6 @@ GPU-only flags:
 - `--stream`
 - `--ring-buffer-size`
 - `--vram-budget-bytes`
+- `--allow-residency` / `--no-allow-residency`
 
-`--ring-buffer-size 0` is valid only for fully resident GPU layouts.
+`--ring-buffer-size 0` is valid only for fully resident GPU layouts, so it cannot be combined with `--no-allow-residency`.
