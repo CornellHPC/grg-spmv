@@ -1,102 +1,78 @@
 Parent docs: [Project README](../../README.md)
 
-# Test Suite Guide
+# Tests
 
-## Layout
+## Run Modes
 
-- `test_memory_ledger.py`
-  - flat-allocation collector behavior and lifecycle invariants
-- `backends/`
-  - backend-specific behavior for MKL and cuSPARSE
-  - backend base/reference behavior
-  - backend memory-ledger integration behavior
-- `operator/`
-  - traversal correctness and numerical invariants
-  - public matmul option semantics
-  - artifact lifecycle and observability behaviors
-  - operator-owned memory-ledger snapshots
-- `bench/`
-  - benchmark helper behavior for summary tables, ledger rendering, and equivalence checks
-- `endtoend/`
-  - cross-method integration semantics for full GRG workflows
-- `data/`
-  - immutable fixture datasets used by end-to-end and missingness tests
+- Default suite:
+  - `uv run pytest -q pygrgl_spmv/tests --backend all`
+- Backend-focused runs:
+  - `uv run pytest -q pygrgl_spmv/tests --backend mkl`
+  - `uv run pytest -q pygrgl_spmv/tests --backend cusparse`
+  - `uv run pytest -q pygrgl_spmv/tests --backend triton`
+- Long streamed-GPU suite:
+  - `uv run pytest -q pygrgl_spmv/tests --backend all --stress`
 
-Implementation paths exercised by these tests:
+Default backend test files already include small-artifact streamed GPU mirrors for planner transitions, exactness, and overlap contracts.
+`--stress` is the long run. It keeps the large streamed Triton/cuSPARSE band cases and can take around 30 minutes.
+Triton autotuning is disabled in tests via monkeypatch so correctness runs stay fast.
+Streamed GPU tests skip only for insufficient host RAM while constructing the synthetic large artifacts; VRAM-budget failures are treated as correctness/accounting bugs.
 
-- GRG code lives under `pygrgl_spmv/grg/`
-- backend code lives under `pygrgl_spmv/backends/base.py`, `reference.py`, `mkl/`, `triton/`, and `cusparse/`
-- benchmark helper tests target the split modules in `scripts/bench/`
+## Shared Contracts
 
-Observability rule covered by the suite:
+The suite protects five things:
 
-- `log_level` controls logger verbosity
-- operator build logs follow normal Python/root logger inheritance
-- compile RSS checkpoints are emitted on the `pygrgl_spmv.grg.compile` logger
-- GPU setup RSS checkpoints are emitted on the backend logger
-- `instrumentation` is the opt-in flag for slower profiling/observability behavior
+- compile and artifact correctness
+- `BoundGRG` host-side API semantics
+- planner byte/layout correctness
+- entered-runtime ownership and lifecycle invariants
+- backend numerical parity and end-to-end explicit-matrix equivalence
 
-Memory-ledger rule covered by the suite:
+## File Map
 
-- `SpmvGRG.memory` owns one retained snapshot plus the latest call snapshot
-- backend call captures are fail-fast
-- backend call memory is lexical and exists only inside an active capture scope
-- validation failures before backend execution must not leave capture active
-- backend generic setup payload must be explicitly retained, borrowed, or dropped
-- benchmark memory tables are rendered from canonical `tree_rows()` output plus benchmark-local case metadata
-- GPU retained sparse memory is now split between CPU pinned host block
-  structure and shared CUDA slot buffers
-- GPU setup streams stored sparse blocks one at a time during host pinning
-- Triton runtime execution is singleton-only (`k == 1`)
+- `test_compile_selectors.py`
+  - Compile-time selector and stable-height block construction edge cases.
+- `test_sparse_utils.py`
+  - Canonical sparse helper invariants for structural dtype finalization and binary CSR rehydration.
+- `test_import_surface.py`
+  - CPU-safe package import surface under blocked optional GPU modules.
+- `test_bench_scripts.py`
+  - Minimal benchmark runner loop counts and reporting contract.
+- `runtime/test_convert.py`
+  - `convert()` path/object behavior, artifact writing, init-bias persistence, and down-edge-only compilation.
+- `runtime/test_artifacts.py`
+  - `.grg_spmv` scan/load/block iteration correctness and direct artifact consumption by runtimes.
+- `runtime/test_api.py`
+  - Entered-runtime lifecycle, `runtime.grgs`, concurrency guard, fixed owned-buffer reuse, and one-runtime multi-GRG usage.
+- `runtime/test_matmul_semantics.py`
+  - Shared `BoundGRG.matmul()` semantics on `ReferenceRuntime`: `by_individual`, init, miss, dtype, and fast-fail contract checks.
+- `runtime/test_emit_all_nodes.py`
+  - `emit_all_nodes=True` semantics, including init modes, dtype variants, stability, and miss rejection.
+- `runtime/test_traversal_correctness.py`
+  - Reference traversal correctness, stable node ordering, exact binary cases, dtype coverage, and zero/stability behavior.
+- `runtime/test_reference.py`
+  - Reference runtime parity and exact byte accounting for resident sparse blocks, selectors, and workspaces.
+- `runtime/test_mkl.py`
+  - MKL runtime parity, format/thread behavior, LP64 ABI checks, `float32` dispatch, shared-value budgeting, and optimize-flag semantics.
+- `runtime/test_plans.py`
+  - CUDA device/stream parsing plus backend plan/pair validation and storage-sharing rules.
+- `runtime/test_directional_layouts.py`
+  - One-sided planner/runtime behavior across backends, including disabled-direction failures, reduced owned bytes, and runtime `k <= max_k` coverage.
+- `runtime/test_triton.py`
+  - Triton planner/runtime specifics: multi-column dense execution, three-block streamed transition matrix, streamed exactness, overlap, scratch correctness, and CUDA device/stream execution behavior.
+- `runtime/test_cusparse.py`
+  - cuSPARSE planner/runtime specifics: dense-view plans, shared-ones modes, three-block streamed transition matrix, streamed exactness, overlap, slot compaction, scratch correctness, and CUDA device/stream execution behavior.
+- `runtime/_runtime_builders.py`
+  - Shared layout-builder helpers used by the runtime-era suite.
+- `runtime/_streaming_cases.py`
+  - Synthetic streamed-artifact builders, three-block streamed mode tables, and analytic expected-value helpers for GPU streamed tests.
+- `endtoend/conftest.py`
+  - Explicit genotype-matrix and missingness helper functions used by end-to-end tests.
+- `endtoend/test_matmul.py`
+  - End-to-end equivalence against `pygrgl.dot_product`, explicit genotype matrices, diploid semantics, init modes, and GRG splitting.
+- `endtoend/test_missing.py`
+  - End-to-end missingness counts, mean-imputation semantics, and shared-site missingness equality.
 
-## Markers
+## Maintenance Rule
 
-- `smoke`: core fast checks selected by `--smoke`
-- `stress`: literal machine-scale stress tests selected by `--stress`
-- `gpu`: requires CuPy/cuSPARSE
-- `mkl`: requires MKL runtime
-
-`--smoke` runs only tests marked `smoke`.
-Stress tests are skipped unless `--stress` is supplied.
-
-The giant streamed exact-output and ring-3 OOM contract tests live under `stress`.
-The many-small-block streamed-overlap tests are ordinary GPU tests.
-cuSPARSE large-stream stress keeps `nnz` below the CUDA 12.9 near-`2^31`
-cuSPARSE SpMM bug boundary and forces int64 slot families locally in the test.
-
-## CLI Options
-
-- `--backend {all,mkl,cusparse,triton}`
-- `--smoke`
-- `--stress`
-- `--grg <path>`: primary GRG used by traversal/backend tests
-- `--missing-grg <path>`: missingness GRG used by missingness tests
-
-## Recommended Commands
-
-Full suite on a small GRG:
-
-```bash
-uv run pytest -q pygrgl_spmv/tests --backend all
-```
-
-Smoke/core suite on a larger GRG:
-
-```bash
-uv run pytest -q pygrgl_spmv/tests --backend all --smoke \
-  --grg /path/to/large.grg
-```
-
-## Fixture Data
-
-- `msprime.example.igd.final.grg` (small primary fixture)
-- `test-200-samples.miss.igd` (source IGD for missingness fixture)
-- `test-200-samples.miss.final.grg` (missingness fixture)
-
-Regenerate missingness fixture:
-
-```bash
-uv run grg construct --force -p 10 -j 4 \
-  pygrgl_spmv/tests/data/test-200-samples.miss.igd \
-  -o pygrgl_spmv/tests/data/test-200-samples.miss.final.grg
-```
+If a new test file is added, add one line here describing the correctness contract it protects.

@@ -1,93 +1,291 @@
-"""MKL backend — Intel MKL-accelerated fused GRG matmul traversal."""
+"""MKL runtime and layout planner."""
 
 from __future__ import annotations
 
-import logging
-import os
+from contextlib import contextmanager
 from dataclasses import dataclass
-from time import perf_counter
+import math
+import mmap
+import os
+from pathlib import Path
 
 import numpy as np
 import scipy.sparse as sp
 
-from pygrgl_spmv.backends import (
-    BackendBase,
-    CallCapture,
-    BackendSetup,
+from pygrgl_spmv.backends.base import (
+    BudgetItem,
     iter_direction_level_pairs,
-    selector_rows_unique_from_csr_indptr,
-    warn_k_hint_mismatch,
+    materialize_sparse_block,
+    sparse_structure_lengths,
+    stored_block_shape,
 )
-from pygrgl_spmv.memory import alloc_field, child_field
-from pygrgl_spmv.backends.mkl.ffi import (
-    MklSparseHandle,
-    mkl_get_max_threads,
-    mkl_set_num_threads,
-)
-from pygrgl_spmv.backends.types import (
-    Direction,
-    InitMode,
-    StoredMatrix,
-    parse_init_mode,
-)
-from pygrgl_spmv.backends.mkl.plan import MklPlan, MklPlanPair
+import pygrgl_spmv.backends.mkl.ffi as mkl_ffi
+from pygrgl_spmv.backends.mkl.ffi import MklSparseHandle, _address_array, _mmap, _munmap, mkl_set_num_threads
+from pygrgl_spmv.backends.types import Direction, InitMode, StoredMatrix
+from pygrgl_spmv.grg import BoundGRG, RuntimeRequirements
+from pygrgl_spmv.grg.artifact import _load_grg_spmv_host, iter_artifact_blocks, scan_grg_spmv
+
+from .plan import MklPlan, MklPlanPair
+
+_HEADROOM_MAPS = 4096
+_MKL_EXPECTED_CALLS = 1000
+_PROT_NONE = 0
+_PROT_READ = int(mmap.PROT_READ)
+_PROT_WRITE = int(mmap.PROT_WRITE)
+_MAP_SHARED = int(mmap.MAP_SHARED)
+_MAP_PRIVATE = int(mmap.MAP_PRIVATE)
+_MAP_ANONYMOUS = int(getattr(mmap, "MAP_ANONYMOUS", 0x20))
+_MAP_FIXED = int(getattr(mmap, "MAP_FIXED", 0x10))
 
 
 @dataclass(frozen=True)
-class _MklBlockOp:
-    """One sparse block application in a level wavefront."""
+class _MklSharedValuesPlan:
+    mode: str
+    logical_bytes: int
+    physical_bytes: int
+    tile_bytes: int
 
+
+@dataclass(frozen=True)
+class _MklBlockPlan:
+    dst_level: int
+    src_level: int
+    stored_shape: tuple[int, int]
+    nnz: int
+    struct_bytes: int
+
+
+@dataclass(frozen=True)
+class _MklArtifactLayout:
+    path: Path
+    share_storage: bool
+    up_owner: Direction | None
+    down_owner: Direction | None
+    blocks_up: tuple[_MklBlockPlan, ...]
+    blocks_down: tuple[_MklBlockPlan, ...]
+
+
+@dataclass
+class MklLayout:
+    artifacts: tuple[_MklArtifactLayout, ...]
+    pair: MklPlanPair
+    dtype: np.dtype
+    struct_dtype: np.dtype
+    shared_values: _MklSharedValuesPlan
+    requirements: RuntimeRequirements
+    budget_items: tuple[BudgetItem, ...]
+    required_budget_for_full_residency: int
+    bytes_by_category: dict[str, int]
+    bytes_total: int
+
+
+@dataclass(frozen=True)
+class _MklOp:
     src_level: int
     handle: MklSparseHandle
     transpose: bool
-    nnz: int
-
-
-@dataclass(frozen=True)
-class _MklDirectionSpec:
-    direction: Direction
-    plan: MklPlan
-    thread_count: int
-    store_blocks: bool
-    ops_owner: Direction
-    stage_name: str
 
 
 @dataclass
-class MklCall:
-    node_values: np.ndarray | None = alloc_field(
-        label="node_state", kind="state", owner="backend", retention="call", activity="yes", default=None
-    )
-    miss_output: np.ndarray | None = alloc_field(
-        label="miss_output", kind="output", owner="backend", retention="call", activity="yes", default=None
-    )
-    level_ms: np.ndarray | None = alloc_field(
-        label="level_ms", kind="temporary", owner="backend", retention="call", activity="yes", default=None
-    )
+class _MklArtifact:
+    path: Path
+    state: object
+    up_grid: list[list[MklSparseHandle | None]]
+    down_grid: list[list[MklSparseHandle | None]]
+    up_ops: list[list[_MklOp]]
+    down_ops: list[list[_MklOp]]
 
 
 @dataclass
-class MklRetained:
-    blocks_up: list[sp.spmatrix] = alloc_field(
-        label="blocks_up", kind="sparse", owner="backend", retention="persistent", activity="always", default_factory=list
-    )
-    blocks_down: list[sp.spmatrix] = alloc_field(
-        label="blocks_down", kind="sparse", owner="backend", retention="persistent", activity="always", default_factory=list
-    )
-    selector_mut_rows: np.ndarray | None = alloc_field(
-        label="selector_mut", kind="selector", owner="backend", retention="persistent", activity="always", default=None
-    )
-    selector_mut_cols: np.ndarray | None = alloc_field(
-        label="selector_mut", kind="selector", owner="backend", retention="persistent", activity="always", default=None
-    )
-    selector_miss_rows: np.ndarray | None = alloc_field(
-        label="selector_miss", kind="selector", owner="backend", retention="persistent", activity="always", default=None
-    )
-    selector_miss_cols: np.ndarray | None = alloc_field(
-        label="selector_miss", kind="selector", owner="backend", retention="persistent", activity="always", default=None
-    )
-    xtx_host: np.ndarray | None = alloc_field(
-        label="xtx_host", kind="init", owner="backend", retention="persistent", activity="always", default=None
+class _SharedValues:
+    array: np.ndarray
+    logical_bytes: int
+    physical_bytes: int
+    mode: str
+    fd: int = -1
+    base_addr: int = 0
+    reserved_bytes: int = 0
+
+    def destroy(self) -> None:
+        self.array = np.empty(0, dtype=self.array.dtype)
+        if self.base_addr and self.reserved_bytes:
+            _munmap(self.base_addr, self.reserved_bytes)
+            self.base_addr = 0
+            self.reserved_bytes = 0
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+def _resolve_artifacts(artifacts) -> tuple[Path, ...]:
+    paths = tuple(Path(path) for path in artifacts)
+    if not paths:
+        raise ValueError("artifacts must be non-empty")
+    for path in paths:
+        if path.suffix != ".grg_spmv":
+            raise ValueError(f"planner expects .grg_spmv artifacts, got {path}")
+        if not path.exists():
+            raise FileNotFoundError(path)
+    return paths
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return int(((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment))
+
+
+def _page_size() -> int | None:
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, ValueError):
+        return None
+
+
+def _vm_max_map_count() -> int | None:
+    try:
+        with open("/proc/sys/vm/max_map_count", encoding="ascii") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _current_map_count() -> int | None:
+    try:
+        with open("/proc/self/maps", encoding="ascii") as handle:
+            return sum(1 for _ in handle)
+    except OSError:
+        return None
+
+
+def _shared_values_plan(dtype: np.dtype, max_nnz: int) -> _MklSharedValuesPlan:
+    logical_bytes = int(max(int(max_nnz), 0) * int(np.dtype(dtype).itemsize))
+    if logical_bytes == 0:
+        return _MklSharedValuesPlan(mode="disabled", logical_bytes=0, physical_bytes=0, tile_bytes=0)
+    if not hasattr(os, "memfd_create"):
+        return _MklSharedValuesPlan(mode="materialized", logical_bytes=logical_bytes, physical_bytes=logical_bytes, tile_bytes=0)
+    page_size = _page_size()
+    max_maps = _vm_max_map_count()
+    current_maps = _current_map_count()
+    if page_size is None or max_maps is None or current_maps is None:
+        return _MklSharedValuesPlan(mode="materialized", logical_bytes=logical_bytes, physical_bytes=logical_bytes, tile_bytes=0)
+    usable_maps = int(max_maps) - int(current_maps) - _HEADROOM_MAPS
+    if usable_maps < 2:
+        return _MklSharedValuesPlan(mode="materialized", logical_bytes=logical_bytes, physical_bytes=logical_bytes, tile_bytes=0)
+    alignment = math.lcm(int(page_size), int(np.dtype(dtype).itemsize))
+    tile_bytes = _round_up(max(alignment, math.ceil(logical_bytes / usable_maps)), alignment)
+    if tile_bytes >= logical_bytes:
+        return _MklSharedValuesPlan(mode="materialized", logical_bytes=logical_bytes, physical_bytes=logical_bytes, tile_bytes=0)
+    return _MklSharedValuesPlan(mode="alias", logical_bytes=logical_bytes, physical_bytes=tile_bytes, tile_bytes=tile_bytes)
+
+
+def _plan_blocks(scan, plan: MklPlan, *, struct_dtype: np.dtype) -> tuple[_MklBlockPlan, ...]:
+    blocks: list[_MklBlockPlan] = []
+    itemsize = int(np.dtype(struct_dtype).itemsize)
+    for block in scan.blocks:
+        nrows, ncols = stored_block_shape(block.shape[0], block.shape[1], store=plan.store)
+        len0, len1 = sparse_structure_lengths(plan.fmt, nrows=nrows, ncols=ncols, nnz=block.nnz)
+        blocks.append(
+            _MklBlockPlan(
+                dst_level=int(block.dst_level),
+                src_level=int(block.src_level),
+                stored_shape=(int(nrows), int(ncols)),
+                nnz=int(block.nnz),
+                struct_bytes=int((len0 + len1) * itemsize),
+            )
+        )
+    return tuple(blocks)
+
+
+def plan_mkl_layout(
+    *,
+    artifacts,
+    pair: MklPlanPair,
+    dtype,
+    requirements: RuntimeRequirements,
+) -> MklLayout:
+    dtype = np.dtype(dtype)
+    if dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
+        raise ValueError(f"MKL runtime supports only float32/float64, got {dtype}")
+    _, struct_dtype, _ = mkl_ffi._ensure_loaded()
+    paths = _resolve_artifacts(artifacts)
+    scans = tuple(scan_grg_spmv(path) for path in paths)
+    max_nodes = max(scan.num_nodes for scan in scans)
+    sparse_bytes = 0
+    selector_bytes = 0
+    max_owned_block_nnz = 0
+    planned: list[_MklArtifactLayout] = []
+    for path, scan in zip(paths, scans, strict=True):
+        share_storage = bool(pair.plan_up is not None and pair.plan_down is not None and pair.plan_up.can_share_storage_with(pair.plan_down))
+        blocks_up = () if pair.plan_up is None else _plan_blocks(scan, pair.plan_up, struct_dtype=struct_dtype)
+        blocks_down = () if pair.plan_down is None or share_storage else _plan_blocks(scan, pair.plan_down, struct_dtype=struct_dtype)
+        sparse_bytes += sum(block.struct_bytes for block in blocks_up)
+        sparse_bytes += sum(block.struct_bytes for block in blocks_down)
+        max_owned_block_nnz = max(max_owned_block_nnz, max((block.nnz for block in blocks_up), default=0))
+        max_owned_block_nnz = max(max_owned_block_nnz, max((block.nnz for block in blocks_down), default=0))
+        state = _load_grg_spmv_host(path, dtype)
+        selector_bytes += int(state.sel_mut.indices.nbytes + state.sel_mut.indptr.nbytes + state.sel_mut.data.nbytes)
+        selector_bytes += int(state.sel_miss.indices.nbytes + state.sel_miss.indptr.nbytes + state.sel_miss.data.nbytes)
+        planned.append(
+            _MklArtifactLayout(
+                path=path,
+                share_storage=share_storage,
+                up_owner=Direction.UP if pair.plan_up is not None else None,
+                down_owner=None if pair.plan_down is None else (Direction.UP if share_storage else Direction.DOWN),
+                blocks_up=blocks_up,
+                blocks_down=blocks_down,
+            )
+        )
+    workspace_up = 0 if pair.plan_up is None else int(max_nodes * int(requirements.max_k_up) * dtype.itemsize)
+    workspace_down = 0 if pair.plan_down is None else int(max_nodes * int(requirements.max_k_down) * dtype.itemsize)
+    shared_values = _shared_values_plan(dtype, max_owned_block_nnz)
+    bytes_by_category = {
+        "resident_sparse": int(sparse_bytes),
+        "selectors": int(selector_bytes),
+        "workspace_up": int(workspace_up),
+        "workspace_down": int(workspace_down),
+        "shared_values": int(shared_values.physical_bytes),
+    }
+    budget_items: list[BudgetItem] = [
+        BudgetItem(kind="fixed", name="selectors", nbytes=int(selector_bytes)),
+        BudgetItem(kind="fixed", name="workspace_up", nbytes=int(workspace_up)),
+        BudgetItem(kind="fixed", name="workspace_down", nbytes=int(workspace_down)),
+        BudgetItem(kind="fixed", name="shared_values", nbytes=int(shared_values.physical_bytes)),
+    ]
+    for artifact_index, artifact_layout in enumerate(planned):
+        for block in artifact_layout.blocks_up:
+            budget_items.append(
+                BudgetItem(
+                    kind="resident_sparse",
+                    name="resident_sparse",
+                    nbytes=int(block.struct_bytes),
+                    artifact_index=artifact_index,
+                    dst_level=int(block.dst_level),
+                    src_level=int(block.src_level),
+                )
+            )
+        for block in artifact_layout.blocks_down:
+            budget_items.append(
+                BudgetItem(
+                    kind="resident_sparse",
+                    name="resident_sparse",
+                    nbytes=int(block.struct_bytes),
+                    artifact_index=artifact_index,
+                    dst_level=int(block.dst_level),
+                    src_level=int(block.src_level),
+                )
+            )
+    budget_items = [item for item in budget_items if item.nbytes > 0]
+    bytes_total = int(sum(item.nbytes for item in budget_items))
+    return MklLayout(
+        artifacts=tuple(planned),
+        pair=pair,
+        dtype=dtype,
+        struct_dtype=np.dtype(struct_dtype),
+        shared_values=shared_values,
+        requirements=requirements,
+        budget_items=tuple(budget_items),
+        required_budget_for_full_residency=bytes_total,
+        bytes_by_category=bytes_by_category,
+        bytes_total=bytes_total,
     )
 
 
@@ -95,593 +293,347 @@ def _needs_transpose(direction: Direction, store: StoredMatrix) -> bool:
     return (direction == Direction.DOWN) != (store == StoredMatrix.T)
 
 
-def _level_call_stats(ops_by_level: list[list[object]]) -> tuple[np.ndarray, np.ndarray]:
-    calls = np.fromiter((len(ops) for ops in ops_by_level), dtype=np.int32, count=len(ops_by_level))
-    nnz = np.fromiter(
-        (sum(int(getattr(op, "nnz", 0)) for op in ops) for ops in ops_by_level),
-        dtype=np.int64,
-        count=len(ops_by_level),
-    )
-    return calls, nnz
+def _thread_count(plan: MklPlan | None) -> int | None:
+    if plan is None:
+        return None
+    count = os.cpu_count() or 1
+    return count if int(plan.n_threads) == 0 else int(plan.n_threads)
 
 
-def _log_level_timing(
-    logger: logging.Logger,
-    *,
-    direction: Direction,
-    calls: np.ndarray,
-    nnz: np.ndarray,
-    level_ms: np.ndarray,
-) -> None:
-    records = [
-        (h, float(level_ms[h]), int(calls[h]), int(nnz[h]))
-        for h in range(len(level_ms))
-        if int(calls[h]) > 0
-    ]
-    if not records:
-        return
+class MklRuntime:
+    """Runtime-owned MKL execution."""
 
-    total_ms = sum(ms for _, ms, _, _ in records)
-    logger.debug("wavefront[%s] levels=%d total=%.3fms", direction.value, len(records), total_ms)
-    for h, ms, call_count, nnz_count in records:
-        pct = (100.0 * ms / total_ms) if total_ms > 0.0 else 0.0
-        logger.debug(
-            "  level=%2d ms=%.3f (%5.1f%%) calls=%3d nnz=%d",
-            h,
-            ms,
-            pct,
-            call_count,
-            nnz_count,
-        )
+    def __init__(self, layout: MklLayout) -> None:
+        self.layout = layout
+        self.device = None
+        self.stream = None
+        self.stream_ptr = None
+        self._artifacts: tuple[_MklArtifact, ...] = ()
+        self._up_workspace: np.ndarray | None = None
+        self._down_workspace: np.ndarray | None = None
+        self._shared_values: _SharedValues | None = None
+        self._entered = False
+        self._active_call = False
+        self._grgs: tuple[BoundGRG, ...] = ()
+        self._threads_up = _thread_count(layout.pair.plan_up)
+        self._threads_down = _thread_count(layout.pair.plan_down)
 
+    @property
+    def grgs(self) -> tuple[BoundGRG, ...]:
+        if not self._entered:
+            raise RuntimeError("MklRuntime must be entered before accessing grgs")
+        return self._grgs
 
-class MklBackend(BackendBase):
-    """MKL-accelerated backend using the Inspector-Executor Sparse BLAS API.
-
-    Persistent MKL handles are created once in setup().
-    Each run_up()/run_down() call performs one fused traversal.
-    """
-
-    _SETUP_MEMORY_POLICY = {
-        "_A_blocks": "dropped",
-        "_sel_mut": "dropped",
-        "_sel_miss": "dropped",
-        "_level_offsets": "borrowed",
-        "_coalescence_counts": "borrowed",
-        "_xtx_host": "retained",
-    }
-
-    def __init__(
-        self,
-        *,
-        pair: MklPlanPair,
-        log_level: str = "WARNING",
-        instrumentation: bool = False,
-    ):
-        super().__init__(
-            plan_up=pair.plan_up,
-            plan_down=pair.plan_down,
-            log_level=log_level,
-            instrumentation=instrumentation,
-        )
-        self._n_threads_up = self._resolve_thread_count(self._plan_up)
-        self._n_threads_down = self._resolve_thread_count(self._plan_down)
-        configured_threads = [
-            count for count in (self._n_threads_up, self._n_threads_down) if count is not None
-        ]
-        self._n_threads_setup = max(configured_threads)
-        if self._plan_up is not None and self._fmt_up not in {"csr", "csc", "coo"}:
-            raise ValueError(f"Unsupported MKL fmt_up={self._fmt_up!r}; expected csr/csc/coo")
-        if self._plan_down is not None and self._fmt_down not in {"csr", "csc", "coo"}:
-            raise ValueError(f"Unsupported MKL fmt_down={self._fmt_down!r}; expected csr/csc/coo")
-        self._coalescence_counts = None
-        self._selector_rows: dict[str, np.ndarray] = {}
-        self._selector_cols: dict[str, np.ndarray] = {}
-        self._selector_row_unique: dict[str, bool] = {}
-        self._install_memory(retained=MklRetained(), call_type=MklCall)
-
-    def _resolve_thread_count(self, plan: MklPlan | None) -> int | None:
-        if plan is None:
-            return None
-        cpu_count = os.cpu_count()
-        if cpu_count is None:
-            cpu_count = 1
-        return cpu_count if plan.n_threads == 0 else int(plan.n_threads)
-
-    def _thread_count_for(self, direction: Direction) -> int:
-        count = self._n_threads_up if direction == Direction.UP else self._n_threads_down
-        if count is None:
-            raise ValueError(f"{direction.value.upper()} plan is not configured")
-        return count
-
-    def _direction_spec(self, direction: Direction) -> _MklDirectionSpec | None:
-        plan = self._plan_for(direction)
-        if plan is None:
-            return None
-        return _MklDirectionSpec(
-            direction=direction,
-            plan=plan,
-            thread_count=self._thread_count_for(direction),
-            store_blocks=self._store_blocks_up if direction == Direction.UP else self._store_blocks_down,
-            ops_owner=Direction.UP if (self._up_ops_owner if direction == Direction.UP else self._down_ops_owner) == "up" else Direction.DOWN,
-            stage_name="run_up" if direction == Direction.UP else "run_down",
-        )
-
-    def _require_direction_spec(self, direction: Direction) -> _MklDirectionSpec:
-        spec = self._direction_spec(direction)
-        if spec is None:
-            raise ValueError(f"{direction.value.upper()} plan is not configured")
-        return spec
-
-    def _grid_for(self, direction: Direction) -> list[list[MklSparseHandle | None]]:
-        return self._blocks_up if direction == Direction.UP else self._blocks_down
-
-    def _build_direction_handles(
-        self,
-        spec: _MklDirectionSpec,
-    ) -> list[list[MklSparseHandle | None]]:
-        num_levels = len(self._level_offsets) - 1
-        if not spec.store_blocks:
-            return [[] for _ in range(num_levels)]
-
-        rows = [
-            [None] * (dst_level if spec.direction == Direction.UP else max(num_levels - dst_level - 1, 0))
-            for dst_level in range(num_levels)
-        ]
-        for dst_level, src_level, row_index in iter_direction_level_pairs(spec.direction, num_levels):
-            stored = self._stored_matrix(spec.direction, dst_level=dst_level, src_level=src_level)
-            rows[dst_level][row_index] = (
-                None if stored.nnz == 0 else MklSparseHandle(stored, spec.plan.fmt.value.lower())
-            )
-        return rows
-
-    @staticmethod
-    def _handle_payload_arrays(handles: list[list[MklSparseHandle | None]]) -> list[np.ndarray]:
-        arrays: list[np.ndarray] = []
-        for row in handles:
-            for handle in row:
-                if handle is None:
-                    continue
-                mat = getattr(handle, "_mat", None)
-                if mat is None:
-                    continue
-                for attr in ("data", "indices", "indptr", "row", "col"):
-                    value = getattr(mat, attr, None)
-                    if value is not None:
-                        arrays.append(np.asarray(value))
-        return arrays
-
-    @staticmethod
-    def _handle_payload_matrices(handles: list[list[MklSparseHandle | None]]) -> list[sp.spmatrix]:
-        mats: list[sp.spmatrix] = []
-        for row in handles:
-            for handle in row:
-                if handle is None:
-                    continue
-                mat = getattr(handle, "_mat", None)
-                if mat is not None:
-                    mats.append(mat)
-        return mats
-
-    def _sync_retained_root(self) -> None:
-        retained = self._retained_mem
-        retained.blocks_up = self._handle_payload_matrices(self._blocks_up)
-        retained.blocks_down = self._handle_payload_matrices(self._blocks_down)
-        retained.selector_mut_rows = self._selector_rows.get("mut")
-        retained.selector_mut_cols = self._selector_cols.get("mut")
-        retained.selector_miss_rows = self._selector_rows.get("miss")
-        retained.selector_miss_cols = self._selector_cols.get("miss")
-        retained.xtx_host = self._xtx_host
-
-    def _build_direction_ops(self, spec: _MklDirectionSpec) -> list[list[_MklBlockOp]]:
-        num_levels = len(self._level_offsets) - 1
-        ops: list[list[_MklBlockOp]] = [[] for _ in range(num_levels)]
-        owner_direction = spec.ops_owner
-        owner_plan = self._plan_for(owner_direction)
-        if owner_plan is None:
-            raise RuntimeError(
-                f"{spec.direction.value.upper()} ops requested shared {owner_direction.value.upper()} storage without a configured plan"
-            )
-        owner_grid = self._grid_for(owner_direction)
-
-        for dst_level, src_level, row_index in iter_direction_level_pairs(spec.direction, num_levels):
-            owner_dst = dst_level if owner_direction == spec.direction else src_level
-            owner_src = src_level if owner_direction == spec.direction else dst_level
-            owner_row_index = owner_src if owner_direction == Direction.UP else owner_src - owner_dst - 1
-            handle = owner_grid[owner_dst][owner_row_index]
-            if handle is None:
-                continue
-            ops[dst_level].append(
-                _MklBlockOp(
-                    src_level=src_level,
-                    handle=handle,
-                    transpose=_needs_transpose(spec.direction, owner_plan.store),
-                    nnz=int(handle.nnz),
+    def __enter__(self) -> "MklRuntime":
+        dtype = np.dtype(self.layout.dtype)
+        states = tuple(_load_grg_spmv_host(artifact.path, dtype) for artifact in self.layout.artifacts)
+        max_nodes = max(state.num_nodes for state in states)
+        if self.layout.pair.plan_up is not None:
+            self._up_workspace = np.zeros((max_nodes, int(self.layout.requirements.max_k_up)), dtype=dtype)
+        if self.layout.pair.plan_down is not None:
+            self._down_workspace = np.zeros((max_nodes, int(self.layout.requirements.max_k_down)), dtype=dtype)
+        setup_threads = max(count for count in (self._threads_up, self._threads_down) if count is not None)
+        mkl_set_num_threads(int(setup_threads))
+        self._shared_values = self._materialize_shared_values()
+        artifacts: list[_MklArtifact] = []
+        try:
+            for artifact_layout, state in zip(self.layout.artifacts, states, strict=True):
+                h = len(state.level_offsets) - 1
+                up_grid = [[None] * dst_level for dst_level in range(h)]
+                down_grid = [[None] * dst_level for dst_level in range(h)]
+                for block in iter_artifact_blocks(artifact_layout.path):
+                    base = sp.csr_matrix(
+                        (
+                            np.ones(block.nnz, dtype=np.bool_),
+                            np.asarray(block.indices),
+                            np.asarray(block.indptr),
+                        ),
+                        shape=block.shape,
+                    )
+                    if self.layout.pair.plan_up is not None:
+                        matrix = materialize_sparse_block(
+                            base,
+                            store=self.layout.pair.plan_up.store,
+                            fmt=self.layout.pair.plan_up.fmt,
+                        )
+                        up_grid[block.dst_level][block.src_level] = self._build_handle(matrix, self.layout.pair.plan_up)
+                    if self.layout.pair.plan_down is not None and not artifact_layout.share_storage:
+                        matrix = materialize_sparse_block(
+                            base,
+                            store=self.layout.pair.plan_down.store,
+                            fmt=self.layout.pair.plan_down.fmt,
+                        )
+                        down_grid[block.dst_level][block.src_level] = self._build_handle(matrix, self.layout.pair.plan_down)
+                artifacts.append(
+                    _MklArtifact(
+                        path=artifact_layout.path,
+                        state=state,
+                        up_grid=up_grid,
+                        down_grid=down_grid,
+                        up_ops=self._build_ops(Direction.UP, state, up_grid, down_grid, artifact_layout),
+                        down_ops=self._build_ops(Direction.DOWN, state, up_grid, down_grid, artifact_layout),
+                    )
                 )
-            )
-        return ops
+            self._artifacts = tuple(artifacts)
+            self._configure_handle_hints()
+            self._grgs = tuple(BoundGRG(self, idx, artifact.state, artifact.path) for idx, artifact in enumerate(self._artifacts))
+            self._entered = True
+            return self
+        except Exception:
+            self._destroy_handles(artifacts)
+            if self._shared_values is not None:
+                self._shared_values.destroy()
+                self._shared_values = None
+            self._up_workspace = None
+            self._down_workspace = None
+            raise
 
-    def _build_selector_indices(self, selector: sp.csr_matrix) -> tuple[np.ndarray, np.ndarray, bool]:
-        coo = selector.tocoo()
-        rows = np.asarray(coo.row, dtype=np.int64)
-        cols = np.asarray(coo.col, dtype=np.int64)
-        row_unique = selector_rows_unique_from_csr_indptr(selector.indptr)
-        return rows, cols, row_unique
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._destroy_handles(self._artifacts)
+        self._artifacts = ()
+        self._up_workspace = None
+        self._down_workspace = None
+        if self._shared_values is not None:
+            self._shared_values.destroy()
+            self._shared_values = None
+        self._grgs = ()
+        self._entered = False
+        self._active_call = False
+
+    @contextmanager
+    def _call_scope(self):
+        if not self._entered:
+            raise RuntimeError("MklRuntime must be entered before matmul")
+        if self._active_call:
+            raise RuntimeError("concurrent runtime.grgs calls are not supported")
+        self._active_call = True
+        try:
+            yield
+        finally:
+            self._active_call = False
+
+    def _materialize_shared_values(self) -> _SharedValues:
+        plan = self.layout.shared_values
+        dtype = np.dtype(self.layout.dtype)
+        logical_len = int(plan.logical_bytes // int(dtype.itemsize))
+        if plan.mode == "disabled":
+            return _SharedValues(array=np.empty(0, dtype=dtype), logical_bytes=0, physical_bytes=0, mode="disabled")
+        if plan.mode == "materialized":
+            arr = np.ones(logical_len, dtype=dtype)
+            arr.setflags(write=False)
+            return _SharedValues(
+                array=arr,
+                logical_bytes=int(plan.logical_bytes),
+                physical_bytes=int(arr.nbytes),
+                mode="materialized",
+            )
+        if plan.mode != "alias":
+            raise ValueError(f"unknown shared-values mode {plan.mode!r}")
+        fd = os.memfd_create("pygrgl_spmv_mkl_shared_values", getattr(os, "MFD_CLOEXEC", 0))
+        tile_bytes = int(plan.tile_bytes)
+        reserved_bytes = _round_up(int(plan.logical_bytes), tile_bytes)
+        seed_addr = 0
+        base_addr = 0
+        try:
+            os.ftruncate(fd, tile_bytes)
+            seed_addr = _mmap(None, tile_bytes, _PROT_READ | _PROT_WRITE, _MAP_SHARED, fd, 0)
+            seed = _address_array(seed_addr, tile_bytes // int(dtype.itemsize), dtype)
+            seed.fill(1)
+            base_addr = _mmap(None, reserved_bytes, _PROT_NONE, _MAP_PRIVATE | _MAP_ANONYMOUS, -1, 0)
+            for offset in range(0, reserved_bytes, tile_bytes):
+                _mmap(base_addr + offset, tile_bytes, _PROT_READ, _MAP_SHARED | _MAP_FIXED, fd, 0)
+            _munmap(seed_addr, tile_bytes)
+            seed_addr = 0
+            arr = _address_array(base_addr, logical_len, dtype)
+            arr.setflags(write=False)
+            return _SharedValues(
+                array=arr,
+                logical_bytes=int(plan.logical_bytes),
+                physical_bytes=int(plan.physical_bytes),
+                mode="alias",
+                fd=fd,
+                base_addr=base_addr,
+                reserved_bytes=reserved_bytes,
+            )
+        except Exception:
+            if seed_addr:
+                _munmap(seed_addr, tile_bytes)
+            if base_addr:
+                _munmap(base_addr, reserved_bytes)
+            os.close(fd)
+            raise
+
+    def _build_handle(self, matrix, plan: MklPlan) -> MklSparseHandle | None:
+        if matrix.nnz == 0:
+            return None
+        assert self._shared_values is not None
+        matrix.data = self._shared_values.array[: int(matrix.nnz)]
+        return MklSparseHandle(matrix, plan.fmt.value.lower(), dtype=self.layout.dtype)
+
+    def _destroy_handles(self, artifacts) -> None:
+        seen: set[int] = set()
+        for artifact in artifacts:
+            for grid in (artifact.up_grid, artifact.down_grid):
+                for row in grid:
+                    for handle in row:
+                        if handle is None:
+                            continue
+                        key = id(handle)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        handle.destroy()
 
     def _configure_handle_hints(self) -> None:
         usage: dict[tuple[int, bool], dict[str, object]] = {}
-        for direction, ops_by_level, plan in (
-            (Direction.UP, self._ops_up, self._plan_up),
-            (Direction.DOWN, self._ops_down, self._plan_down),
-        ):
-            if plan is None:
-                continue
-            for ops in ops_by_level:
-                for op in ops:
-                    key = (id(op.handle), bool(op.transpose))
-                    entry = usage.get(key)
-                    if entry is None:
-                        entry = {
-                            "handle": op.handle,
-                            "transpose": bool(op.transpose),
-                            "k_hint": plan.k_hint,
-                        }
-                        usage[key] = entry
-                        continue
-                    existing_hint = entry["k_hint"]
-                    if existing_hint is None:
-                        entry["k_hint"] = plan.k_hint
-                    elif plan.k_hint is not None and int(existing_hint) != int(plan.k_hint):
-                        raise ValueError(
-                            "Incompatible MKL k_hint values share the same handle and transpose mode: "
-                            f"{direction.value} requested {plan.k_hint}, existing {existing_hint}"
-                        )
-        expected = 1000
+        for artifact in self._artifacts:
+            for ops_by_level, plan, max_k in (
+                (artifact.up_ops, self.layout.pair.plan_up, int(self.layout.requirements.max_k_up)),
+                (artifact.down_ops, self.layout.pair.plan_down, int(self.layout.requirements.max_k_down)),
+            ):
+                if plan is None or not plan.optimize:
+                    continue
+                for ops in ops_by_level:
+                    for op in ops:
+                        key = (id(op.handle), bool(op.transpose))
+                        entry = usage.get(key)
+                        if entry is None:
+                            usage[key] = {
+                                "handle": op.handle,
+                                "transpose": bool(op.transpose),
+                                "max_k": int(max_k),
+                            }
+                            continue
+                        entry["max_k"] = max(int(entry["max_k"]), int(max_k))
         for entry in usage.values():
             handle = entry["handle"]
             assert isinstance(handle, MklSparseHandle)
             transpose = bool(entry["transpose"])
-            handle.set_mv_hint(transpose=transpose, expected_calls=expected)
-            hint_k = entry["k_hint"]
-            if hint_k is not None and int(hint_k) > 1:
-                handle.set_mm_hint(int(hint_k), transpose=transpose, expected_calls=expected)
+            handle.set_mv_hint(transpose=transpose, expected_calls=_MKL_EXPECTED_CALLS)
+            max_k = int(entry["max_k"])
+            if max_k > 1:
+                handle.set_mm_hint(max_k, transpose=transpose, expected_calls=_MKL_EXPECTED_CALLS)
             handle.optimize()
 
-    def setup(
+    def _build_ops(
         self,
-        setup: BackendSetup,
-    ) -> None:
-        mkl_set_num_threads(self._n_threads_setup)
-        self._apply_setup_state(setup)
-        self._dtype = np.float64
-        self._xtx_host = None
-        if self._coalescence_counts is not None:
-            self._xtx_host = (2.0 * self._coalescence_counts.astype(self._dtype, copy=False)).reshape(self._num_nodes)
-
-        requested_dtype = np.dtype(setup.dtype)
-        if requested_dtype != np.float64:
-            self._logger.info(
-                "MKL backend uses float64 kernels; requested dtype %s is cast to float64 internally",
-                requested_dtype,
+        direction: Direction,
+        state,
+        up_grid: list[list[MklSparseHandle | None]],
+        down_grid: list[list[MklSparseHandle | None]],
+        artifact_layout: _MklArtifactLayout,
+    ) -> list[list[_MklOp]]:
+        h = len(state.level_offsets) - 1
+        ops: list[list[_MklOp]] = [[] for _ in range(h)]
+        if (direction == Direction.UP and self.layout.pair.plan_up is None) or (direction == Direction.DOWN and self.layout.pair.plan_down is None):
+            return ops
+        owner_direction = artifact_layout.up_owner if direction == Direction.UP else artifact_layout.down_owner
+        assert owner_direction is not None
+        owner_plan = self.layout.pair.plan_up if owner_direction == Direction.UP else self.layout.pair.plan_down
+        assert owner_plan is not None
+        owner_grid = up_grid if owner_direction == Direction.UP else down_grid
+        for dst_level, src_level, _row_index in iter_direction_level_pairs(direction, h):
+            owner_dst = dst_level if direction == Direction.UP else src_level
+            owner_src = src_level if direction == Direction.UP else dst_level
+            handle = owner_grid[owner_dst][owner_src]
+            if handle is None:
+                continue
+            ops[dst_level].append(
+                _MklOp(
+                    src_level=src_level,
+                    handle=handle,
+                    transpose=_needs_transpose(direction, owner_plan.store),
+                )
             )
+        return ops
 
-        num_levels = len(self._level_offsets) - 1
-        self._blocks_up = [[] for _ in range(num_levels)]
-        self._blocks_down = [[] for _ in range(num_levels)]
-        self._ops_up = [[] for _ in range(num_levels)]
-        self._ops_down = [[] for _ in range(num_levels)]
-
-        up_spec = self._direction_spec(Direction.UP)
-        down_spec = self._direction_spec(Direction.DOWN)
-        if up_spec is not None:
-            self._blocks_up = self._build_direction_handles(up_spec)
-            self._ops_up = self._build_direction_ops(up_spec)
-        if down_spec is not None:
-            self._blocks_down = self._build_direction_handles(down_spec)
-            self._ops_down = self._build_direction_ops(down_spec)
-
-        self._selector_rows = {}
-        self._selector_cols = {}
-        self._selector_row_unique = {}
-        self._selector_rows["mut"], self._selector_cols["mut"], self._selector_row_unique["mut"] = (
-            self._build_selector_indices(self._sel_mut)
-        )
-        self._selector_rows["miss"], self._selector_cols["miss"], self._selector_row_unique["miss"] = (
-            self._build_selector_indices(self._sel_miss)
-        )
-        self._configure_handle_hints()
-
-        self._logger.info(
-            (
-                "MklBackend setup: fmt_up=%s fmt_down=%s k_hint=%s n_threads=%s (actual=%d) "
-                "store_up=%s store_down=%s up_owner=%s down_owner=%s"
-            ),
-            "<unspecified>" if self._plan_up is None else self._fmt_up,
-            "<unspecified>" if self._plan_down is None else self._fmt_down,
-            (None if self._plan_up is None else self._plan_up.k_hint, None if self._plan_down is None else self._plan_down.k_hint),
-            (self._n_threads_up, self._n_threads_down),
-            mkl_get_max_threads(),
-            self._store_blocks_up,
-            self._store_blocks_down,
-            self._up_ops_owner,
-            self._down_ops_owner,
-        )
-        self._refresh_level_stats()
-        self._sync_retained_root()
-        self._bump_retained_epoch()
-        self._A_blocks = []
-        self._sel_mut = sp.csr_matrix((0, 0))
-        self._sel_miss = sp.csr_matrix((0, 0))
-        self._assert_setup_memory_contract()
-
-    def _refresh_level_stats(self) -> None:
-        self._ops_up_calls, self._ops_up_nnz = _level_call_stats(self._ops_up)
-        self._ops_down_calls, self._ops_down_nnz = _level_call_stats(self._ops_down)
-
-    def _log_wavefront_levels(self, direction: Direction, level_ms: np.ndarray) -> None:
-        match direction:
-            case Direction.UP:
-                calls = self._ops_up_calls
-                nnz = self._ops_up_nnz
-            case Direction.DOWN:
-                calls = self._ops_down_calls
-                nnz = self._ops_down_nnz
-            case _:
-                raise ValueError(f"Unknown direction for wavefront profile: {direction!r}")
-        _log_level_timing(self._logger, direction=direction, calls=calls, nnz=nnz, level_ms=level_ms)
-
-    def _propagate_direction_inplace(
+    def _run(
         self,
-        spec: _MklDirectionSpec,
-        node_values: np.ndarray,
-        level_ms: np.ndarray | None = None,
-    ) -> None:
-        off = self._level_offsets
-        k = node_values.shape[1]
-        ops_by_level = self._ops_up if spec.direction == Direction.UP else self._ops_down
-        level_iter = (
-            range(1, len(off) - 1)
-            if spec.direction == Direction.UP
-            else range(len(off) - 2, -1, -1)
-        )
-        for h in level_iter:
-            lo, hi = int(off[h]), int(off[h + 1])
-            t_level = perf_counter() if level_ms is not None else None
-            for op in ops_by_level[h]:
-                src_lo, src_hi = int(off[op.src_level]), int(off[op.src_level + 1])
-                if k == 1:
-                    op.handle.mv(
-                        node_values[src_lo:src_hi, 0],
-                        node_values[lo:hi, 0],
-                        alpha=1.0,
-                        beta=1.0,
-                        transpose=op.transpose,
-                    )
-                else:
-                    op.handle.mm(
-                        node_values[src_lo:src_hi],
-                        node_values[lo:hi],
-                        alpha=1.0,
-                        beta=1.0,
-                        transpose=op.transpose,
-                    )
-            if level_ms is not None and t_level is not None:
-                level_ms[h] = (perf_counter() - t_level) * 1000.0
-
-    def _selector_forward(self, node_values: np.ndarray, selector: str) -> np.ndarray:
-        rows = self._selector_rows[selector]
-        cols = self._selector_cols[selector]
-        unique_rows = self._selector_row_unique[selector]
-        k = node_values.shape[1]
-        out = np.zeros((self._num_mutations, k), dtype=self._dtype)
-        if rows.size == 0:
-            return out
-        values = node_values[cols]
-        if unique_rows:
-            out[rows] = values
-        else:
-            np.add.at(out, rows, values)
-        return out
-
-    def _selector_backward_add(self, source: np.ndarray, selector: str, node_values: np.ndarray) -> None:
-        rows = self._selector_rows[selector]
-        cols = self._selector_cols[selector]
-        if rows.size == 0:
-            return
-        np.add.at(node_values, cols, source[rows])
-
-    def _run_direction(
-        self,
-        spec: _MklDirectionSpec,
+        artifact_index: int,
+        direction: Direction,
         primary: np.ndarray,
         *,
         miss: np.ndarray | None,
         init_mode: InitMode,
-        init: np.ndarray | None,
+        init_payload: np.ndarray | None,
         need_miss_output: bool,
         emit_all_nodes: bool,
-    ) -> tuple[np.ndarray, np.ndarray | None] | np.ndarray:
-        mkl_set_num_threads(spec.thread_count)
-        x, k = self._normalize_primary_input(direction=spec.direction, primary=primary)
-        if spec.plan.k_hint is not None and int(k) != int(spec.plan.k_hint):
-            warn_k_hint_mismatch(
-                backend="MKL",
-                direction=spec.direction,
-                runtime_k=k,
-                k_hint=int(spec.plan.k_hint),
+    ):
+        artifact = self._artifacts[int(artifact_index)]
+        state = artifact.state
+        workspace = self._up_workspace if direction == Direction.UP else self._down_workspace
+        if workspace is None:
+            raise ValueError(f"{direction.value.upper()} plan is not configured")
+        thread_count = self._threads_up if direction == Direction.UP else self._threads_down
+        assert thread_count is not None
+        mkl_set_num_threads(int(thread_count))
+        x = np.asarray(primary, dtype=self.layout.dtype, order="C")
+        k = int(x.shape[1])
+        node_values = workspace[: state.num_nodes, :k]
+        node_values.fill(0)
+        if init_mode == InitMode.XTX:
+            if state.coalescence_counts is None:
+                raise ValueError("init_mode=xtx requires GRG coalescence counts")
+            node_values += (2.0 * state.coalescence_counts.astype(self.layout.dtype, copy=False))[:, None]
+        elif init_mode == InitMode.VECTOR:
+            assert init_payload is not None
+            node_values += init_payload[None, :]
+        elif init_mode == InitMode.MATRIX:
+            assert init_payload is not None
+            node_values += init_payload
+
+        use_mv = k == 1 and workspace.shape[1] == 1
+        if direction == Direction.UP:
+            node_values[: state.num_samples] += x
+            ops = artifact.up_ops
+            for dst_level in range(1, len(state.level_offsets) - 1):
+                lo = int(state.level_offsets[dst_level])
+                hi = int(state.level_offsets[dst_level + 1])
+                dst = node_values[lo:hi]
+                for op in ops[dst_level]:
+                    src_lo = int(state.level_offsets[op.src_level])
+                    src_hi = int(state.level_offsets[op.src_level + 1])
+                    src = node_values[src_lo:src_hi]
+                    if use_mv:
+                        op.handle.mv(src[:, 0], dst[:, 0], alpha=1.0, beta=1.0, transpose=op.transpose)
+                    else:
+                        op.handle.mm(src, dst, alpha=1.0, beta=1.0, transpose=op.transpose)
+            if emit_all_nodes:
+                return np.array(node_values, copy=True)
+            out_mut = (
+                np.asarray(state.sel_mut @ node_values, dtype=self.layout.dtype)
+                if state.sel_mut.nnz
+                else np.zeros((state.num_mutations, k), dtype=self.layout.dtype)
             )
-
-        miss_arr = self._normalize_down_miss_input(miss, k=k) if spec.direction == Direction.DOWN else None
-
-        mode = parse_init_mode(init_mode)
-        init_payload = self._validate_init(mode, init, k)
-
-        node_values = np.zeros((self._num_nodes, k), dtype=self._dtype)
-        self._apply_init_inplace(node_values, mode, init_payload)
-
-        if spec.direction == Direction.UP:
-            np.add(node_values[: self._num_samples], x, out=node_values[: self._num_samples])
-        else:
-            self._selector_backward_add(x, "mut", node_values)
-            if miss_arr is not None:
-                self._selector_backward_add(miss_arr, "miss", node_values)
-
-        track_wave = self._instrumentation and self._logger.isEnabledFor(logging.DEBUG)
-        level_ms = np.zeros(len(self._level_offsets) - 1, dtype=np.float64) if track_wave else None
-        self._propagate_direction_inplace(spec, node_values, level_ms=level_ms)
-
-        if emit_all_nodes:
-            if track_wave and level_ms is not None:
-                self._log_wavefront_levels(spec.direction, level_ms)
-            if self._capture_active:
-                call = self._call_mem
-                assert isinstance(call, MklCall)
-                call.node_values = node_values
-                call.miss_output = None
-                call.level_ms = level_ms
-                self._publish_call_capture(
-                    CallCapture(
-                        nonce=self._capture_nonce,
-                        direction=spec.direction.value,
-                        runtime_k=k,
-                        active_alloc_keys=frozenset(),
-                        meta={
-                            "emit_all_nodes": True,
-                            "mode": "instrumented" if self._instrumentation else "n/a",
-                        },
-                    )
-                )
-            return node_values
-
-        if spec.direction == Direction.UP:
-            out_mut = self._selector_forward(node_values, "mut")
-
             out_miss = None
             if need_miss_output:
-                out_miss = self._selector_forward(node_values, "miss")
-
-            if track_wave and level_ms is not None:
-                self._log_wavefront_levels(spec.direction, level_ms)
-            if self._capture_active:
-                call = self._call_mem
-                assert isinstance(call, MklCall)
-                call.node_values = node_values
-                call.miss_output = out_miss
-                call.level_ms = level_ms
-                self._publish_call_capture(
-                    CallCapture(
-                        nonce=self._capture_nonce,
-                        direction=spec.direction.value,
-                        runtime_k=k,
-                        active_alloc_keys=frozenset(),
-                        meta={
-                            "need_miss_output": bool(need_miss_output),
-                            "mode": "instrumented" if self._instrumentation else "n/a",
-                        },
-                    )
+                out_miss = (
+                    np.asarray(state.sel_miss @ node_values, dtype=self.layout.dtype)
+                    if state.sel_miss.nnz
+                    else np.zeros((state.num_mutations, k), dtype=self.layout.dtype)
                 )
             return out_mut, out_miss
 
-        out = node_values[: self._num_samples]
+        if state.sel_mut.nnz:
+            node_values += state.sel_mut.T @ x
+        if miss is not None and state.sel_miss.nnz:
+            node_values += state.sel_miss.T @ np.asarray(miss, dtype=self.layout.dtype, order="C")
+        ops = artifact.down_ops
+        for dst_level in range(len(state.level_offsets) - 2, -1, -1):
+            lo = int(state.level_offsets[dst_level])
+            hi = int(state.level_offsets[dst_level + 1])
+            dst = node_values[lo:hi]
+            for op in ops[dst_level]:
+                src_lo = int(state.level_offsets[op.src_level])
+                src_hi = int(state.level_offsets[op.src_level + 1])
+                src = node_values[src_lo:src_hi]
+                if use_mv:
+                    op.handle.mv(src[:, 0], dst[:, 0], alpha=1.0, beta=1.0, transpose=op.transpose)
+                else:
+                    op.handle.mm(src, dst, alpha=1.0, beta=1.0, transpose=op.transpose)
+        if emit_all_nodes:
+            return np.array(node_values, copy=True)
+        return np.array(node_values[: state.num_samples], copy=True)
 
-        if track_wave and level_ms is not None:
-            self._log_wavefront_levels(spec.direction, level_ms)
-        if self._capture_active:
-            call = self._call_mem
-            assert isinstance(call, MklCall)
-            call.node_values = node_values
-            call.miss_output = None
-            call.level_ms = level_ms
-            self._publish_call_capture(
-                CallCapture(
-                    nonce=self._capture_nonce,
-                    direction=spec.direction.value,
-                    runtime_k=k,
-                    active_alloc_keys=frozenset(),
-                    meta={
-                        "has_miss_input": bool(miss_arr is not None),
-                        "mode": "instrumented" if self._instrumentation else "n/a",
-                    },
-                )
-            )
-        return out
 
-    def run_up(
-        self,
-        primary: np.ndarray,
-        *,
-        init_mode: InitMode,
-        init: np.ndarray | None = None,
-        need_miss_output: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray | None]:
-        spec = self._require_direction_spec(Direction.UP)
-        out_mut, out_miss = self._run_direction(
-            spec,
-            primary,
-            miss=None,
-            init_mode=init_mode,
-            init=init,
-            need_miss_output=need_miss_output,
-            emit_all_nodes=False,
-        )
-        return out_mut, out_miss
-
-    def run_down(
-        self,
-        primary: np.ndarray,
-        *,
-        miss: np.ndarray | None = None,
-        init_mode: InitMode,
-        init: np.ndarray | None = None,
-    ) -> np.ndarray:
-        spec = self._require_direction_spec(Direction.DOWN)
-        out = self._run_direction(
-            spec,
-            primary,
-            miss=miss,
-            init_mode=init_mode,
-            init=init,
-            need_miss_output=False,
-            emit_all_nodes=False,
-        )
-        return out
-
-    def run_up_nodes(
-        self,
-        primary: np.ndarray,
-        *,
-        init_mode: InitMode,
-        init: np.ndarray | None = None,
-    ) -> np.ndarray:
-        spec = self._require_direction_spec(Direction.UP)
-        out = self._run_direction(
-            spec,
-            primary,
-            miss=None,
-            init_mode=init_mode,
-            init=init,
-            need_miss_output=False,
-            emit_all_nodes=True,
-        )
-        return out
-
-    def run_down_nodes(
-        self,
-        primary: np.ndarray,
-        *,
-        init_mode: InitMode,
-        init: np.ndarray | None = None,
-    ) -> np.ndarray:
-        spec = self._require_direction_spec(Direction.DOWN)
-        out = self._run_direction(
-            spec,
-            primary,
-            miss=None,
-            init_mode=init_mode,
-            init=init,
-            need_miss_output=False,
-            emit_all_nodes=True,
-        )
-        return out
-
-__all__ = ["MklBackend", "MklPlan"]
+__all__ = ["MklLayout", "MklRuntime", "plan_mkl_layout"]

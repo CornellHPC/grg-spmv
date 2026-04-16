@@ -1,8 +1,6 @@
-"""Triton backend public exports."""
+"""Triton runtime exports."""
 
-from __future__ import annotations
-
-from pygrgl_spmv.backends.triton.backend import TritonBackend
+from pygrgl_spmv.backends.triton.backend import TritonLayout, TritonRuntime, plan_triton_layout
 from pygrgl_spmv.backends.triton.plan import TritonPlan, TritonPlanPair
 
-__all__ = ["TritonBackend", "TritonPlan", "TritonPlanPair"]
+__all__ = ["TritonLayout", "TritonPlan", "TritonPlanPair", "TritonRuntime", "plan_triton_layout"]

@@ -1,26 +1,15 @@
-"""cuSPARSE backend public exports."""
+"""cuSPARSE runtime exports."""
 
-from . import plan as plan
-cusparse_plan = plan
-from .backend import CusparseBackend, is_valid_combo
-from .plan import (
-    CusparsePlan,
-    CusparsePlanPair,
-    DenseOrder,
-    Operation,
-    SparseFormat,
-    SpMMAlgorithm,
-)
+from pygrgl_spmv.backends.cusparse.backend import CusparseLayout, CusparseRuntime, plan_cusparse_layout
+from pygrgl_spmv.backends.cusparse.plan import CusparsePlan, CusparsePlanPair, DenseOrder, Operation, SpMMAlgorithm
 
 __all__ = [
-    "CusparseBackend",
+    "CusparseLayout",
     "CusparsePlan",
     "CusparsePlanPair",
+    "CusparseRuntime",
     "DenseOrder",
     "Operation",
-    "SparseFormat",
     "SpMMAlgorithm",
-    "cusparse_plan",
-    "plan",
-    "is_valid_combo",
+    "plan_cusparse_layout",
 ]

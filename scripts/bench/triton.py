@@ -1,64 +1,40 @@
-"""Benchmark SpmvGRG matmul for the Triton backend."""
+"""Benchmark the canonical Triton runtime configuration."""
 
 from __future__ import annotations
 
 import argparse
 
-from .cli import (
-    add_common_bench_args,
-    configure_logging,
-    parse_common_bench_args,
-)
-from .configs import expand_triton_configs, format_dry_run_line
-from .run import run_benchmark_suite
+from pygrgl_spmv.backends.triton import TritonPlan, TritonPlanPair, TritonRuntime, plan_triton_layout
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark SpmvGRG matmul for the Triton backend")
-    add_common_bench_args(parser)
-    parser.add_argument("--device", type=int, required=True, help="CUDA device ordinal")
-    return parser.parse_args()
+from .cli import add_common_args, parse_args
+from .run import baseline_requirements, benchmark_runtime
 
 
 def main() -> None:
-    args = parse_args()
-    configure_logging(str(args.log_level))
-
-    try:
-        common = parse_common_bench_args(args)
-    except ValueError as exc:
-        raise SystemExit(f"Argument error: {exc}") from exc
-
-    configs = expand_triton_configs(
-        common.plan_pair_specs,
-        int(args.device),
-        common.ring_buffer_size,
-        common.log_level,
-        common.instrumentation,
+    parser = argparse.ArgumentParser(description="Benchmark TritonRuntime")
+    add_common_args(parser, gpu=True)
+    args = parse_args(parser.parse_args(), gpu=True)
+    layout = plan_triton_layout(
+        artifacts=[args.artifact],
+        pair=TritonPlanPair(
+            plan_up=TritonPlan(store="N", fmt="CSR", scratch="none"),
+            plan_down=TritonPlan(store="T", fmt="CSC", scratch="none"),
+        ),
+        dtype=args.dtype,
+        requirements=baseline_requirements(direction=args.direction, k=args.k),
+        vram_budget_bytes=args.vram_budget_bytes,
+        ring_buffer_size=args.ring_buffer_size,
+        device=args.device,
+        stream=args.stream,
     )
-    if common.dry_run:
-        for entry in configs:
-            print(
-                format_dry_run_line(
-                    entry,
-                    common.ks,
-                    common.options,
-                    dtype=common.dtype,
-                )
-            )
-        return
-
-    run_benchmark_suite(
-        grg_path=common.grg,
-        configs=configs,
-        ks=common.ks,
-        options=common.options,
-        n_trials=common.n_trials,
-        n_warmup=common.n_warmup,
-        dtype=common.dtype,
-        output_atol=common.output_atol,
-        output_rtol=common.output_rtol,
-        skip_note=common.skip_note,
+    benchmark_runtime(
+        runtime_cls=TritonRuntime,
+        layout=layout,
+        direction=args.direction,
+        k=args.k,
+        dtype=args.dtype,
+        warmup=args.warmup,
+        trials=args.trials,
     )
 
 

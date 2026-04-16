@@ -1,13 +1,11 @@
-"""Plan type for the Triton backend."""
+"""Concrete Triton plan types."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Mapping
 
-from pygrgl_spmv.backends import _parse_optional_k_hint
 from pygrgl_spmv.backends.types import (
-    Direction,
     SparseFormat,
     StoredMatrix,
     parse_sparse_format,
@@ -26,7 +24,7 @@ def _normalize_scratch(value: object) -> str:
         return "all"
     parts = token.split("|")
     if any(part == "" for part in parts):
-        raise ValueError(f"Invalid Triton scratch specification: {value!r}")
+        raise ValueError(f"invalid Triton scratch specification: {value!r}")
     levels: list[int] = []
     seen: set[int] = set()
     for part in parts:
@@ -34,7 +32,7 @@ def _normalize_scratch(value: object) -> str:
         if level < 0:
             raise ValueError(f"Triton scratch levels must be non-negative, got {value!r}")
         if level in seen:
-            raise ValueError(f"Duplicate Triton scratch level {level} in {value!r}")
+            raise ValueError(f"duplicate Triton scratch level {level} in {value!r}")
         seen.add(level)
         levels.append(level)
     return "|".join(str(level) for level in sorted(levels))
@@ -42,32 +40,26 @@ def _normalize_scratch(value: object) -> str:
 
 @dataclass(frozen=True)
 class TritonPlan:
-    """Explicit Triton traversal/storage plan for singleton-vector execution."""
-
     store: StoredMatrix
     fmt: SparseFormat
-    k_hint: int | None
     scratch: str = "none"
 
     def __post_init__(self) -> None:
-        parsed_k = _parse_optional_k_hint(self.k_hint)
-        if parsed_k not in {None, 1}:
-            raise ValueError(f"Triton backend requires k_hint=none or 1, got {self.k_hint!r}")
+        object.__setattr__(self, "store", parse_store(self.store))
+        object.__setattr__(self, "fmt", parse_sparse_format(self.fmt))
         if self.fmt not in _ALLOWED_FORMATS:
             raise ValueError(f"Triton backend supports only CSR/CSC formats, got {self.fmt.value}")
-        object.__setattr__(self, "k_hint", None if parsed_k is None else int(parsed_k))
         object.__setattr__(self, "scratch", _normalize_scratch(self.scratch))
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "TritonPlan":
-        allowed_keys = {"store", "fmt", "k_hint", "scratch"}
-        extra = sorted(set(value) - allowed_keys)
+        allowed = {"store", "fmt", "scratch"}
+        extra = sorted(set(value) - allowed)
         if extra:
-            raise ValueError(f"Unknown TritonPlan field(s): {extra}")
+            raise ValueError(f"unknown TritonPlan field(s): {extra}")
         return cls(
             store=parse_store(value["store"]),
             fmt=parse_sparse_format(value["fmt"]),
-            k_hint=value["k_hint"],
             scratch=value.get("scratch", "none"),
         )
 
@@ -76,9 +68,6 @@ class TritonPlan:
             return self.fmt == other.fmt
         return transpose_compatible_format(self.fmt) == other.fmt
 
-    def __str__(self) -> str:
-        k_hint = "none" if self.k_hint is None else str(self.k_hint)
-        return f"[k_hint={k_hint},store={self.store.value},fmt={self.fmt.value},scratch={self.scratch}]"
 
 @dataclass(frozen=True)
 class TritonPlanPair:
@@ -87,7 +76,7 @@ class TritonPlanPair:
 
     def __post_init__(self) -> None:
         if self.plan_up is None and self.plan_down is None:
-            raise ValueError("At least one of plan_up/plan_down must be provided")
+            raise ValueError("at least one of plan_up/plan_down must be provided")
         if self.plan_up is not None and self.plan_up.store != StoredMatrix.N:
             raise ValueError(f"Triton plan_up expects store=N, got {self.plan_up.store.value}")
         if self.plan_down is not None and self.plan_down.store != StoredMatrix.T:
@@ -103,9 +92,6 @@ class TritonPlanPair:
             plan_up=None if plan_up is None else TritonPlan.from_dict(plan_up),
             plan_down=None if plan_down is None else TritonPlan.from_dict(plan_down),
         )
-
-    def direction_enabled(self, direction: Direction) -> bool:
-        return (self.plan_up is not None) if direction == Direction.UP else (self.plan_down is not None)
 
 
 __all__ = ["TritonPlan", "TritonPlanPair"]

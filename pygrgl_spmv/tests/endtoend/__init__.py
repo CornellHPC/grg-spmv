@@ -1,1 +1,1 @@
-"""End-to-end tests for immutable-GRG matmul behavior."""
+"""End-to-end runtime tests."""

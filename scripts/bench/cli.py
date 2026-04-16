@@ -1,201 +1,58 @@
-"""CLI parsing and common benchmark arguments."""
+"""Minimal CLI helpers for runtime-centric benchmarks."""
 
 from __future__ import annotations
 
 import argparse
-import logging
 from dataclasses import dataclass
 
 import numpy as np
 
-from scripts.bench.configs import PlanPairSpec, parse_plan_pair_literal
-
-DTYPE = np.float64
-DEFAULT_MATMUL_OPTIONS = (
-    "baseline",
-    "by_individual",
-    "init_xtx",
-    "init_vector",
-    "init_matrix",
-    "miss",
-)
-LOGGER = logging.getLogger("scripts.bench")
-OUTPUT_ATOL = 1e-8
-OUTPUT_RTOL = 1e-5
-OUTPUT_ATOL_FLOAT32 = 1e-2
-OUTPUT_RTOL_FLOAT32 = 1e-1
-DEFAULT_GRG_PATH = "/pscratch/sd/q/qys/grg/simulation-mutation-200m.trees.v4.igd.final.grg"
-LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
-
 
 @dataclass(frozen=True)
-class CommonBenchArgs:
-    grg: str
-    ks: list[int]
-    plan_pair_specs: list[PlanPairSpec]
-    ring_buffer_size: int
-    options: list[str]
-    n_trials: int
-    n_warmup: int
+class BenchArgs:
+    artifact: str
+    direction: str
+    k: int
+    trials: int
+    warmup: int
     dtype: np.dtype
-    output_atol: float
-    output_rtol: float
-    log_level: str
-    instrumentation: bool
-    dry_run: bool
-    skip_note: bool
+    device: int
+    stream: int
+    ring_buffer_size: int
+    vram_budget_bytes: int
 
 
-def add_common_bench_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--grg", default=DEFAULT_GRG_PATH)
-    parser.add_argument(
-        "--ks",
-        type=str,
-        default="32",
-        help="Comma-separated runtime-k values (input rows); e.g. 1,4,16",
-    )
-    parser.add_argument("--trials", type=int, default=10, help="Number of timed trials")
-    parser.add_argument("--warmup", type=int, default=3, help="Number of warmup runs")
-    parser.add_argument("--ring-buffer-size", type=int, default=2, help="GPU sparse slot ring size")
-    parser.add_argument(
-        "--plan-up-down",
-        action="append",
-        type=parse_plan_pair_literal,
-        default=None,
-        help="Repeated explicit plan-pair literal [..][..]",
-    )
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="WARNING",
-        choices=list(LOG_LEVEL_CHOICES),
-        help="Root log level for benchmark, operator, and backend loggers",
-    )
-    parser.add_argument(
-        "--instrumentation",
-        action="store_true",
-        help="Enable profiling/instrumentation mode even when it reduces absolute performance",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default=np.dtype(DTYPE).name,
-        choices=["float32", "float64"],
-        help="Input/output floating dtype",
-    )
-    parser.add_argument(
-        "--matmul-options",
-        type=str,
-        default="all",
-        help="Comma-separated: baseline,by_individual,init_xtx,init_vector,init_matrix,miss,all",
-    )
-    parser.add_argument("--dry-run", action="store_true", help="Print expanded backend configs and exit")
-    parser.add_argument("--skip-note", action="store_true", help="Hide the Note column in the summary table")
+def add_common_args(parser: argparse.ArgumentParser, *, gpu: bool) -> None:
+    parser.add_argument("--artifact", required=True, help="Path to a .grg_spmv artifact")
+    parser.add_argument("--direction", choices=["up", "down"], default="up")
+    parser.add_argument("--k", type=int, default=1)
+    parser.add_argument("--trials", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--dtype", choices=["float32", "float64"], default="float64")
+    if gpu:
+        parser.add_argument("--device", type=int, default=0)
+        parser.add_argument("--stream", type=int, default=0)
+        parser.add_argument("--ring-buffer-size", type=int, default=2)
+        parser.add_argument("--vram-budget-bytes", type=int, required=True)
 
 
-def parse_csv_ints(raw: str, field_name: str) -> list[int]:
-    values: list[int] = []
-    for token in raw.split(","):
-        tok = token.strip()
-        if not tok:
-            continue
-        value = int(tok)
-        if value < 0:
-            raise ValueError(f"{field_name} must contain non-negative integers, got {value}")
-        values.append(value)
-    if not values:
-        raise ValueError(f"{field_name} must contain at least one value")
-    return values
-
-
-def parse_dtype(raw: str) -> np.dtype:
-    token = str(raw).strip().lower()
-    if token == "float32":
-        return np.dtype(np.float32)
-    if token == "float64":
-        return np.dtype(np.float64)
-    raise ValueError(f"--dtype must be one of float32,float64; got {raw!r}")
-
-
-def tolerances_for_dtype(dtype: np.dtype) -> tuple[float, float]:
-    dt = np.dtype(dtype)
-    if dt == np.float32:
-        return OUTPUT_ATOL_FLOAT32, OUTPUT_RTOL_FLOAT32
-    if dt == np.float64:
-        return OUTPUT_ATOL, OUTPUT_RTOL
-    raise ValueError(f"Unsupported benchmark dtype for tolerance: {dt}")
-
-
-def parse_matmul_options(raw: str) -> list[str]:
-    tokens = [tok.strip().lower() for tok in raw.split(",") if tok.strip()]
-    if not tokens or "all" in tokens:
-        return list(DEFAULT_MATMUL_OPTIONS)
-    valid = set(DEFAULT_MATMUL_OPTIONS)
-    unknown = sorted(tok for tok in tokens if tok not in valid)
-    if unknown:
-        raise ValueError(f"Unknown matmul option(s): {', '.join(unknown)}")
-    return tokens
-
-
-def parse_common_bench_args(args: argparse.Namespace) -> CommonBenchArgs:
-    ks = parse_csv_ints(args.ks, "--ks")
-    plan_pair_specs = list(args.plan_up_down or [])
-    if not plan_pair_specs:
-        raise ValueError("--plan-up-down must be provided at least once")
-    if int(args.ring_buffer_size) < 1:
-        raise ValueError("--ring-buffer-size must be >= 1")
-    options = parse_matmul_options(args.matmul_options)
-    dtype = parse_dtype(args.dtype)
-    output_atol, output_rtol = tolerances_for_dtype(dtype)
-    return CommonBenchArgs(
-        grg=str(args.grg),
-        ks=ks,
-        plan_pair_specs=plan_pair_specs,
-        ring_buffer_size=int(args.ring_buffer_size),
-        options=options,
-        n_trials=int(args.trials),
-        n_warmup=int(args.warmup),
+def parse_args(args: argparse.Namespace, *, gpu: bool) -> BenchArgs:
+    dtype = np.dtype(np.float32 if args.dtype == "float32" else np.float64)
+    if int(args.k) < 1:
+        raise ValueError(f"--k must be >= 1, got {args.k}")
+    if int(args.trials) < 1:
+        raise ValueError(f"--trials must be >= 1, got {args.trials}")
+    if int(args.warmup) < 0:
+        raise ValueError(f"--warmup must be >= 0, got {args.warmup}")
+    return BenchArgs(
+        artifact=str(args.artifact),
+        direction=str(args.direction),
+        k=int(args.k),
+        trials=int(args.trials),
+        warmup=int(args.warmup),
         dtype=dtype,
-        output_atol=output_atol,
-        output_rtol=output_rtol,
-        log_level=str(args.log_level),
-        instrumentation=bool(args.instrumentation),
-        dry_run=bool(args.dry_run),
-        skip_note=bool(args.skip_note),
+        device=0 if not gpu else int(args.device),
+        stream=0 if not gpu else int(args.stream),
+        ring_buffer_size=0 if not gpu else int(args.ring_buffer_size),
+        vram_budget_bytes=0 if not gpu else int(args.vram_budget_bytes),
     )
-
-
-def configure_logging(log_level: str) -> None:
-    level_name = str(log_level).upper()
-    level = getattr(logging, level_name, logging.WARNING)
-    root = logging.getLogger()
-    if not root.handlers:
-        logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    else:
-        root.setLevel(level)
-    LOGGER.setLevel(level)
-
-
-def progress(msg: str) -> None:
-    LOGGER.info("[bench] %s", msg)
-
-
-__all__ = [
-    "CommonBenchArgs",
-    "DEFAULT_GRG_PATH",
-    "DEFAULT_MATMUL_OPTIONS",
-    "DTYPE",
-    "LOG_LEVEL_CHOICES",
-    "OUTPUT_ATOL",
-    "OUTPUT_ATOL_FLOAT32",
-    "OUTPUT_RTOL",
-    "OUTPUT_RTOL_FLOAT32",
-    "add_common_bench_args",
-    "configure_logging",
-    "parse_common_bench_args",
-    "parse_csv_ints",
-    "parse_dtype",
-    "parse_matmul_options",
-    "progress",
-    "tolerances_for_dtype",
-]

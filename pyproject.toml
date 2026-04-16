@@ -31,7 +31,6 @@ dependencies = [
 [project.optional-dependencies]
 gpu = [
     "cupy-cuda12x>=13.6.0",
-    "nvtx>=0.2.14",
     "torch>=2.10.0",
     "triton>=3.6.0",
 ]
@@ -47,9 +46,6 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["pygrgl_spmv"]
-include = [
-    "pygrgl_spmv/configs/*.json",
-]
 exclude = [
     "pygrgl_spmv/tests/**",
     "pygrgl_spmv/**/__pycache__/**",
@@ -77,10 +73,11 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["pygrgl_spmv/tests"]
+testpaths = [
+    "pygrgl_spmv/tests",
+]
 markers = [
-    "smoke: core fast tests selected by --smoke",
-    "stress: literal machine-scale stress tests selected by --stress",
+    "stress: long streamed GPU stress tests",
     "gpu: tests requiring a GPU (CuPy + cuSPARSE)",
     "mkl: tests specific to MKL backend",
     "cusparse: tests specific to cuSPARSE backend",

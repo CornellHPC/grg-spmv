@@ -10,7 +10,6 @@ import pygrgl
 import scipy.sparse as sp
 
 from pygrgl_spmv._rss import rss_checkpoint
-from pygrgl_spmv.backends import BackendSetup
 from pygrgl_spmv.grg.sparse import binary_csr_from_parts, finalize_int_array, pick_small_signed_int_dtype
 
 _LOGGER = logging.getLogger(__name__)
@@ -45,22 +44,6 @@ class CompiledOperatorState:
     init_vector_down_bias: np.ndarray | None = None
     init_xtx_up_bias: np.ndarray | None = None
     init_xtx_down_bias: np.ndarray | None = None
-
-    def to_backend_setup(self, dtype: np.dtype) -> BackendSetup:
-        if self.A_blocks is None:
-            raise RuntimeError("Compiled operator blocks are not available for backend setup")
-        return BackendSetup(
-            A_blocks=self.A_blocks,
-            level_offsets=self.level_offsets,
-            num_samples=self.num_samples,
-            num_mutations=self.num_mutations,
-            num_nodes=self.num_nodes,
-            sel_mut=self.sel_mut,
-            sel_miss=self.sel_miss,
-            coalescence_counts=self.coalescence_counts,
-            dtype=dtype,
-        )
-
 
 def _invert_permutation(perm: np.ndarray) -> np.ndarray:
     """Build the inverse of a dense permutation array."""

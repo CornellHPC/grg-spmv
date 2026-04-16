@@ -1,50 +1,36 @@
-"""Benchmark SpmvGRG matmul for the MKL backend."""
+"""Benchmark the canonical MKL runtime configuration."""
 
 from __future__ import annotations
 
 import argparse
 
-from .cli import (
-    add_common_bench_args,
-    configure_logging,
-    parse_common_bench_args,
-)
-from .configs import expand_mkl_configs, format_dry_run_line
-from .run import run_benchmark_suite
+from pygrgl_spmv.backends.mkl import MklPlan, MklPlanPair, MklRuntime, plan_mkl_layout
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark SpmvGRG matmul for MKL backend")
-    add_common_bench_args(parser)
-    return parser.parse_args()
+from .cli import add_common_args, parse_args
+from .run import baseline_requirements, benchmark_runtime
 
 
 def main() -> None:
-    args = parse_args()
-    configure_logging(str(args.log_level))
-
-    try:
-        common = parse_common_bench_args(args)
-    except ValueError as exc:
-        raise SystemExit(f"Argument error: {exc}") from exc
-
-    configs = expand_mkl_configs(common.plan_pair_specs, common.log_level, common.instrumentation)
-    if common.dry_run:
-        for entry in configs:
-            print(format_dry_run_line(entry, common.ks, common.options, dtype=common.dtype))
-        return
-
-    run_benchmark_suite(
-        grg_path=common.grg,
-        configs=configs,
-        ks=common.ks,
-        options=common.options,
-        n_trials=common.n_trials,
-        n_warmup=common.n_warmup,
-        dtype=common.dtype,
-        output_atol=common.output_atol,
-        output_rtol=common.output_rtol,
-        skip_note=common.skip_note,
+    parser = argparse.ArgumentParser(description="Benchmark MklRuntime")
+    add_common_args(parser, gpu=False)
+    args = parse_args(parser.parse_args(), gpu=False)
+    layout = plan_mkl_layout(
+        artifacts=[args.artifact],
+        pair=MklPlanPair(
+            plan_up=MklPlan(store="N", fmt="CSR", n_threads=0),
+            plan_down=MklPlan(store="T", fmt="CSC", n_threads=0),
+        ),
+        dtype=args.dtype,
+        requirements=baseline_requirements(direction=args.direction, k=args.k),
+    )
+    benchmark_runtime(
+        runtime_cls=MklRuntime,
+        layout=layout,
+        direction=args.direction,
+        k=args.k,
+        dtype=args.dtype,
+        warmup=args.warmup,
+        trials=args.trials,
     )
 
 

@@ -1,142 +1,71 @@
 # pygrgl-spmv
 
-`pygrgl-spmv` provides sparse matmul backends for GRG-based genotype matrix traversal.
+`pygrgl-spmv` is a runtime-owned sparse matmul prototype for GRG genotype matrices.
 
-## Installation
-
-```bash
-pip install pygrgl-spmv
-```
-
-Optional extras:
-
-```bash
-pip install "pygrgl-spmv[gpu]"
-pip install "pygrgl-spmv[dev]"
-```
-
-## Quick start with `load()`
-
-`load()` is the explicit-config convenience API. It does not probe for a default
-backend. You must point `PYGRGL_SPMV_CONFIG` at a JSON file.
-
-```python
-import os
-from importlib.resources import as_file, files
-
-import numpy as np
-
-from pygrgl_spmv import load
-
-cfg = files("pygrgl_spmv.configs").joinpath("reference-default.json")
-with as_file(cfg) as cfg_path:
-    os.environ["PYGRGL_SPMV_CONFIG"] = str(cfg_path)
-    op = load(
-        "/path/to/file.grg",
-        np.float64,
-        artifact_dir="pygrgl_spmv_artifacts",
-    )
-```
-
-Bundled sample configs:
-
-- `reference-default.json`: base-install CPU reference backend
-- `mkl-default.json`: MKL backend, requires `libmkl_rt.so`
-- `cusparse-default.json`: cuSPARSE backend, requires CuPy + CUDA
-- `triton-default.json`: Triton backend, requires Torch + Triton + CUDA
-
-The JSON schema is strict:
-
-- `backend` must be one of `reference`, `mkl`, `cusparse`, or `triton`
-- the selected backend section must be present
-- each `up` / `down` entry must be either `null` or a full backend plan dict
-- all fields must be written explicitly; `load()` does not fill in omitted plan fields
-
-One-sided example:
-
-```json
-{
-  "backend": "reference",
-  "reference": {
-    "log_level": "WARNING",
-    "up": {
-      "store": "N",
-      "fmt": "CSR",
-      "k_hint": null
-    },
-    "down": null
-  }
-}
-```
-
-Successful backend selection is logged at INFO level on the `pygrgl_spmv` logger.
-
-## Manual backend construction
-
-If you want to construct backends directly, `SpmvGRG` still accepts an explicit
-backend instance.
+## Core workflow
 
 ```python
 import numpy as np
 
-from pygrgl_spmv import SpmvGRG
-from pygrgl_spmv.backends.mkl import MklBackend, MklPlanPair
+from pygrgl_spmv import RuntimeRequirements, convert
+from pygrgl_spmv.backends.cusparse import CusparsePlanPair, CusparseRuntime, plan_cusparse_layout
 
-backend = MklBackend(
-    pair=MklPlanPair.from_dicts(
-        {"k_hint": None, "store": "N", "fmt": "CSR", "n_threads": 1},
-        {"k_hint": None, "store": "T", "fmt": "CSC", "n_threads": 1},
-    ),
-    log_level="WARNING",
+artifact = convert("A.grg", "artifacts")
+req = RuntimeRequirements(
+    max_k_up=8,
+    max_k_down=8,
+    need_down_miss_input=True,
+    need_up_miss_output=False,
+    need_init_vector=True,
+    need_init_matrix=False,
+    need_init_xtx=True,
+)
+pair = CusparsePlanPair.from_dicts(
+    {"store": "N", "fmt": "CSR", "opA": "N", "opB": "N", "orderB": "ROW", "orderC": "ROW", "algo": "DEFAULT", "scratch": "none"},
+    {"store": "T", "fmt": "CSC", "opA": "N", "opB": "N", "orderB": "ROW", "orderC": "ROW", "algo": "DEFAULT", "scratch": "none"},
+)
+layout = plan_cusparse_layout(
+    artifacts=[artifact],
+    pair=pair,
+    dtype=np.float64,
+    requirements=req,
+    vram_budget_bytes=8_000_000_000,
+    ring_buffer_size=4,
+    device=0,
+    stream=0,
 )
 
-op = SpmvGRG("/path/to/file.grg", backend, np.float64, artifact_dir="pygrgl_spmv_artifacts")
+with CusparseRuntime(layout) as runtime:
+    (A,) = runtime.grgs
+    y = A.matmul(np.ones((1, A.num_samples), dtype=np.float64), "up")
 ```
 
-Set either side of the plan pair to `None` to build a one-sided operator.
+## Public surface
 
-GPU backends (`CusparseBackend`, `TritonBackend`) require explicit
-`device=`, `stream=`, and `ring_buffer_size=` constructor arguments.
+- Package root exports:
+  - `convert(...) -> Path`
+  - `RuntimeRequirements`
+  - `plan_reference_layout(...)`, `ReferenceRuntime`
+  - `plan_mkl_layout(...)`, `MklRuntime`
+- GPU backends are imported from their subpackages:
+  - `pygrgl_spmv.backends.triton`
+  - `pygrgl_spmv.backends.cusparse`
 
-## `convert()`
+## Notes
 
-`convert()` compiles a `.grg` or loaded `pygrgl.ImmutableGRG` into a
-`CompiledOperatorState`, optionally saving a `.grg_spmv` artifact.
+- planners and runtimes consume `.grg_spmv` artifacts only
+- runtime-owned buffers are allocated in `__enter__()`
+- one runtime owns one shared execution arena across all `runtime.grgs`
+- concurrent calls on one runtime fail fast
+- Triton and cuSPARSE support declared `max_k >= 1`
+- GPU layouts can mix resident and streamed sparse blocks under a VRAM budget
+- `ring_buffer_size=0` is valid for GPU layouts only when the budget keeps every sparse block resident
+- the package root intentionally stays CPU-safe and does not re-export GPU runtime symbols
 
-```python
-from pygrgl_spmv import convert
+## Benchmark scripts
 
-state = convert("/path/to/file.grg")
-saved = convert("/path/to/file.grg", output_dir="artifacts")
-```
+- `uv run python -m scripts.bench.mkl`
+- `uv run python -m scripts.bench.triton`
+- `uv run python -m scripts.bench.cusparse`
 
-## Artifact behavior
-
-- `.grg` input builds or reuses a cached `.grg_spmv` artifact under `artifact_dir`
-- `.grg_spmv` input loads the artifact directly
-- loaded `ImmutableGRG` input compiles in memory and leaves `artifact_path` unset
-
-## Documentation
-
-- [GRG Operator Docs](pygrgl_spmv/grg/README.md)
-- [Backend Docs](pygrgl_spmv/backends/README.md)
-- [Benchmark Script Docs](scripts/README.md)
-- [Test Suite Docs](pygrgl_spmv/tests/README.md)
-
-## Benchmarks
-
-Benchmark entrypoints:
-
-- `python -m scripts.bench.mkl`
-- `python -m scripts.bench.cusparse`
-- `python -m scripts.bench.triton`
-
-See `scripts/README.md` for explicit plan syntax, wildcard expansion, and benchmark-only flags.
-
-## Tests
-
-Recommended command:
-
-```bash
-uv run pytest -q pygrgl_spmv/tests --backend all
-```
+See [scripts/README.md](scripts/README.md) for the minimal benchmark CLI.
