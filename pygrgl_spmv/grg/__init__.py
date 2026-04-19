@@ -604,6 +604,66 @@ class SpmvGRG:
             return output
 
 
+def _log_matrix_stats(matrix: sp.csr_matrix, name: str) -> None:
+    row_nnz = np.diff(matrix.indptr).astype(np.float64)
+    density = matrix.nnz / (matrix.shape[0] * matrix.shape[1]) if matrix.shape[0] * matrix.shape[1] > 0 else 0.0
+    _COMPILE_LOGGER.info(
+        "convert_graph stats  %-30s  shape=%dx%d  nnz=%d  density=%.4e"
+        "  row_nnz: mean=%.2f  std=%.2f  max=%d",
+        name,
+        matrix.shape[0], matrix.shape[1],
+        matrix.nnz,
+        density,
+        float(row_nnz.mean()) if row_nnz.size else 0.0,
+        float(row_nnz.std()) if row_nnz.size else 0.0,
+        int(row_nnz.max()) if row_nnz.size else 0,
+    )
+
+
+def _plot_sparsity_patterns(compiled: CompiledOperatorState, stem: str, plot_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    _HEATMAP_THRESHOLD = 50_000
+    _MAX_BINS = 1024
+
+    def _save(matrix: sp.csr_matrix, name: str) -> None:
+        _log_matrix_stats(matrix, name)
+        fig, ax = plt.subplots()
+        if max(matrix.shape) > _HEATMAP_THRESHOLD:
+            coo = matrix.tocoo()
+            scale = _MAX_BINS / max(matrix.shape)
+            row_bins = max(1, round(matrix.shape[0] * scale))
+            col_bins = max(1, round(matrix.shape[1] * scale))
+            H, _, _ = np.histogram2d(
+                coo.row, coo.col,
+                bins=[row_bins, col_bins],
+                range=[[0, matrix.shape[0]], [0, matrix.shape[1]]],
+            )
+            im = ax.imshow(
+                H, aspect="auto", cmap="hot_r", origin="upper",
+                extent=[0, matrix.shape[1], matrix.shape[0], 0],
+            )
+            fig.colorbar(im, ax=ax, label="nnz per bin")
+        else:
+            ax.spy(matrix, markersize=0.5)
+        ax.set_title(f"{name}  ({matrix.shape[0]}×{matrix.shape[1]}, nnz={matrix.nnz})")
+        fig.savefig(plot_dir / f"{stem}_{name}.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    if compiled.A_blocks is not None:
+        for i, row in enumerate(compiled.A_blocks):
+            for j, block in enumerate(row):
+                if block is not None:
+                    _save(block, f"A_block_{i}_{j}")
+
+    _save(compiled.sel_mut, "sel_mut")
+    _save(compiled.sel_miss, "sel_miss")
+
+
 def convert(
     source: str | os.PathLike[str] | pygrgl.ImmutableGRG,
     output_dir: str | os.PathLike[str] | None = None,
@@ -650,6 +710,14 @@ def convert(
         prev_rss = rss_checkpoint(_COMPILE_LOGGER, "artifact:grg_dropped", prev_rss)
     _build_init_biases(compiled, dtype)
     prev_rss = rss_checkpoint(_COMPILE_LOGGER, "artifact:init_biases", prev_rss)
+
+    _convert_graph = os.environ.get("CONVERT_GRAPH")
+    if _convert_graph:
+        if _convert_graph not in ("1", "true", "yes"):
+            _plot_dir = Path(_convert_graph)
+        else:
+            _plot_dir = (Path(output_dir) if output_dir is not None else Path.cwd()) / "sparsity_plots"
+        _plot_sparsity_patterns(compiled, stem or "grg", _plot_dir)
 
     if output_dir is not None:
         out = Path(output_dir).expanduser()
