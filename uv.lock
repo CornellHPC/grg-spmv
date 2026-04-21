@@ -1290,9 +1290,16 @@ wheels = [
 [[package]]
 name = "pygrgl"
 version = "2.6"
-source = { git = "ssh://git@github.com/aprilweilab/grgl.git?rev=main#b2f3c8946d34902f0319eb2b2807facb1c2ccb4e" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2e/af/d8bd36fd20c74832b268a2be63177c5e0bfd1e3b38e73c93cca94ea83d58/pygrgl-2.6.tar.gz", hash = "sha256:f025f4f06f355f89e7d066cf6f370c59a8df2d2827d1f5142f8df93d4f0f2cc7", size = 8167990, upload-time = "2026-02-06T19:07:50.437Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/3c/741560da187ec5b96cc8225810b7ba9c72b3b1220bf56e07a26056b47089/pygrgl-2.6-cp310-cp310-manylinux_2_24_x86_64.whl", hash = "sha256:10cb4052ac590b047305827dc74ccef4ca68c8366bd3e182f596e4db5566c592", size = 1838518, upload-time = "2026-02-06T19:07:41.994Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/dd/71373cd7173556b825f4795b6a1e3da97eb0bffc0dd457d7f331c3ac7de8/pygrgl-2.6-cp311-cp311-manylinux_2_24_x86_64.whl", hash = "sha256:e1e097c41fb100af2071e7ee0cb0276dcf54f4ecf31044a136e335a7fb95a814", size = 1839445, upload-time = "2026-02-06T19:07:43.875Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/c2/8479c25fa8e8b8a23e1709962ed7d9320cd05de94778678a4d529fde766a/pygrgl-2.6-cp312-cp312-manylinux_2_24_x86_64.whl", hash = "sha256:1deee8d01200f8b408f23845a623e49e80955dcb397ecec7118703885cdeea5f", size = 1841302, upload-time = "2026-02-06T19:07:45.089Z" },
+    { url = "https://files.pythonhosted.org/packages/45/f4/fa426de798e35cfc87ca41223828c8ad3b7dd8b783df796d0f35236afab4/pygrgl-2.6-cp313-cp313-manylinux_2_24_x86_64.whl", hash = "sha256:5f163f5faa1198488e319a1b5167fdb1518870c5444aa82d2e648494824b19d2", size = 1841190, upload-time = "2026-02-06T19:07:46.314Z" },
 ]
 
 [[package]]
@@ -1332,7 +1339,7 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'dev'", specifier = ">=3.10.8" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "pandas", marker = "extra == 'dev'", specifier = ">=2.3.3" },
-    { name = "pygrgl", git = "ssh://git@github.com/aprilweilab/grgl.git?rev=main" },
+    { name = "pygrgl", specifier = ">=2.6" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.2" },
     { name = "scipy", specifier = ">=1.10.0" },
     { name = "seaborn", marker = "extra == 'dev'", specifier = ">=0.13.2" },

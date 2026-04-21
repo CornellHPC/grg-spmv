@@ -24,7 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.26.0",
-    "pygrgl",
+    "pygrgl>=2.6",
     "scipy>=1.10.0",
 ]
 
@@ -89,6 +89,3 @@ venvPath = "."
 venv = ".venv"
 pythonVersion = "3.10"
 pythonPlatform = "x86_64-unknown-linux-gnu"
-
-[tool.uv.sources]
-pygrgl = { git = "ssh://git@github.com/aprilweilab/grgl.git", rev = "main" }
