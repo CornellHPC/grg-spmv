@@ -46,6 +46,8 @@ The suite protects five things:
   - Entered-runtime lifecycle, `runtime.grgs`, concurrency guard, fixed owned-buffer reuse, and one-runtime multi-GRG usage.
 - `runtime/test_matmul_semantics.py`
   - Shared `BoundGRG.matmul()` semantics on `ReferenceRuntime`: `by_individual`, init, miss, dtype, and fast-fail contract checks.
+- `runtime/test_prepare_cuda.py`
+  - Direct `prepare_matmul_cuda()` contract checks: CPU rejection, GPU buffer semantics, and prepared-path correctness for init, missingness, and node emission.
 - `runtime/test_emit_all_nodes.py`
   - `emit_all_nodes=True` semantics, including init modes, dtype variants, stability, and miss rejection.
 - `runtime/test_traversal_correctness.py`

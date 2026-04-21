@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Iterator
 from typing import Any
 
@@ -175,8 +175,23 @@ __all__ = [
     "_struct_dtype_for_bound",
     "iter_direction_level_pairs",
     "materialize_sparse_block",
+    "relink_stream_dependencies",
     "sparse_structure_lengths",
     "sparse_structure_nbytes",
     "split_selector_by_level",
     "stored_block_shape",
 ]
+
+
+def relink_stream_dependencies(ops_by_level, *, direction: Direction):
+    prev_by_slot: dict[int, tuple[int, int]] = {}
+    height = len(ops_by_level)
+    level_iter = range(1, height) if direction == Direction.UP else range(height - 2, -1, -1)
+    for dst_level in level_iter:
+        for op_idx, op in enumerate(ops_by_level[dst_level]):
+            slot = getattr(op, "slot", None)
+            if slot is None:
+                continue
+            ops_by_level[dst_level][op_idx] = replace(op, prev_in_slot=prev_by_slot.get(int(slot)))
+            prev_by_slot[int(slot)] = (dst_level, op_idx)
+    return ops_by_level

@@ -13,7 +13,7 @@ import numpy as np
 import pygrgl
 
 from pygrgl_spmv._rss import rss_checkpoint
-from pygrgl_spmv.backends.types import Direction, InitMode, parse_direction
+from pygrgl_spmv.backends.types import Direction, InitMode, parse_direction, parse_init_mode
 from pygrgl_spmv.grg.artifact import _load_grg_spmv_host, artifact_path_for_grg, save_grg_spmv
 from pygrgl_spmv.grg.compile import CompiledOperatorState, compile_grg
 
@@ -39,6 +39,20 @@ class RuntimeRequirements:
             raise ValueError(f"max_k_up must be >= 1, got {self.max_k_up}")
         if int(self.max_k_down) < 1:
             raise ValueError(f"max_k_down must be >= 1, got {self.max_k_down}")
+
+
+@dataclass(frozen=True)
+class _CudaMatmulSpec:
+    direction: Direction
+    k: int
+    emit_all_nodes: bool
+    by_individual: bool
+    init_mode: InitMode
+    backend_init_mode: InitMode
+    use_miss: bool
+    input_cols: int
+    output_cols: int
+    apply_endpoint_bias: bool
 
 
 def _decode_allele(data: np.ndarray, offsets: np.ndarray, idx: int) -> str:
@@ -358,7 +372,14 @@ class BoundGRG:
                     "pygrgl.TraversalDirection.UP, or pygrgl.TraversalDirection.DOWN"
                 )
 
-    def _parse_init(self, init: str | np.ndarray | None, rows: int, input_dtype: np.dtype) -> tuple[InitMode, np.ndarray | None]:
+    def _parse_init(
+        self,
+        init: str | np.ndarray | None,
+        rows: int,
+        input_dtype: np.dtype,
+        *,
+        reorder_matrix: bool,
+    ) -> tuple[InitMode, np.ndarray | None]:
         if init is None:
             return InitMode.NONE, None
         if isinstance(init, str):
@@ -381,8 +402,10 @@ class BoundGRG:
         if init.ndim == 2:
             if init.shape != (rows, self.num_nodes):
                 raise ValueError(f"if init is a matrix, it must match the dimensions ({rows}, {self.num_nodes})")
-            init_nodes = init[:, self.node_perm].T
-            return InitMode.MATRIX, init_nodes.astype(self._dtype, order="C", copy=False)
+            if reorder_matrix:
+                init_nodes = init[:, self.node_perm].T
+                return InitMode.MATRIX, init_nodes.astype(self._dtype, order="C", copy=False)
+            return InitMode.MATRIX, init.astype(self._dtype, order="C", copy=False)
         raise ValueError("init must be None, 'xtx', a vector, or a matrix")
 
     def _validate_miss(self, miss: np.ndarray, rows: int, direction: Direction, input_dtype: np.dtype) -> np.ndarray:
@@ -427,6 +450,116 @@ class BoundGRG:
         reordered = node_values[self.inv_node_perm]
         return reordered.T.astype(self._dtype, copy=False)
 
+    def _prepare_cuda_spec(
+        self,
+        *,
+        direction: str | Direction | pygrgl.TraversalDirection,
+        k: int,
+        emit_all_nodes: bool,
+        by_individual: bool,
+        init_mode: str | InitMode,
+        use_miss: bool,
+    ) -> _CudaMatmulSpec:
+        direction_name = self._parse_direction(direction)
+        init_mode_name = parse_init_mode(init_mode)
+        rows = int(k)
+        if rows < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+        if emit_all_nodes and use_miss:
+            raise RuntimeError('the "use_miss" parameter cannot be mixed with "emit_all_nodes=True"')
+        if init_mode_name != InitMode.NONE and use_miss:
+            raise ValueError('the "use_miss" parameter cannot be mixed with a non-none init_mode')
+        if init_mode_name == InitMode.XTX and self.coalescence_counts is None:
+            raise ValueError(
+                "init_mode='xtx' requires per-node coalescence counts in the GRG. "
+                "This artifact was loaded without coalescence counts."
+            )
+        _validate_runtime_requirements(
+            self._runtime.layout.requirements,
+            direction=direction_name,
+            k=rows,
+            init_mode=init_mode_name,
+            uses_miss=bool(use_miss),
+        )
+        input_cols = (
+            self.num_individuals
+            if by_individual and direction_name == Direction.UP
+            else (self.num_samples if direction_name == Direction.UP else self.num_mutations)
+        )
+        if emit_all_nodes:
+            output_cols = self.num_nodes
+        elif direction_name == Direction.UP:
+            output_cols = self.num_mutations
+        elif by_individual:
+            output_cols = self.num_individuals
+        else:
+            output_cols = self.num_samples
+        backend_init_mode = (
+            init_mode_name
+            if emit_all_nodes or init_mode_name == InitMode.MATRIX
+            else InitMode.NONE
+        )
+        return _CudaMatmulSpec(
+            direction=direction_name,
+            k=rows,
+            emit_all_nodes=bool(emit_all_nodes),
+            by_individual=bool(by_individual),
+            init_mode=init_mode_name,
+            backend_init_mode=backend_init_mode,
+            use_miss=bool(use_miss),
+            input_cols=int(input_cols),
+            output_cols=int(output_cols),
+            apply_endpoint_bias=bool(
+                (not emit_all_nodes) and init_mode_name in {InitMode.VECTOR, InitMode.XTX}
+            ),
+        )
+
+    def _copy_host_to_cuda(self, dst, src: np.ndarray) -> None:
+        import torch
+
+        arr = np.asarray(src, dtype=self._dtype, order="C")
+        stream = getattr(self._runtime, "_torch_caller_stream", None)
+        if stream is None:
+            dst.copy_(torch.from_numpy(arr), non_blocking=False)
+            return
+        with torch.cuda.device(dst.device):
+            with torch.cuda.stream(stream()):
+                dst.copy_(torch.from_numpy(arr), non_blocking=False)
+
+    def _copy_cuda_to_host(self, src) -> np.ndarray:
+        import torch
+
+        stream = getattr(self._runtime, "_torch_caller_stream", None)
+        if stream is None:
+            return src.detach().cpu().numpy().astype(self._dtype, copy=False).copy()
+        with torch.cuda.device(src.device):
+            with torch.cuda.stream(stream()):
+                host = src.detach().cpu()
+        return host.numpy().astype(self._dtype, copy=False).copy()
+
+    def prepare_matmul_cuda(
+        self,
+        *,
+        direction,
+        k: int,
+        emit_all_nodes: bool = False,
+        by_individual: bool = False,
+        init_mode: str | InitMode = "none",
+        use_miss: bool = False,
+    ):
+        prepare = getattr(self._runtime, "_prepare_matmul_cuda", None)
+        if prepare is None:
+            raise NotImplementedError("prepare_matmul_cuda() is implemented only for CUDA backends")
+        spec = self._prepare_cuda_spec(
+            direction=direction,
+            k=int(k),
+            emit_all_nodes=bool(emit_all_nodes),
+            by_individual=bool(by_individual),
+            init_mode=init_mode,
+            use_miss=bool(use_miss),
+        )
+        return prepare(self, spec)
+
     def matmul(
         self,
         input,
@@ -461,7 +594,45 @@ class BoundGRG:
         if init is not None and miss is not None:
             raise ValueError('the "miss" parameter cannot be mixed with the "init" parameter')
 
-        init_mode, init_payload = self._parse_init(init, rows, x_in.dtype)
+        if getattr(self._runtime, "_prepare_matmul_cuda", None) is not None:
+            init_mode, init_payload = self._parse_init(init, rows, x_in.dtype, reorder_matrix=False)
+            spec = self._prepare_cuda_spec(
+                direction=direction_name,
+                k=rows,
+                emit_all_nodes=bool(emit_all_nodes),
+                by_individual=bool(by_individual),
+                init_mode=init_mode,
+                use_miss=bool(miss is not None),
+            )
+            miss_matrix = None if miss is None else self._validate_miss(miss, rows, direction_name, x_in.dtype)
+            with self._runtime._call_scope():
+                with self.prepare_matmul_cuda(
+                    direction=spec.direction,
+                    k=spec.k,
+                    emit_all_nodes=spec.emit_all_nodes,
+                    by_individual=spec.by_individual,
+                    init_mode=spec.init_mode,
+                    use_miss=spec.use_miss,
+                ) as op:
+                    self._copy_host_to_cuda(op.input, x_in)
+                    if spec.direction == Direction.DOWN and miss_matrix is not None:
+                        self._copy_host_to_cuda(op.miss_input, miss_matrix)
+                    if init_mode == InitMode.VECTOR:
+                        assert init_payload is not None
+                        self._copy_host_to_cuda(op.init_vector, init_payload)
+                    elif init_mode == InitMode.MATRIX:
+                        assert init_payload is not None
+                        self._copy_host_to_cuda(op.init_matrix, init_payload)
+                    run_prelocked = getattr(op, "_call_prelocked", None)
+                    if run_prelocked is None:
+                        raise RuntimeError("prepared CUDA op is missing _call_prelocked()")
+                    run_prelocked()
+                    result = self._copy_cuda_to_host(op.output)
+                    if spec.direction == Direction.UP and miss_matrix is not None:
+                        miss_matrix += self._copy_cuda_to_host(op.miss_output).astype(miss_matrix.dtype, copy=False)
+                    return result
+
+        init_mode, init_payload = self._parse_init(init, rows, x_in.dtype, reorder_matrix=True)
         _validate_runtime_requirements(
             self._runtime.layout.requirements,
             direction=direction_name,

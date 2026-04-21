@@ -37,7 +37,10 @@ layout = plan_cusparse_layout(
 
 with CusparseRuntime(layout) as runtime:
     (A,) = runtime.grgs
-    y = A.matmul(np.ones((1, A.num_samples), dtype=np.float64), "up")
+    with A.prepare_matmul_cuda(direction="up", k=1) as op:
+        op.input.copy_(op.input.new_tensor(np.ones((1, A.num_samples), dtype=np.float64)))
+        op()
+        y = op.output.cpu().numpy().copy()
 ```
 
 ## Public surface
@@ -50,6 +53,7 @@ with CusparseRuntime(layout) as runtime:
 - GPU backends are imported from their subpackages:
   - `pygrgl_spmv.backends.triton`
   - `pygrgl_spmv.backends.cusparse`
+- GPU execution is centered on `grg.prepare_matmul_cuda(...)`; eager `grg.matmul(...)` is a NumPy convenience wrapper over that prepared path
 
 ## Notes
 

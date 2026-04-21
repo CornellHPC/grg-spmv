@@ -3,15 +3,23 @@ from __future__ import annotations
 import numpy as np
 import pygrgl
 import pytest
+import scipy.sparse as sp
 
 from pygrgl_spmv.backends.mkl import MklPlan, MklPlanPair
 from pygrgl_spmv.backends.reference import ReferencePlan, ReferencePlanPair
+from pygrgl_spmv.grg.artifact import save_grg_spmv
+from pygrgl_spmv.grg.sparse import binary_csr_from_parts
 from pygrgl_spmv.tests.conftest import DATA_DTYPE, tol
 from pygrgl_spmv.tests.runtime._runtime_builders import build_layout_for_backend, full_requirements, runtime_cls_for_backend
+from pygrgl_spmv.tests.runtime._streaming_cases import _synthetic_state
 
 _BACKENDS = [
     pytest.param("reference", id="reference"),
     pytest.param("mkl", id="mkl", marks=pytest.mark.mkl),
+    pytest.param("cusparse", id="cusparse", marks=[pytest.mark.gpu, pytest.mark.cusparse]),
+    pytest.param("triton", id="triton", marks=[pytest.mark.gpu, pytest.mark.triton]),
+]
+_GPU_BACKENDS = [
     pytest.param("cusparse", id="cusparse", marks=[pytest.mark.gpu, pytest.mark.cusparse]),
     pytest.param("triton", id="triton", marks=[pytest.mark.gpu, pytest.mark.triton]),
 ]
@@ -93,6 +101,53 @@ def _requirements_for(_backend_name: str, *, k: int):
     return full_requirements(max_k_up=int(k), max_k_down=int(k))
 
 
+def _sparse_mutation_selector_artifact(tmp_path):
+    path = tmp_path / "sparse-mutation-selector.grg_spmv"
+    struct_dtype = np.dtype(np.int32)
+    num_samples = 1
+    num_nodes = 2
+    num_mutations = 5
+    sel_mut = binary_csr_from_parts(
+        indices=np.asarray([1], dtype=struct_dtype),
+        indptr=np.asarray([0, 1, 1, 1, 1, 1], dtype=struct_dtype),
+        shape=(num_mutations, num_nodes),
+        shared_data=True,
+    )
+    sel_miss = binary_csr_from_parts(
+        indices=np.empty(0, dtype=struct_dtype),
+        indptr=np.zeros(num_mutations + 1, dtype=struct_dtype),
+        shape=(num_mutations, num_nodes),
+        shared_data=True,
+    )
+    state = _synthetic_state(
+        blocks=[[], [sp.csr_matrix((1, 1), dtype=np.bool_)]],
+        level_offsets=np.asarray([0, num_samples, num_nodes], dtype=struct_dtype),
+        num_samples=num_samples,
+        num_mutations=num_mutations,
+        num_nodes=num_nodes,
+        sel_mut=sel_mut,
+        sel_miss=sel_miss,
+    )
+    save_grg_spmv(state, path)
+    return path
+
+
+def _one_sided_requirements(direction: str, *, disabled_k: int, disabled_miss: bool):
+    if direction == "up":
+        return full_requirements(
+            max_k_up=2,
+            max_k_down=int(disabled_k),
+            need_down_miss_input=bool(disabled_miss),
+            need_up_miss_output=False,
+        )
+    return full_requirements(
+        max_k_up=int(disabled_k),
+        max_k_down=2,
+        need_down_miss_input=False,
+        need_up_miss_output=bool(disabled_miss),
+    )
+
+
 @pytest.mark.parametrize("backend_name", _BACKENDS)
 @pytest.mark.parametrize("direction", ["up", "down"], ids=["up", "down"])
 def test_one_sided_layout_runs_enabled_direction(primary_artifact, primary_grg, backend_name, direction):
@@ -147,8 +202,51 @@ def test_one_sided_layout_drops_unused_storage(primary_artifact, backend_name):
         requirements=_requirements_for(backend_name, k=k),
     )
     assert up_only_layout.bytes_total < full_layout.bytes_total
-    assert up_only_layout.bytes_by_category["workspace_down"] == 0
+    if "workspace_down" in up_only_layout.bytes_by_category:
+        assert up_only_layout.bytes_by_category["workspace_down"] == 0
     assert up_only_layout.bytes_by_category["resident_sparse"] < full_layout.bytes_by_category["resident_sparse"]
+
+
+@pytest.mark.parametrize("backend_name", _GPU_BACKENDS)
+@pytest.mark.parametrize("direction", ["up", "down"], ids=["up-only", "down-only"])
+def test_gpu_one_sided_layout_ignores_disabled_direction_requirements(primary_artifact, backend_name, direction):
+    pair = _up_only_pair(backend_name) if direction == "up" else _down_only_pair(backend_name)
+    benign = build_layout_for_backend(
+        backend_name,
+        [primary_artifact],
+        pair=pair,
+        requirements=_one_sided_requirements(direction, disabled_k=1, disabled_miss=False),
+    )
+    hostile = build_layout_for_backend(
+        backend_name,
+        [primary_artifact],
+        pair=pair,
+        requirements=_one_sided_requirements(direction, disabled_k=1024, disabled_miss=True),
+        vram_budget_bytes=benign.bytes_total,
+    )
+    assert hostile.bytes_total == benign.bytes_total
+    assert hostile.required_budget_for_full_residency == benign.required_budget_for_full_residency
+    assert hostile.bytes_by_category == benign.bytes_by_category
+
+
+@pytest.mark.parametrize("backend_name", _GPU_BACKENDS)
+def test_gpu_dense_arena_aux_rows_include_mutations_with_sparse_selector(tmp_path, backend_name):
+    artifact = _sparse_mutation_selector_artifact(tmp_path)
+    requirements = full_requirements(
+        max_k_up=2,
+        max_k_down=2,
+        need_down_miss_input=False,
+        need_up_miss_output=False,
+        need_init_vector=True,
+        need_init_matrix=False,
+        need_init_xtx=False,
+    )
+    layout = build_layout_for_backend(backend_name, [artifact], requirements=requirements)
+    io0_rows = 5
+    side_io_rows = 1
+    aux_rows = 5
+    expected = int((io0_rows + side_io_rows + aux_rows) * 2 * np.dtype(DATA_DTYPE).itemsize)
+    assert layout.bytes_by_category["dense_arena"] == expected
 
 
 @pytest.mark.parametrize("backend_name", _BACKENDS)

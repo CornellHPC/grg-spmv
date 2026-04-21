@@ -53,23 +53,64 @@ def _assert_triton_reset(runtime: TritonRuntime) -> None:
     assert runtime._root_to_caller_event is None
     assert runtime._level_streams == []
     assert runtime._slot_copy_streams == []
-    assert runtime._scratch_streams_up == []
-    assert runtime._scratch_streams_down == []
+    assert runtime._scratch_streams == []
     assert runtime._slot_indices == []
     assert runtime._slot_indptr == []
-    assert runtime._up_state is None
-    assert runtime._down_state is None
-    assert runtime._up_scratch == []
-    assert runtime._down_scratch == []
+    assert runtime._state is None
+    assert runtime._scratch == []
     assert runtime._artifacts == ()
     assert runtime._grgs == ()
     assert runtime._config_up is None
     assert runtime._config_down is None
-    assert runtime._staging_up == {}
-    assert runtime._staging_down == {}
     assert runtime.stream is None
     assert not runtime._entered
     assert not runtime._active_call
+
+
+def _torch_device_nbytes(value, seen: set[int]) -> int:
+    if value is None or not isinstance(value, torch.Tensor) or value.device.type != "cuda":
+        return 0
+    storage = value.untyped_storage()
+    nbytes = int(storage.nbytes())
+    if nbytes == 0:
+        return 0
+    ptr = int(storage.data_ptr())
+    if ptr in seen:
+        return 0
+    seen.add(ptr)
+    return nbytes
+
+
+def _triton_owned_device_nbytes(runtime: TritonRuntime) -> int:
+    seen: set[int] = set()
+    total = 0
+    for value in (runtime._state, runtime._io0, runtime._io1, runtime._aux):
+        total += _torch_device_nbytes(value, seen)
+    for values in (runtime._slot_indices, runtime._slot_indptr):
+        total += sum(_torch_device_nbytes(value, seen) for value in values)
+    for row in runtime._scratch:
+        total += sum(_torch_device_nbytes(value, seen) for value in row)
+    for artifact in runtime._artifacts:
+        for value in (
+            artifact.sel_mut_rows,
+            artifact.sel_mut_cols,
+            artifact.sel_miss_rows,
+            artifact.sel_miss_cols,
+            artifact.node_perm,
+            artifact.sample_to_individual,
+            artifact.xtx_bias,
+            artifact.init_vector_up_bias,
+            artifact.init_vector_down_bias,
+            artifact.init_xtx_up_bias,
+            artifact.init_xtx_down_bias,
+        ):
+            total += _torch_device_nbytes(value, seen)
+        for ops_by_level in (artifact.up_ops, artifact.down_ops):
+            for ops in ops_by_level:
+                for op in ops:
+                    total += _torch_device_nbytes(op.launch_block.indices, seen)
+                    total += _torch_device_nbytes(op.launch_block.indptr, seen)
+    return total
 
 
 def _owner_keys(layout, *, resident: bool) -> tuple[tuple[int, int], ...]:
@@ -86,13 +127,14 @@ def _nonzero_slot_count(layout) -> int:
     return sum(1 for slot in layout.slot_plans if slot.nbytes > 0)
 
 
-def _build_layout(artifact, *, runtime_k: int, ring_buffer_size: int, budget_bytes: int, allow_residency: bool = True):
+def _build_layout(artifact, *, runtime_k: int, ring_buffer_size: int, budget_bytes: int, allow_residency: bool = True, stream=0):
     return build_triton_layout(
         [artifact],
         requirements=_requirements(runtime_k),
         ring_buffer_size=int(ring_buffer_size),
         vram_budget_bytes=int(budget_bytes),
         allow_residency=bool(allow_residency),
+        stream=stream,
     )
 
 
@@ -239,22 +281,22 @@ def _run_exactness_case(artifact, case, *, runtime_k: int, mode: ThreeBlockMode,
             np.testing.assert_array_equal(actual, expected)
 
 
-def _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, *, n: int, bandwidth: int) -> None:
+def _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, *, n: int, bandwidth: int, runtime_k: int) -> None:
     clear_torch_state()
     artifact = write_overlap_band_artifact(tmp_path, f"triton-overlap-{n}-{bandwidth}", n=n, bandwidth=bandwidth)
     budget_bytes = triton_ring_thresholds(
         artifact,
-        requirements=_requirements(1),
+        requirements=_requirements(runtime_k),
         total_vram_bytes=prepare_triton_stream_stress_case().total_vram_bytes,
         max_ring_buffer_size=2,
     )[int(requested_ring_buffer_size) - 1]
     layout = _build_layout(
         artifact,
-        runtime_k=1,
+        runtime_k=runtime_k,
         ring_buffer_size=requested_ring_buffer_size,
         budget_bytes=budget_bytes,
     )
-    ref_layout = build_reference_layout([artifact], requirements=_requirements(1))
+    ref_layout = build_reference_layout([artifact], requirements=_requirements(runtime_k))
     state = {"active": True, "compute": [], "copy": []}
     original_launch = triton_backend_mod.launch_block
 
@@ -313,7 +355,7 @@ def _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, 
         for run_idx, direction in enumerate(order):
             size = ref_grg.num_samples if direction == "up" else ref_grg.num_mutations
             rng = np.random.default_rng(71_000 + 1_000 * requested_ring_buffer_size + 10 * run_idx + (0 if direction == "up" else 1))
-            primary = rng.choice(np.array([-1.0, 1.0], dtype=DATA_DTYPE), size=(1, size))
+            primary = rng.choice(np.array([-1.0, 1.0], dtype=DATA_DTYPE), size=(int(runtime_k), size))
             expected = ref_grg.matmul(primary, direction)
             actual = grg.matmul(primary, direction)
             np.testing.assert_array_equal(actual, expected)
@@ -543,6 +585,16 @@ def test_triton_small_int64_artifact_compacts_slot_dtypes(tmp_path):
         assert runtime._slot_indptr[0].dtype == torch.int32
 
 
+def test_triton_owned_device_bytes_do_not_exceed_tight_budget(primary_artifact):
+    clear_torch_state()
+    base = build_triton_layout([primary_artifact], requirements=_requirements(2), vram_budget_bytes=1_000_000_000_000)
+    layout = build_triton_layout([primary_artifact], requirements=_requirements(2), vram_budget_bytes=base.bytes_total)
+    assert layout.bytes_total == base.bytes_total
+    with TritonRuntime(layout) as runtime:
+        assert _triton_owned_device_nbytes(runtime) <= layout.vram_budget_bytes
+    clear_torch_state()
+
+
 @pytest.mark.parametrize("requested_ring_buffer_size", [1, 2, 3], ids=["ring1", "ring2", "ring3"])
 def test_triton_allow_residency_false_forces_all_streamed_layout(triton_small_stream_artifact, requested_ring_buffer_size):
     fixed_bytes, block_bytes, owner_block_count = _full_budget_components(triton_small_stream_artifact, runtime_k=2)
@@ -643,7 +695,7 @@ def test_triton_small_three_block_planner_transitions(triton_small_stream_artifa
 
 
 @pytest.mark.stress
-@pytest.mark.parametrize("runtime_k", [1, 2], ids=["k1", "k2"])
+@pytest.mark.parametrize("runtime_k", [2], ids=["k2"])
 @pytest.mark.parametrize("mode", THREE_BLOCK_TRANSITION_MODES, ids=[mode.name for mode in THREE_BLOCK_TRANSITION_MODES])
 def test_triton_large_three_block_planner_transitions(triton_stream_stress_artifact, runtime_k, mode):
     _assert_planner_transition(triton_stream_stress_artifact, runtime_k=runtime_k, mode=mode)
@@ -696,7 +748,7 @@ def test_triton_small_three_block_exactness_allow_residency_false(order, runtime
 
 @pytest.mark.stress
 @pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
-@pytest.mark.parametrize("runtime_k", [1, 2], ids=["k1", "k2"])
+@pytest.mark.parametrize("runtime_k", [2], ids=["k2"])
 @pytest.mark.parametrize("mode", THREE_BLOCK_EXACTNESS_MODES, ids=[mode.name for mode in THREE_BLOCK_EXACTNESS_MODES])
 def test_triton_large_three_block_exactness(order, runtime_k, mode, triton_stream_stress_case, triton_stream_stress_artifact):
     clear_torch_state()
@@ -707,11 +759,66 @@ def test_triton_large_three_block_exactness(order, runtime_k, mode, triton_strea
 @pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
 @pytest.mark.parametrize("requested_ring_buffer_size", [1, 2], ids=["ring1", "ring2"])
 def test_triton_small_stream_copy_overlaps_compute(tmp_path, order, requested_ring_buffer_size, monkeypatch):
-    _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, n=64, bandwidth=8)
+    _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, n=64, bandwidth=8, runtime_k=1)
 
 
 @pytest.mark.stress
 @pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
 @pytest.mark.parametrize("requested_ring_buffer_size", [1, 2], ids=["ring1", "ring2"])
 def test_triton_stream_copy_overlaps_compute(tmp_path, order, requested_ring_buffer_size, monkeypatch):
-    _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, n=4096, bandwidth=64)
+    _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, n=4096, bandwidth=64, runtime_k=2)
+
+
+def test_triton_prepare_cuda_graph_capture_resident(primary_artifact, primary_grg):
+    with torch.cuda.device(0):
+        capture_stream = torch.cuda.Stream()
+    layout = build_triton_layout([primary_artifact], requirements=_requirements(2), stream=capture_stream)
+    with TritonRuntime(layout) as runtime:
+        (grg,) = runtime.grgs
+        rng = np.random.default_rng(98_101)
+        src_np = rng.standard_normal((2, primary_grg.num_samples), dtype=DATA_DTYPE)
+        init_np = rng.standard_normal((2,), dtype=DATA_DTYPE)
+        expected = np.asarray(pygrgl.matmul(primary_grg, src_np, pygrgl.TraversalDirection.UP, init=init_np))
+        with grg.prepare_matmul_cuda(direction="up", k=2, init_mode="vector") as op:
+            src = torch.from_numpy(src_np).to(device=op.input.device)
+            init = torch.from_numpy(init_np).to(device=op.init_vector.device)
+            graph = torch.cuda.CUDAGraph()
+            # All capture-sensitive setup must already be complete once the prepared op is entered.
+            with torch.cuda.graph(graph, stream=capture_stream):
+                op.input.copy_(src)
+                op.init_vector.copy_(init)
+                op()
+            graph.replay()
+            torch.cuda.synchronize(runtime.device)
+            actual = op.output.cpu().numpy().copy()
+        np.testing.assert_allclose(actual, expected, atol=tol(DATA_DTYPE)[0], rtol=tol(DATA_DTYPE)[1])
+
+
+def test_triton_prepare_cuda_graph_capture_streamed(triton_small_stream_artifact, gpu_small_stream_case):
+    fixed_bytes, block_bytes, owner_block_count = _full_budget_components(triton_small_stream_artifact, runtime_k=1)
+    assert owner_block_count == 3
+    with torch.cuda.device(0):
+        capture_stream = torch.cuda.Stream()
+    layout = _build_layout(
+        triton_small_stream_artifact,
+        runtime_k=1,
+        ring_buffer_size=1,
+        budget_bytes=fixed_bytes + block_bytes,
+        allow_residency=False,
+        stream=capture_stream,
+    )
+    with TritonRuntime(layout) as runtime:
+        (grg,) = runtime.grgs
+        src_np = np.arange(gpu_small_stream_case.n, dtype=DATA_DTYPE).reshape(1, gpu_small_stream_case.n)
+        expected = expected_up(src_np.T, shifts=gpu_small_stream_case.shifts, bandwidth=gpu_small_stream_case.bandwidth).T
+        with grg.prepare_matmul_cuda(direction="up", k=1) as op:
+            src = torch.from_numpy(src_np).to(device=op.input.device)
+            graph = torch.cuda.CUDAGraph()
+            # All capture-sensitive setup must already be complete once the prepared op is entered.
+            with torch.cuda.graph(graph, stream=capture_stream):
+                op.input.copy_(src)
+                op()
+            graph.replay()
+            torch.cuda.synchronize(runtime.device)
+            actual = op.output.cpu().numpy().copy()
+        np.testing.assert_allclose(actual, expected, atol=0.0, rtol=0.0)

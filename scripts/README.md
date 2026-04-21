@@ -15,6 +15,7 @@ Use them as:
 - `uv run python -m scripts.bench.cusparse`
 
 Each script benchmarks one `.grg_spmv` artifact with one canonical backend plan and prints mean/std call time.
+GPU benchmarks drive `grg.prepare_matmul_cuda(...)` directly; CPU benchmarks still call eager `grg.matmul(...)`.
 
 Common flags:
 

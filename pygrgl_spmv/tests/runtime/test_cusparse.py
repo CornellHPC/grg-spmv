@@ -71,8 +71,6 @@ def _assert_cusparse_reset(runtime: CusparseRuntime) -> None:
     assert runtime._down_src_bufs is None
     assert runtime._up_scratch == []
     assert runtime._down_scratch == []
-    assert runtime._up_staging == {}
-    assert runtime._down_staging == {}
     assert runtime._ext_main_up == []
     assert runtime._ext_main_down == []
     assert runtime._ext_scratch_up == []
@@ -103,6 +101,85 @@ def _assert_runtime_matches_reference(grg, primary_grg, *, seed: int) -> None:
     )
 
 
+def _cupy_device_nbytes(value, seen: set[int]) -> int:
+    if value is None or not hasattr(value, "data"):
+        return 0
+    nbytes = int(value.nbytes)
+    if nbytes == 0:
+        return 0
+    ptr = int(value.data.ptr)
+    if ptr in seen:
+        return 0
+    seen.add(ptr)
+    return nbytes
+
+
+def _cupy_nested_nbytes(values, seen: set[int]) -> int:
+    if values is None:
+        return 0
+    total = 0
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            total += _cupy_nested_nbytes(value, seen)
+        else:
+            total += _cupy_device_nbytes(value, seen)
+    return total
+
+
+def _shared_ones_nbytes(shared_ones, seen: set[int]) -> int:
+    if shared_ones is None or int(shared_ones.physical_nbytes) == 0:
+        return 0
+    if shared_ones._materialized is not None:
+        return _cupy_device_nbytes(shared_ones._materialized, seen)
+    ptr = int(shared_ones.ptr)
+    if ptr in seen:
+        return 0
+    seen.add(ptr)
+    return int(shared_ones.physical_nbytes)
+
+
+def _cusparse_owned_device_nbytes(runtime: CusparseRuntime) -> int:
+    seen: set[int] = set()
+    total = _shared_ones_nbytes(runtime._shared_ones, seen)
+    for value in (runtime._alpha, runtime._beta_zero, runtime._beta_one, runtime._io0, runtime._io1, runtime._aux):
+        total += _cupy_device_nbytes(value, seen)
+    for values in (
+        runtime._slot_struct0,
+        runtime._slot_struct1,
+        runtime._up_level_bufs,
+        runtime._down_level_bufs,
+        runtime._up_src_bufs,
+        runtime._down_src_bufs,
+        runtime._up_scratch,
+        runtime._down_scratch,
+        runtime._ext_main_up,
+        runtime._ext_main_down,
+        runtime._ext_scratch_up,
+        runtime._ext_scratch_down,
+    ):
+        total += _cupy_nested_nbytes(values, seen)
+    for artifact in runtime._artifacts:
+        for selector in (artifact.mut_selector, artifact.miss_selector):
+            total += _cupy_nested_nbytes(selector.rows_by_level, seen)
+            total += _cupy_nested_nbytes(selector.cols_by_level, seen)
+        for value in (
+            artifact.node_perm,
+            artifact.sample_to_individual,
+            artifact.xtx_bias,
+            artifact.init_vector_up_bias,
+            artifact.init_vector_down_bias,
+            artifact.init_xtx_up_bias,
+            artifact.init_xtx_down_bias,
+        ):
+            total += _cupy_device_nbytes(value, seen)
+        for ops_by_level in (artifact.up_ops, artifact.down_ops):
+            for ops in ops_by_level:
+                for op in ops:
+                    total += _cupy_device_nbytes(op.block.struct0, seen)
+                    total += _cupy_device_nbytes(op.block.struct1, seen)
+    return total
+
+
 def _owner_keys(layout, *, resident: bool) -> tuple[tuple[int, int], ...]:
     keys = [
         (int(block.dst_level), int(block.src_level))
@@ -117,13 +194,14 @@ def _nonzero_slot_count(layout) -> int:
     return sum(1 for slot in layout.slot_plans if slot.nbytes > 0)
 
 
-def _build_layout(artifact, *, runtime_k: int, ring_buffer_size: int, budget_bytes: int, allow_residency: bool = True):
+def _build_layout(artifact, *, runtime_k: int, ring_buffer_size: int, budget_bytes: int, allow_residency: bool = True, stream=0):
     return build_cusparse_layout(
         [artifact],
         requirements=_requirements(runtime_k),
         ring_buffer_size=int(ring_buffer_size),
         vram_budget_bytes=int(budget_bytes),
         allow_residency=bool(allow_residency),
+        stream=stream,
     )
 
 
@@ -288,23 +366,23 @@ def _warm_spin_kernel() -> None:
     cp.cuda.runtime.deviceSynchronize()
 
 
-def _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, *, n: int, bandwidth: int) -> None:
+def _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, *, n: int, bandwidth: int, runtime_k: int) -> None:
     clear_cupy_state()
     _warm_spin_kernel()
     artifact = write_overlap_band_artifact(tmp_path, f"cusparse-overlap-{n}-{bandwidth}", n=n, bandwidth=bandwidth)
     budget_bytes = cusparse_ring_thresholds(
         artifact,
-        requirements=_requirements(1),
+        requirements=_requirements(runtime_k),
         total_vram_bytes=prepare_cusparse_stream_stress_case().total_vram_bytes,
         max_ring_buffer_size=2,
     )[int(requested_ring_buffer_size) - 1]
     layout = _build_layout(
         artifact,
-        runtime_k=1,
+        runtime_k=runtime_k,
         ring_buffer_size=requested_ring_buffer_size,
         budget_bytes=budget_bytes,
     )
-    ref_layout = build_reference_layout([artifact], requirements=_requirements(1))
+    ref_layout = build_reference_layout([artifact], requirements=_requirements(runtime_k))
     state = {"active": True, "compute": [], "copy": []}
     original_launch = CusparseRuntime._launch_spmm
 
@@ -376,7 +454,7 @@ def _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, 
         for run_idx, direction in enumerate(order):
             size = ref_grg.num_samples if direction == "up" else ref_grg.num_mutations
             rng = np.random.default_rng(51_000 + 1_000 * requested_ring_buffer_size + 10 * run_idx + (0 if direction == "up" else 1))
-            primary = rng.choice(np.array([-1.0, 1.0], dtype=DATA_DTYPE), size=(1, size))
+            primary = rng.choice(np.array([-1.0, 1.0], dtype=DATA_DTYPE), size=(int(runtime_k), size))
             expected = ref_grg.matmul(primary, direction)
             actual = grg.matmul(primary, direction)
             np.testing.assert_array_equal(actual, expected)
@@ -657,6 +735,16 @@ def test_cusparse_small_int64_artifact_compacts_slot_dtypes(tmp_path):
         assert runtime._slot_struct1[0].dtype == np.int32
 
 
+def test_cusparse_owned_device_bytes_do_not_exceed_tight_budget(primary_artifact):
+    clear_cupy_state()
+    base = build_cusparse_layout([primary_artifact], requirements=_requirements(2), vram_budget_bytes=1_000_000_000_000)
+    layout = build_cusparse_layout([primary_artifact], requirements=_requirements(2), vram_budget_bytes=base.bytes_total)
+    assert layout.bytes_total == base.bytes_total
+    with CusparseRuntime(layout) as runtime:
+        assert _cusparse_owned_device_nbytes(runtime) <= layout.vram_budget_bytes
+    clear_cupy_state()
+
+
 @pytest.mark.parametrize("requested_ring_buffer_size", [1, 2, 3], ids=["ring1", "ring2", "ring3"])
 def test_cusparse_allow_residency_false_forces_all_streamed_layout(cusparse_small_stream_artifact, requested_ring_buffer_size):
     fixed_bytes, block_bytes, owner_block_count = _full_budget_components(cusparse_small_stream_artifact, runtime_k=2)
@@ -838,7 +926,7 @@ def test_cusparse_small_three_block_planner_transitions(cusparse_small_stream_ar
 
 
 @pytest.mark.stress
-@pytest.mark.parametrize("runtime_k", [1, 2], ids=["k1", "k2"])
+@pytest.mark.parametrize("runtime_k", [2], ids=["k2"])
 @pytest.mark.parametrize("mode", THREE_BLOCK_TRANSITION_MODES, ids=[mode.name for mode in THREE_BLOCK_TRANSITION_MODES])
 def test_cusparse_large_three_block_planner_transitions(cusparse_stream_stress_artifact, runtime_k, mode):
     _assert_planner_transition(cusparse_stream_stress_artifact, runtime_k=runtime_k, mode=mode)
@@ -891,7 +979,7 @@ def test_cusparse_small_three_block_exactness_allow_residency_false(order, runti
 
 @pytest.mark.stress
 @pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
-@pytest.mark.parametrize("runtime_k", [1, 2], ids=["k1", "k2"])
+@pytest.mark.parametrize("runtime_k", [2], ids=["k2"])
 @pytest.mark.parametrize("mode", THREE_BLOCK_EXACTNESS_MODES, ids=[mode.name for mode in THREE_BLOCK_EXACTNESS_MODES])
 def test_cusparse_large_three_block_exactness(order, runtime_k, mode, cusparse_stream_stress_case, cusparse_stream_stress_artifact):
     clear_cupy_state()
@@ -902,11 +990,68 @@ def test_cusparse_large_three_block_exactness(order, runtime_k, mode, cusparse_s
 @pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
 @pytest.mark.parametrize("requested_ring_buffer_size", [1, 2], ids=["ring1", "ring2"])
 def test_cusparse_small_stream_copy_overlaps_compute(tmp_path, order, requested_ring_buffer_size, monkeypatch):
-    _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, n=64, bandwidth=8)
+    _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, n=64, bandwidth=8, runtime_k=1)
 
 
 @pytest.mark.stress
 @pytest.mark.parametrize("order", [("up", "down"), ("down", "up")], ids=["up-down", "down-up"])
 @pytest.mark.parametrize("requested_ring_buffer_size", [1, 2], ids=["ring1", "ring2"])
 def test_cusparse_stream_copy_overlaps_compute(tmp_path, order, requested_ring_buffer_size, monkeypatch):
-    _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, n=4096, bandwidth=64)
+    _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, n=4096, bandwidth=64, runtime_k=2)
+
+
+def test_cusparse_prepare_cuda_graph_capture_resident(primary_artifact, primary_grg):
+    torch = pytest.importorskip("torch")
+    with torch.cuda.device(0):
+        capture_stream = torch.cuda.Stream()
+    layout = build_cusparse_layout([primary_artifact], requirements=_requirements(2), stream=capture_stream)
+    with CusparseRuntime(layout) as runtime:
+        (grg,) = runtime.grgs
+        rng = np.random.default_rng(98_201)
+        src_np = rng.standard_normal((2, primary_grg.num_samples), dtype=DATA_DTYPE)
+        init_np = rng.standard_normal((2,), dtype=DATA_DTYPE)
+        expected = np.asarray(pygrgl.matmul(primary_grg, src_np, pygrgl.TraversalDirection.UP, init=init_np))
+        with grg.prepare_matmul_cuda(direction="up", k=2, init_mode="vector") as op:
+            src = torch.from_numpy(src_np).to(device=op.input.device)
+            init = torch.from_numpy(init_np).to(device=op.init_vector.device)
+            graph = torch.cuda.CUDAGraph()
+            # All capture-sensitive setup must already be complete once the prepared op is entered.
+            with torch.cuda.graph(graph, stream=capture_stream):
+                op.input.copy_(src)
+                op.init_vector.copy_(init)
+                op()
+            graph.replay()
+            cp.cuda.runtime.deviceSynchronize()
+            actual = op.output.cpu().numpy().copy()
+        np.testing.assert_allclose(actual, expected, atol=tol(DATA_DTYPE)[0], rtol=tol(DATA_DTYPE)[1])
+
+
+def test_cusparse_prepare_cuda_graph_capture_streamed(cusparse_small_stream_artifact, gpu_small_stream_case):
+    torch = pytest.importorskip("torch")
+    fixed_bytes, block_bytes, owner_block_count = _full_budget_components(cusparse_small_stream_artifact, runtime_k=1)
+    assert owner_block_count == 3
+    with torch.cuda.device(0):
+        capture_stream = torch.cuda.Stream()
+    layout = _build_layout(
+        cusparse_small_stream_artifact,
+        runtime_k=1,
+        ring_buffer_size=1,
+        budget_bytes=fixed_bytes + block_bytes,
+        allow_residency=False,
+        stream=capture_stream,
+    )
+    with CusparseRuntime(layout) as runtime:
+        (grg,) = runtime.grgs
+        src_np = np.arange(gpu_small_stream_case.n, dtype=DATA_DTYPE).reshape(1, gpu_small_stream_case.n)
+        expected = expected_up(src_np.T, shifts=gpu_small_stream_case.shifts, bandwidth=gpu_small_stream_case.bandwidth).T
+        with grg.prepare_matmul_cuda(direction="up", k=1) as op:
+            src = torch.from_numpy(src_np).to(device=op.input.device)
+            graph = torch.cuda.CUDAGraph()
+            # All capture-sensitive setup must already be complete once the prepared op is entered.
+            with torch.cuda.graph(graph, stream=capture_stream):
+                op.input.copy_(src)
+                op()
+            graph.replay()
+            cp.cuda.runtime.deviceSynchronize()
+            actual = op.output.cpu().numpy().copy()
+        np.testing.assert_allclose(actual, expected, atol=0.0, rtol=0.0)

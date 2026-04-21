@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 import warnings
 
@@ -20,6 +20,7 @@ from pygrgl_spmv.backends.base import (
     _require_struct_dtype,
     iter_direction_level_pairs,
     materialize_sparse_block,
+    relink_stream_dependencies,
     sparse_structure_lengths,
     stored_block_shape,
 )
@@ -31,7 +32,7 @@ from pygrgl_spmv.backends.triton.kernel import (
     launch_block,
 )
 from pygrgl_spmv.backends.types import Direction, InitMode, SparseFormat, StoredMatrix, transpose_compatible_format
-from pygrgl_spmv.grg import BoundGRG, RuntimeRequirements
+from pygrgl_spmv.grg import BoundGRG, RuntimeRequirements, _CudaMatmulSpec
 from pygrgl_spmv.grg.artifact import _load_grg_spmv_host, iter_artifact_blocks, scan_grg_spmv
 
 from .plan import TritonPlan, TritonPlanPair
@@ -98,6 +99,7 @@ class TritonLayout:
     max_num_samples: int
     max_num_mutations: int
     max_num_nodes: int
+    max_selector_nnz: int
     max_levels: int
     max_rows_by_level: tuple[int, ...]
     max_up_ops_by_level: tuple[int, ...]
@@ -169,9 +171,17 @@ class _TritonArtifact:
     state: object
     sel_mut_rows: torch.Tensor
     sel_mut_cols: torch.Tensor
+    sel_mut_row_unique: bool
     sel_miss_rows: torch.Tensor
     sel_miss_cols: torch.Tensor
+    sel_miss_row_unique: bool
+    node_perm: torch.Tensor
+    sample_to_individual: torch.Tensor
     xtx_bias: torch.Tensor | None
+    init_vector_up_bias: torch.Tensor | None
+    init_vector_down_bias: torch.Tensor | None
+    init_xtx_up_bias: torch.Tensor | None
+    init_xtx_down_bias: torch.Tensor | None
     up_ops: list[list[_TritonOp]]
     down_ops: list[list[_TritonOp]]
 
@@ -285,17 +295,43 @@ def _warn_ring_mismatch(*, requested: int, allocated: int) -> None:
     )
 
 
-def _relink_stream_dependencies(ops_by_level: list[list[_TritonOp]], *, direction: Direction) -> list[list[_TritonOp]]:
-    prev_by_slot: dict[int, tuple[int, int]] = {}
-    height = len(ops_by_level)
-    level_iter = range(1, height) if direction == Direction.UP else range(height - 2, -1, -1)
-    for dst_level in level_iter:
-        for op_idx, op in enumerate(ops_by_level[dst_level]):
-            if op.slot is None:
-                continue
-            ops_by_level[dst_level][op_idx] = replace(op, prev_in_slot=prev_by_slot.get(op.slot))
-            prev_by_slot[op.slot] = (dst_level, op_idx)
-    return ops_by_level
+def _enabled_max_k(pair: TritonPlanPair, requirements: RuntimeRequirements) -> int:
+    values = []
+    if pair.plan_up is not None:
+        values.append(int(requirements.max_k_up))
+    if pair.plan_down is not None:
+        values.append(int(requirements.max_k_down))
+    if not values:
+        raise ValueError("Triton layout requires at least one configured direction plan")
+    return max(values)
+
+
+def _side_io_rows(pair: TritonPlanPair, requirements: RuntimeRequirements, *, max_num_mutations: int, max_num_nodes: int) -> int:
+    need_miss_rows = (
+        (pair.plan_down is not None and requirements.need_down_miss_input)
+        or (pair.plan_up is not None and requirements.need_up_miss_output)
+    )
+    return max(
+        int(max_num_mutations) if need_miss_rows else 0,
+        1 if requirements.need_init_vector else 0,
+        int(max_num_nodes) if requirements.need_init_matrix else 0,
+    )
+
+
+def _metadata_bytes(state, pair: TritonPlanPair, requirements: RuntimeRequirements, dtype: np.dtype) -> int:
+    long_itemsize = int(np.dtype(np.int64).itemsize)
+    total = int((state.num_nodes + state.num_samples) * long_itemsize)
+    if requirements.need_init_vector:
+        if pair.plan_up is not None:
+            total += int(np.asarray(state.init_vector_up_bias, dtype=dtype).nbytes)
+        if pair.plan_down is not None:
+            total += int(np.asarray(state.init_vector_down_bias, dtype=dtype).nbytes)
+    if requirements.need_init_xtx:
+        if pair.plan_up is not None and state.init_xtx_up_bias is not None:
+            total += int(np.asarray(state.init_xtx_up_bias, dtype=dtype).nbytes)
+        if pair.plan_down is not None and state.init_xtx_down_bias is not None:
+            total += int(np.asarray(state.init_xtx_down_bias, dtype=dtype).nbytes)
+    return total
 
 
 def plan_triton_layout(
@@ -338,51 +374,41 @@ def plan_triton_layout(
     )
     scratch_up_enabled = _resolve_scratch_levels(pair.plan_up, max_levels)
     scratch_down_enabled = _resolve_scratch_levels(pair.plan_down, max_levels)
-    max_samples = max(scan.num_samples for scan in scans)
-    max_mutations = max(scan.num_mutations for scan in scans)
-    max_nodes = max(scan.num_nodes for scan in scans)
+    max_num_samples = max(scan.num_samples for scan in scans)
+    max_num_mutations = max(scan.num_mutations for scan in scans)
+    max_num_nodes = max(scan.num_nodes for scan in scans)
+    max_selector_nnz = max(
+        max(int(scan.selector_mut_nnz), int(scan.selector_miss_nnz))
+        for scan in scans
+    )
 
     selector_bytes = 0
+    metadata_bytes = 0
     xtx_bias_bytes = 0
+    long_itemsize = int(np.dtype(np.int64).itemsize)
     for path in paths:
         state = _load_grg_spmv_host(path, dtype)
         sel_mut = state.sel_mut.tocoo()
         sel_miss = state.sel_miss.tocoo()
-        selector_bytes += int(np.asarray(sel_mut.row).nbytes + np.asarray(sel_mut.col).nbytes)
-        selector_bytes += int(np.asarray(sel_miss.row).nbytes + np.asarray(sel_miss.col).nbytes)
+        selector_bytes += int((sel_mut.row.size + sel_mut.col.size + sel_miss.row.size + sel_miss.col.size) * long_itemsize)
+        metadata_bytes += _metadata_bytes(state, pair, requirements, dtype)
         if requirements.need_init_xtx and state.coalescence_counts is not None:
             xtx_bias_bytes += int(state.num_nodes * dtype.itemsize)
 
-    staging_bytes = 0
-    workspace_up = 0
-    workspace_down = 0
+    max_k = _enabled_max_k(pair, requirements)
+    state_bytes = int(max_num_nodes * max_k * dtype.itemsize)
+    io0_rows = int(max(max_num_samples, max_num_mutations))
+    side_io_rows = _side_io_rows(pair, requirements, max_num_mutations=max_num_mutations, max_num_nodes=max_num_nodes)
+    aux_rows = int(max(max_num_nodes, max_num_samples, max_num_mutations, max_selector_nnz))
+    dense_arena_bytes = int((io0_rows + side_io_rows + aux_rows) * max_k * dtype.itemsize)
     scratch_bytes = 0
-    if pair.plan_up is not None:
-        workspace_up = int(max_nodes * int(requirements.max_k_up) * dtype.itemsize)
-        staging_bytes += int(max_samples * int(requirements.max_k_up) * dtype.itemsize)
-        staging_bytes += int(max_mutations * int(requirements.max_k_up) * dtype.itemsize)
-        if requirements.need_up_miss_output:
-            staging_bytes += int(max_mutations * int(requirements.max_k_up) * dtype.itemsize)
-        if requirements.need_init_vector:
-            staging_bytes += int(int(requirements.max_k_up) * dtype.itemsize)
-        if requirements.need_init_matrix:
-            staging_bytes += int(max_nodes * int(requirements.max_k_up) * dtype.itemsize)
-        for level, enabled in enumerate(scratch_up_enabled):
-            if enabled:
-                scratch_bytes += int(max_rows_by_level[level] * max_up_ops_by_level[level] * int(requirements.max_k_up) * dtype.itemsize)
-    if pair.plan_down is not None:
-        workspace_down = int(max_nodes * int(requirements.max_k_down) * dtype.itemsize)
-        staging_bytes += int(max_mutations * int(requirements.max_k_down) * dtype.itemsize)
-        staging_bytes += int(max_samples * int(requirements.max_k_down) * dtype.itemsize)
-        if requirements.need_down_miss_input:
-            staging_bytes += int(max_mutations * int(requirements.max_k_down) * dtype.itemsize)
-        if requirements.need_init_vector:
-            staging_bytes += int(int(requirements.max_k_down) * dtype.itemsize)
-        if requirements.need_init_matrix:
-            staging_bytes += int(max_nodes * int(requirements.max_k_down) * dtype.itemsize)
-        for level, enabled in enumerate(scratch_down_enabled):
-            if enabled:
-                scratch_bytes += int(max_rows_by_level[level] * max_down_ops_by_level[level] * int(requirements.max_k_down) * dtype.itemsize)
+    for level in range(max_levels):
+        scratch_slots = max(
+            max_up_ops_by_level[level] if scratch_up_enabled[level] else 0,
+            max_down_ops_by_level[level] if scratch_down_enabled[level] else 0,
+        )
+        if scratch_slots:
+            scratch_bytes += int(max_rows_by_level[level] * scratch_slots * max_k * dtype.itemsize)
 
     blocks: list[_TritonBlockPlan] = []
     planned: list[_TritonArtifactLayout] = []
@@ -403,7 +429,7 @@ def plan_triton_layout(
             )
         )
 
-    fixed_bytes = int(selector_bytes + xtx_bias_bytes + staging_bytes + workspace_up + workspace_down + scratch_bytes)
+    fixed_bytes = int(selector_bytes + metadata_bytes + xtx_bias_bytes + dense_arena_bytes + state_bytes + scratch_bytes)
     resident_bytes_full = int(sum(block.nbytes for block in blocks))
     required_budget_for_full_residency = int(fixed_bytes + resident_bytes_full)
     if not allow_residency:
@@ -464,18 +490,18 @@ def plan_triton_layout(
         "resident_sparse": resident_bytes,
         "ring_slots": ring_bytes,
         "selectors": int(selector_bytes),
+        "metadata": int(metadata_bytes),
         "xtx_bias": int(xtx_bias_bytes),
-        "staging": int(staging_bytes),
-        "workspace_up": int(workspace_up),
-        "workspace_down": int(workspace_down),
+        "dense_arena": int(dense_arena_bytes),
+        "state": int(state_bytes),
         "scratch": int(scratch_bytes),
     }
     budget_items: list[BudgetItem] = [
         BudgetItem(kind="fixed", name="selectors", nbytes=int(selector_bytes)),
+        BudgetItem(kind="fixed", name="metadata", nbytes=int(metadata_bytes)),
         BudgetItem(kind="fixed", name="xtx_bias", nbytes=int(xtx_bias_bytes)),
-        BudgetItem(kind="fixed", name="staging", nbytes=int(staging_bytes)),
-        BudgetItem(kind="fixed", name="workspace_up", nbytes=int(workspace_up)),
-        BudgetItem(kind="fixed", name="workspace_down", nbytes=int(workspace_down)),
+        BudgetItem(kind="fixed", name="dense_arena", nbytes=int(dense_arena_bytes)),
+        BudgetItem(kind="fixed", name="state", nbytes=int(state_bytes)),
         BudgetItem(kind="fixed", name="scratch", nbytes=int(scratch_bytes)),
     ]
     for artifact_index, artifact_layout in enumerate(planned):
@@ -506,9 +532,10 @@ def plan_triton_layout(
         requested_ring_buffer_size=requested_ring_buffer_size,
         allocated_ring_buffer_size=len(slot_plans),
         vram_budget_bytes=int(vram_budget_bytes),
-        max_num_samples=max_samples,
-        max_num_mutations=max_mutations,
-        max_num_nodes=max_nodes,
+        max_num_samples=max_num_samples,
+        max_num_mutations=max_num_mutations,
+        max_num_nodes=max_num_nodes,
+        max_selector_nnz=max_selector_nnz,
         max_levels=max_levels,
         max_rows_by_level=max_rows_by_level,
         max_up_ops_by_level=max_up_ops_by_level,
@@ -523,6 +550,51 @@ def plan_triton_layout(
     )
 
 
+class _TritonPreparedMatmul:
+    def __init__(self, runtime: "TritonRuntime", artifact: _TritonArtifact, spec: _CudaMatmulSpec) -> None:
+        self._runtime = runtime
+        self._artifact = artifact
+        self._spec = spec
+        k = int(spec.k)
+        self._input_internal = runtime._io0[: spec.input_cols, :k]
+        self.input = self._input_internal.T
+        if spec.emit_all_nodes:
+            self._output_internal = runtime._aux[: artifact.state.num_nodes, :k]
+        else:
+            self._output_internal = runtime._io0[: spec.output_cols, :k]
+        self.output = self._output_internal.T
+        if spec.use_miss:
+            assert runtime._io1 is not None
+            miss_view = runtime._io1[: artifact.state.num_mutations, :k]
+            if spec.direction == Direction.DOWN:
+                self._miss_input_internal = miss_view
+                self.miss_input = miss_view.T
+            else:
+                self._miss_output_internal = miss_view
+                self.miss_output = miss_view.T
+        if spec.init_mode == InitMode.VECTOR:
+            assert runtime._io1 is not None
+            self._init_vector_internal = runtime._io1[0, :k]
+            self.init_vector = self._init_vector_internal
+        if spec.init_mode == InitMode.MATRIX:
+            assert runtime._io1 is not None
+            self._init_matrix_internal = runtime._io1[: artifact.state.num_nodes, :k]
+            self.init_matrix = self._init_matrix_internal.T
+
+    def __enter__(self) -> "_TritonPreparedMatmul":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def __call__(self) -> None:
+        with self._runtime._call_scope():
+            self._call_prelocked()
+
+    def _call_prelocked(self) -> None:
+        self._runtime._execute_prepared(self._artifact, self._spec, self)
+
+
 class TritonRuntime:
     """Runtime-owned Triton execution with resident or streamed sparse blocks."""
 
@@ -533,35 +605,49 @@ class TritonRuntime:
         self.device = torch.device("cuda", int(layout.device))
         self.stream_ptr = int(layout.stream_ptr)
         self.stream = None
-        self._caller_stream_keepalive = layout.stream_owner
+        self._stream_owner = layout.stream_owner
         self._caller_stream = None
         self._root_stream = None
         self._caller_to_root_event = None
         self._root_to_caller_event = None
         self._level_streams: list[torch.cuda.Stream] = []
         self._slot_copy_streams: list[torch.cuda.Stream] = []
-        self._scratch_streams_up: list[list[torch.cuda.Stream]] = []
-        self._scratch_streams_down: list[list[torch.cuda.Stream]] = []
+        self._scratch_streams: list[list[torch.cuda.Stream]] = []
         self._slot_indices: list[torch.Tensor] = []
         self._slot_indptr: list[torch.Tensor] = []
-        self._up_state = None
-        self._down_state = None
-        self._up_scratch: list[list[torch.Tensor]] = []
-        self._down_scratch: list[list[torch.Tensor]] = []
+        self._state: torch.Tensor | None = None
+        self._io0: torch.Tensor | None = None
+        self._io1: torch.Tensor | None = None
+        self._aux: torch.Tensor | None = None
+        self._scratch: list[list[torch.Tensor]] = []
+        self._copy_done: list[list[torch.cuda.Event]] = []
+        self._compute_done: list[list[torch.cuda.Event]] = []
+        self._level_ready: list[torch.cuda.Event] = []
+        self._launch_event = None
         self._artifacts: tuple[_TritonArtifact, ...] = ()
         self._grgs: tuple[BoundGRG, ...] = ()
         self._entered = False
         self._active_call = False
         self._config_up: CsrKernelConfig | CscKernelConfig | None = None
         self._config_down: CsrKernelConfig | CscKernelConfig | None = None
-        self._staging_up: dict[str, torch.Tensor] = {}
-        self._staging_down: dict[str, torch.Tensor] = {}
 
     @property
     def grgs(self) -> tuple[BoundGRG, ...]:
         if not self._entered:
             raise RuntimeError("TritonRuntime must be entered before accessing grgs")
         return self._grgs
+
+    def _arena_max_k(self) -> int:
+        return _enabled_max_k(self.layout.pair, self.layout.requirements)
+
+    def _shared_scratch_ops_by_level(self) -> tuple[int, ...]:
+        return tuple(
+            max(
+                self.layout.max_up_ops_by_level[level] if self.layout.scratch_up_enabled[level] else 0,
+                self.layout.max_down_ops_by_level[level] if self.layout.scratch_down_enabled[level] else 0,
+            )
+            for level in range(self.layout.max_levels)
+        )
 
     def _reset_owned_state(self) -> None:
         self._artifacts = ()
@@ -570,14 +656,16 @@ class TritonRuntime:
         self._slot_indptr = []
         self._level_streams = []
         self._slot_copy_streams = []
-        self._scratch_streams_up = []
-        self._scratch_streams_down = []
-        self._up_state = None
-        self._down_state = None
-        self._up_scratch = []
-        self._down_scratch = []
-        self._staging_up = {}
-        self._staging_down = {}
+        self._scratch_streams = []
+        self._state = None
+        self._io0 = None
+        self._io1 = None
+        self._aux = None
+        self._scratch = []
+        self._copy_done = []
+        self._compute_done = []
+        self._level_ready = []
+        self._launch_event = None
         self._config_up = None
         self._config_down = None
         self.stream = None
@@ -591,6 +679,16 @@ class TritonRuntime:
     def __enter__(self) -> "TritonRuntime":
         artifacts: list[_TritonArtifact] = []
         try:
+            max_k = self._arena_max_k()
+            io0_rows = int(max(self.layout.max_num_samples, self.layout.max_num_mutations))
+            side_io_rows = _side_io_rows(
+                self.layout.pair,
+                self.layout.requirements,
+                max_num_mutations=self.layout.max_num_mutations,
+                max_num_nodes=self.layout.max_num_nodes,
+            )
+            aux_rows = int(max(self.layout.max_num_nodes, self.layout.max_num_samples, self.layout.max_num_mutations, self.layout.max_selector_nnz))
+            scratch_slots = self._shared_scratch_ops_by_level()
             with torch.cuda.device(self.device):
                 self._caller_stream = torch.cuda.get_stream_from_external(self.stream_ptr, device=self.device)
                 self.stream = self._caller_stream
@@ -599,12 +697,8 @@ class TritonRuntime:
                 self._root_to_caller_event = torch.cuda.Event()
                 self._level_streams = [torch.cuda.Stream() for _ in range(self.layout.max_levels)]
                 self._slot_copy_streams = [torch.cuda.Stream() for _ in range(self.layout.allocated_ring_buffer_size)]
-                self._scratch_streams_up = [
-                    [torch.cuda.Stream() for _ in range(self.layout.max_up_ops_by_level[level])] if self.layout.scratch_up_enabled[level] else []
-                    for level in range(self.layout.max_levels)
-                ]
-                self._scratch_streams_down = [
-                    [torch.cuda.Stream() for _ in range(self.layout.max_down_ops_by_level[level])] if self.layout.scratch_down_enabled[level] else []
+                self._scratch_streams = [
+                    [torch.cuda.Stream() for _ in range(scratch_slots[level])]
                     for level in range(self.layout.max_levels)
                 ]
                 self._slot_indices = [
@@ -615,40 +709,31 @@ class TritonRuntime:
                     torch.zeros((slot.indptr_len,), device=self.device, dtype=_torch_int_dtype(slot.indptr_dtype))
                     for slot in self.layout.slot_plans
                 ]
-                if self.layout.pair.plan_up is not None:
-                    max_k_up = int(self.layout.requirements.max_k_up)
-                    self._up_state = torch.zeros((self.layout.max_num_nodes, max_k_up), device=self.device, dtype=self._torch_dtype())
-                    self._staging_up["input_primary"] = torch.zeros((self.layout.max_num_samples, max_k_up), device=self.device, dtype=self._torch_dtype())
-                    self._staging_up["output_main"] = torch.zeros((self.layout.max_num_mutations, max_k_up), device=self.device, dtype=self._torch_dtype())
-                    if self.layout.requirements.need_up_miss_output:
-                        self._staging_up["output_miss"] = torch.zeros((self.layout.max_num_mutations, max_k_up), device=self.device, dtype=self._torch_dtype())
-                    if self.layout.requirements.need_init_vector:
-                        self._staging_up["init_vector"] = torch.zeros((1, max_k_up), device=self.device, dtype=self._torch_dtype())
-                    if self.layout.requirements.need_init_matrix:
-                        self._staging_up["init_matrix"] = torch.zeros((self.layout.max_num_nodes, max_k_up), device=self.device, dtype=self._torch_dtype())
-                    self._up_scratch = [
-                        [torch.zeros((self.layout.max_rows_by_level[level], max_k_up), device=self.device, dtype=self._torch_dtype()) for _ in range(self.layout.max_up_ops_by_level[level])]
-                        if self.layout.scratch_up_enabled[level]
-                        else []
-                        for level in range(self.layout.max_levels)
+                self._state = torch.zeros((self.layout.max_num_nodes, max_k), device=self.device, dtype=self._torch_dtype())
+                self._io0 = torch.zeros((io0_rows, max_k), device=self.device, dtype=self._torch_dtype())
+                self._io1 = None if side_io_rows == 0 else torch.zeros((side_io_rows, max_k), device=self.device, dtype=self._torch_dtype())
+                self._aux = torch.zeros((aux_rows, max_k), device=self.device, dtype=self._torch_dtype())
+                self._scratch = [
+                    [
+                        torch.zeros((self.layout.max_rows_by_level[level], max_k), device=self.device, dtype=self._torch_dtype())
+                        for _ in range(scratch_slots[level])
                     ]
-                if self.layout.pair.plan_down is not None:
-                    max_k_down = int(self.layout.requirements.max_k_down)
-                    self._down_state = torch.zeros((self.layout.max_num_nodes, max_k_down), device=self.device, dtype=self._torch_dtype())
-                    self._staging_down["input_primary"] = torch.zeros((self.layout.max_num_mutations, max_k_down), device=self.device, dtype=self._torch_dtype())
-                    self._staging_down["output_main"] = torch.zeros((self.layout.max_num_samples, max_k_down), device=self.device, dtype=self._torch_dtype())
-                    if self.layout.requirements.need_down_miss_input:
-                        self._staging_down["input_miss"] = torch.zeros((self.layout.max_num_mutations, max_k_down), device=self.device, dtype=self._torch_dtype())
-                    if self.layout.requirements.need_init_vector:
-                        self._staging_down["init_vector"] = torch.zeros((1, max_k_down), device=self.device, dtype=self._torch_dtype())
-                    if self.layout.requirements.need_init_matrix:
-                        self._staging_down["init_matrix"] = torch.zeros((self.layout.max_num_nodes, max_k_down), device=self.device, dtype=self._torch_dtype())
-                    self._down_scratch = [
-                        [torch.zeros((self.layout.max_rows_by_level[level], max_k_down), device=self.device, dtype=self._torch_dtype()) for _ in range(self.layout.max_down_ops_by_level[level])]
-                        if self.layout.scratch_down_enabled[level]
-                        else []
-                        for level in range(self.layout.max_levels)
-                    ]
+                    for level in range(self.layout.max_levels)
+                ]
+                max_ops_by_level = [
+                    max(int(self.layout.max_up_ops_by_level[level]), int(self.layout.max_down_ops_by_level[level]))
+                    for level in range(self.layout.max_levels)
+                ]
+                self._copy_done = [
+                    [torch.cuda.Event() for _ in range(max_ops_by_level[level])]
+                    for level in range(self.layout.max_levels)
+                ]
+                self._compute_done = [
+                    [torch.cuda.Event() for _ in range(max_ops_by_level[level])]
+                    for level in range(self.layout.max_levels)
+                ]
+                self._level_ready = [torch.cuda.Event() for _ in range(self.layout.max_levels)]
+                self._launch_event = torch.cuda.Event()
 
             states = tuple(_load_grg_spmv_host(artifact.path, self.layout.dtype) for artifact in self.layout.artifacts)
             for artifact_layout, state in zip(self.layout.artifacts, states, strict=True):
@@ -670,6 +755,9 @@ class TritonRuntime:
 
     def _torch_dtype(self) -> torch.dtype:
         return torch.float64 if np.dtype(self.layout.dtype) == np.float64 else torch.float32
+
+    def _torch_caller_stream(self):
+        return self._caller_stream
 
     @contextmanager
     def _call_scope(self):
@@ -704,6 +792,13 @@ class TritonRuntime:
         host = torch.empty(values.shape, dtype=_torch_int_dtype(dtype), pin_memory=True)
         _copy_struct_checked(host.numpy(), values, label=label)
         return host
+
+    def _prepare_matmul_cuda(self, grg: BoundGRG, spec: _CudaMatmulSpec) -> _TritonPreparedMatmul:
+        if spec.direction == Direction.UP and self.layout.pair.plan_up is None:
+            raise ValueError("UP plan is not configured")
+        if spec.direction == Direction.DOWN and self.layout.pair.plan_down is None:
+            raise ValueError("DOWN plan is not configured")
+        return _TritonPreparedMatmul(self, self._artifacts[int(grg._artifact_index)], spec)
 
     def _build_artifact(self, artifact_layout: _TritonArtifactLayout, state) -> _TritonArtifact:
         up_owner: dict[tuple[int, int], _TritonLaunchBlock | _TritonStreamSource] = {}
@@ -764,14 +859,36 @@ class TritonRuntime:
             xtx_bias = None
             if self.layout.requirements.need_init_xtx and state.coalescence_counts is not None:
                 xtx_bias = torch.from_numpy(2.0 * state.coalescence_counts.astype(self.layout.dtype, copy=False)).to(device=self.device, dtype=self._torch_dtype())
+            init_vector_up_bias = None
+            init_vector_down_bias = None
+            if self.layout.requirements.need_init_vector:
+                if self.layout.pair.plan_up is not None:
+                    init_vector_up_bias = torch.from_numpy(np.asarray(state.init_vector_up_bias, dtype=self.layout.dtype)).to(device=self.device, dtype=self._torch_dtype())
+                if self.layout.pair.plan_down is not None:
+                    init_vector_down_bias = torch.from_numpy(np.asarray(state.init_vector_down_bias, dtype=self.layout.dtype)).to(device=self.device, dtype=self._torch_dtype())
+            init_xtx_up_bias = None
+            init_xtx_down_bias = None
+            if self.layout.requirements.need_init_xtx:
+                if self.layout.pair.plan_up is not None and state.init_xtx_up_bias is not None:
+                    init_xtx_up_bias = torch.from_numpy(np.asarray(state.init_xtx_up_bias, dtype=self.layout.dtype)).to(device=self.device, dtype=self._torch_dtype())
+                if self.layout.pair.plan_down is not None and state.init_xtx_down_bias is not None:
+                    init_xtx_down_bias = torch.from_numpy(np.asarray(state.init_xtx_down_bias, dtype=self.layout.dtype)).to(device=self.device, dtype=self._torch_dtype())
             return _TritonArtifact(
                 path=artifact_layout.path,
                 state=state,
-                sel_mut_rows=torch.from_numpy(np.asarray(sel_mut.row)).to(device=self.device),
-                sel_mut_cols=torch.from_numpy(np.asarray(sel_mut.col)).to(device=self.device),
-                sel_miss_rows=torch.from_numpy(np.asarray(sel_miss.row)).to(device=self.device),
-                sel_miss_cols=torch.from_numpy(np.asarray(sel_miss.col)).to(device=self.device),
+                sel_mut_rows=torch.from_numpy(np.asarray(sel_mut.row)).to(device=self.device, dtype=torch.long),
+                sel_mut_cols=torch.from_numpy(np.asarray(sel_mut.col)).to(device=self.device, dtype=torch.long),
+                sel_mut_row_unique=bool(np.all(np.diff(np.asarray(state.sel_mut.indptr)) <= 1)),
+                sel_miss_rows=torch.from_numpy(np.asarray(sel_miss.row)).to(device=self.device, dtype=torch.long),
+                sel_miss_cols=torch.from_numpy(np.asarray(sel_miss.col)).to(device=self.device, dtype=torch.long),
+                sel_miss_row_unique=bool(np.all(np.diff(np.asarray(state.sel_miss.indptr)) <= 1)),
+                node_perm=torch.from_numpy(np.asarray(state.node_perm)).to(device=self.device, dtype=torch.long),
+                sample_to_individual=torch.from_numpy(np.asarray(state.sample_to_individual)).to(device=self.device, dtype=torch.long),
                 xtx_bias=xtx_bias,
+                init_vector_up_bias=init_vector_up_bias,
+                init_vector_down_bias=init_vector_down_bias,
+                init_xtx_up_bias=init_xtx_up_bias,
+                init_xtx_down_bias=init_xtx_down_bias,
                 up_ops=self._build_ops(Direction.UP, artifact_layout, state, up_owner, down_owner),
                 down_ops=self._build_ops(Direction.DOWN, artifact_layout, state, up_owner, down_owner),
             )
@@ -814,7 +931,7 @@ class TritonRuntime:
                     prev_in_slot=None,
                 )
             )
-        return _relink_stream_dependencies(ops, direction=direction)
+        return relink_stream_dependencies(ops, direction=direction)
 
     def _view(self, state_tensor: torch.Tensor, state, level: int, k: int) -> torch.Tensor:
         lo = int(state.level_offsets[level])
@@ -840,12 +957,12 @@ class TritonRuntime:
             copy_done[dst_level][op_idx].record(stream)
 
     def _enqueue_wavefront(self, artifact: _TritonArtifact, direction: Direction, k: int) -> None:
-        state_tensor = self._up_state if direction == Direction.UP else self._down_state
-        assert state_tensor is not None
+        assert self._state is not None
+        assert self._root_stream is not None
+        assert self._launch_event is not None
+        state_tensor = self._state
         ops_by_level = artifact.up_ops if direction == Direction.UP else artifact.down_ops
         scratch_enabled = self.layout.scratch_up_enabled if direction == Direction.UP else self.layout.scratch_down_enabled
-        scratch_streams = self._scratch_streams_up if direction == Direction.UP else self._scratch_streams_down
-        scratch_buffers = self._up_scratch if direction == Direction.UP else self._down_scratch
         h = len(artifact.state.level_offsets) - 1
         if direction == Direction.UP:
             seed_level = 0
@@ -854,19 +971,18 @@ class TritonRuntime:
             seed_level = h - 1
             level_iter = range(h - 2, -1, -1)
 
-        copy_done = [[torch.cuda.Event() for _ in ops] for ops in ops_by_level]
-        compute_done = [[torch.cuda.Event() for _ in ops] for ops in ops_by_level]
-        level_ready = [torch.cuda.Event() for _ in range(h)]
-        launch_event = torch.cuda.Event()
+        copy_done = self._copy_done
+        compute_done = self._compute_done
+        level_ready = self._level_ready
         with torch.cuda.stream(self._root_stream):
-            launch_event.record(self._root_stream)
+            self._launch_event.record(self._root_stream)
         for stream in self._slot_copy_streams:
-            stream.wait_event(launch_event)
+            stream.wait_event(self._launch_event)
         for stream in self._level_streams:
-            stream.wait_event(launch_event)
-        for per_level in scratch_streams:
+            stream.wait_event(self._launch_event)
+        for per_level in self._scratch_streams:
             for stream in per_level:
-                stream.wait_event(launch_event)
+                stream.wait_event(self._launch_event)
         if h > 0:
             with torch.cuda.stream(self._level_streams[seed_level]):
                 level_ready[seed_level].record(self._level_streams[seed_level])
@@ -874,15 +990,12 @@ class TritonRuntime:
             stream = self._level_streams[dst_level]
             ops = ops_by_level[dst_level]
             if scratch_enabled[dst_level]:
-                done_events = [torch.cuda.Event() for _ in ops]
-                with torch.cuda.stream(stream):
-                    pass
                 for op_idx, op in enumerate(ops):
-                    helper = scratch_streams[dst_level][op_idx]
+                    helper = self._scratch_streams[dst_level][op_idx]
                     if op.slot is not None:
                         self._copy_host_block_to_slot(copy_done, compute_done, dst_level, op_idx, op)
                     dst_view = self._view(state_tensor, artifact.state, dst_level, k)
-                    helper_view = scratch_buffers[dst_level][op_idx][: dst_view.shape[0], :k]
+                    helper_view = self._scratch[dst_level][op_idx][: dst_view.shape[0], :k]
                     with torch.cuda.stream(helper):
                         helper.wait_event(level_ready[op.src_level])
                         if op.slot is not None:
@@ -896,12 +1009,11 @@ class TritonRuntime:
                             fp64_acc=self._torch_dtype() == torch.float64,
                         )
                         compute_done[dst_level][op_idx].record(helper)
-                        done_events[op_idx].record(helper)
                 with torch.cuda.stream(stream):
                     dst_view = self._view(state_tensor, artifact.state, dst_level, k)
-                    for op_idx, done in enumerate(done_events):
-                        stream.wait_event(done)
-                        dst_view.add_(scratch_buffers[dst_level][op_idx][: dst_view.shape[0], :k])
+                    for op_idx in range(len(ops)):
+                        stream.wait_event(compute_done[dst_level][op_idx])
+                        dst_view.add_(self._scratch[dst_level][op_idx][: dst_view.shape[0], :k])
                     level_ready[dst_level].record(stream)
                 continue
             with torch.cuda.stream(stream):
@@ -922,8 +1034,8 @@ class TritonRuntime:
                     compute_done[dst_level][op_idx].record(stream)
                 level_ready[dst_level].record(stream)
         with torch.cuda.stream(self._root_stream):
-            for event in level_ready:
-                self._root_stream.wait_event(event)
+            for level in range(h):
+                self._root_stream.wait_event(level_ready[level])
 
     def _config_for(self, direction: Direction):
         config = self._config_up if direction == Direction.UP else self._config_down
@@ -977,104 +1089,129 @@ class TritonRuntime:
         return int(self.layout.requirements.max_k_up if direction == Direction.UP else self.layout.requirements.max_k_down)
 
     def _seed_for_tune(self, artifact: _TritonArtifact, direction: Direction, k: int) -> None:
-        state_tensor = self._up_state if direction == Direction.UP else self._down_state
-        staging = self._staging_up if direction == Direction.UP else self._staging_down
-        assert state_tensor is not None
+        assert self._state is not None
+        assert self._aux is not None
+        assert self._root_stream is not None
+        state_tensor = self._state[: artifact.state.num_nodes, :k]
         with torch.cuda.stream(self._root_stream):
             state_tensor.zero_()
-            staging["input_primary"].zero_()
-            staging["input_primary"][:, :k].fill_(1.0)
             if direction == Direction.UP:
-                state_tensor[: artifact.state.num_samples, :k].add_(staging["input_primary"][: artifact.state.num_samples, :k])
-            else:
-                if artifact.sel_mut_rows.numel() > 0:
-                    state_tensor[:, :k].index_add_(0, artifact.sel_mut_cols, staging["input_primary"][:, :k].index_select(0, artifact.sel_mut_rows))
+                state_tensor[: artifact.state.num_samples, :k].fill_(1.0)
+            elif artifact.sel_mut_rows.numel() > 0:
+                temp = self._aux[: artifact.sel_mut_rows.numel(), :k]
+                temp.fill_(1.0)
+                state_tensor.index_add_(0, artifact.sel_mut_cols, temp)
 
-    def _stage_inputs(self, direction: Direction, primary: np.ndarray, miss: np.ndarray | None, init_mode: InitMode, init_payload: np.ndarray | None) -> None:
-        staging = self._staging_up if direction == Direction.UP else self._staging_down
-        input_primary = staging["input_primary"]
-        k = int(primary.shape[1])
-        with torch.cuda.stream(self._root_stream):
-            input_primary.zero_()
-            input_primary[: primary.shape[0], :k].copy_(torch.from_numpy(np.asarray(primary, dtype=self.layout.dtype)), non_blocking=False)
-            if direction == Direction.DOWN and miss is not None and "input_miss" in staging:
-                staging["input_miss"].zero_()
-                staging["input_miss"][: miss.shape[0], :k].copy_(torch.from_numpy(np.asarray(miss, dtype=self.layout.dtype)), non_blocking=False)
-            if init_mode == InitMode.VECTOR and "init_vector" in staging and init_payload is not None:
-                staging["init_vector"].zero_()
-                staging["init_vector"][0, :k].copy_(torch.from_numpy(np.asarray(init_payload, dtype=self.layout.dtype)), non_blocking=False)
-            if init_mode == InitMode.MATRIX and "init_matrix" in staging and init_payload is not None:
-                staging["init_matrix"].zero_()
-                staging["init_matrix"][: init_payload.shape[0], :k].copy_(torch.from_numpy(np.asarray(init_payload, dtype=self.layout.dtype)), non_blocking=False)
-
-    def _seed_workspace(self, artifact: _TritonArtifact, direction: Direction, init_mode: InitMode, has_miss_input: bool, k: int) -> None:
-        state_tensor = self._up_state if direction == Direction.UP else self._down_state
-        staging = self._staging_up if direction == Direction.UP else self._staging_down
-        assert state_tensor is not None
+    def _seed_state(self, artifact: _TritonArtifact, spec: _CudaMatmulSpec, prepared: _TritonPreparedMatmul) -> None:
+        assert self._state is not None
+        assert self._aux is not None
+        assert self._root_stream is not None
+        k = int(spec.k)
+        state_tensor = self._state[: artifact.state.num_nodes, :k]
         with torch.cuda.stream(self._root_stream):
             state_tensor.zero_()
-            if init_mode == InitMode.XTX:
+            if spec.backend_init_mode == InitMode.XTX:
                 if artifact.xtx_bias is None:
                     raise ValueError("init_mode=xtx requires GRG coalescence counts")
-                state_tensor[: artifact.state.num_nodes, :k].add_(artifact.xtx_bias[: artifact.state.num_nodes, None])
-            elif init_mode == InitMode.VECTOR and "init_vector" in staging:
-                state_tensor[: artifact.state.num_nodes, :k].add_(staging["init_vector"][0, :k])
-            elif init_mode == InitMode.MATRIX and "init_matrix" in staging:
-                state_tensor[: artifact.state.num_nodes, :k].add_(staging["init_matrix"][: artifact.state.num_nodes, :k])
-            if direction == Direction.UP:
-                state_tensor[: artifact.state.num_samples, :k].add_(staging["input_primary"][: artifact.state.num_samples, :k])
-            else:
-                if artifact.sel_mut_rows.numel() > 0:
-                    state_tensor[:, :k].index_add_(0, artifact.sel_mut_cols, staging["input_primary"][:, :k].index_select(0, artifact.sel_mut_rows))
-                if has_miss_input and artifact.sel_miss_rows.numel() > 0 and "input_miss" in staging:
-                    state_tensor[:, :k].index_add_(0, artifact.sel_miss_cols, staging["input_miss"][:, :k].index_select(0, artifact.sel_miss_rows))
+                state_tensor.add_(artifact.xtx_bias[: artifact.state.num_nodes, None])
+            elif spec.backend_init_mode == InitMode.VECTOR:
+                state_tensor.add_(prepared._init_vector_internal)
+            elif spec.backend_init_mode == InitMode.MATRIX:
+                torch.index_select(prepared._init_matrix_internal, 0, artifact.node_perm, out=state_tensor)
 
-    def _run(
-        self,
-        artifact_index: int,
-        direction: Direction,
-        primary: np.ndarray,
-        *,
-        miss: np.ndarray | None,
-        init_mode: InitMode,
-        init_payload: np.ndarray | None,
-        need_miss_output: bool,
-        emit_all_nodes: bool,
-    ):
-        if direction == Direction.UP and self.layout.pair.plan_up is None:
-            raise ValueError("UP plan is not configured")
-        if direction == Direction.DOWN and self.layout.pair.plan_down is None:
-            raise ValueError("DOWN plan is not configured")
-        k = int(primary.shape[1])
-        artifact = self._artifacts[int(artifact_index)]
-        with self._caller_root_scope():
-            self._stage_inputs(direction, primary, miss, init_mode, init_payload)
-            self._seed_workspace(artifact, direction, init_mode, has_miss_input=miss is not None, k=k)
-            self._enqueue_wavefront(artifact, direction, k)
-            torch.cuda.synchronize(self.device)
-        state_tensor = self._up_state if direction == Direction.UP else self._down_state
-        assert state_tensor is not None
-        if emit_all_nodes:
-            return state_tensor[: artifact.state.num_nodes, :k].cpu().numpy().copy()
-        if direction == Direction.UP:
-            staging = self._staging_up
-            output_main = staging["output_main"]
-            output_main.zero_()
-            node_view = state_tensor[: artifact.state.num_nodes, :k]
+            if spec.direction == Direction.UP:
+                dst = state_tensor[: artifact.state.num_samples, :k]
+                if spec.by_individual:
+                    temp = self._aux[: artifact.state.num_samples, :k]
+                    torch.index_select(prepared._input_internal, 0, artifact.sample_to_individual, out=temp)
+                    dst.add_(temp)
+                else:
+                    dst.add_(prepared._input_internal)
+                return
+
             if artifact.sel_mut_rows.numel() > 0:
-                output_main[: artifact.state.num_mutations, :k].index_add_(0, artifact.sel_mut_rows, node_view.index_select(0, artifact.sel_mut_cols))
-            out_miss = None
-            if need_miss_output:
-                output_miss = staging["output_miss"]
-                output_miss.zero_()
-                if artifact.sel_miss_rows.numel() > 0:
-                    output_miss[: artifact.state.num_mutations, :k].index_add_(0, artifact.sel_miss_rows, node_view.index_select(0, artifact.sel_miss_cols))
-                out_miss = output_miss[: artifact.state.num_mutations, :k].cpu().numpy().copy()
-            return output_main[: artifact.state.num_mutations, :k].cpu().numpy().copy(), out_miss
-        output_main = self._staging_down["output_main"]
-        output_main.zero_()
-        output_main[: artifact.state.num_samples, :k].copy_(state_tensor[: artifact.state.num_samples, :k])
-        return output_main[: artifact.state.num_samples, :k].cpu().numpy().copy()
+                temp = self._aux[: artifact.sel_mut_rows.numel(), :k]
+                torch.index_select(prepared._input_internal, 0, artifact.sel_mut_rows, out=temp)
+                state_tensor.index_add_(0, artifact.sel_mut_cols, temp)
+            if spec.use_miss and artifact.sel_miss_rows.numel() > 0:
+                temp = self._aux[: artifact.sel_miss_rows.numel(), :k]
+                torch.index_select(prepared._miss_input_internal, 0, artifact.sel_miss_rows, out=temp)
+                state_tensor.index_add_(0, artifact.sel_miss_cols, temp)
+
+    def _apply_endpoint_bias(
+        self,
+        artifact: _TritonArtifact,
+        spec: _CudaMatmulSpec,
+        prepared: _TritonPreparedMatmul,
+        output: torch.Tensor,
+    ) -> None:
+        if not spec.apply_endpoint_bias:
+            return
+        assert self._aux is not None
+        rows = int(output.shape[0])
+        temp = self._aux[:rows, : spec.k]
+        if spec.init_mode == InitMode.XTX:
+            bias = artifact.init_xtx_up_bias if spec.direction == Direction.UP else artifact.init_xtx_down_bias
+            if bias is None:
+                raise RuntimeError(f"missing Triton {spec.direction.value} XTX endpoint bias")
+            output.add_(bias[:rows, None])
+            return
+        bias = artifact.init_vector_up_bias if spec.direction == Direction.UP else artifact.init_vector_down_bias
+        if bias is None:
+            raise RuntimeError(f"missing Triton {spec.direction.value} vector endpoint bias")
+        temp.zero_()
+        temp.add_(bias[:rows, None])
+        temp.mul_(prepared._init_vector_internal[None, :])
+        output.add_(temp)
+
+    def _write_output(self, artifact: _TritonArtifact, spec: _CudaMatmulSpec, prepared: _TritonPreparedMatmul) -> None:
+        assert self._state is not None
+        assert self._aux is not None
+        assert self._root_stream is not None
+        k = int(spec.k)
+        state_tensor = self._state[: artifact.state.num_nodes, :k]
+        with torch.cuda.stream(self._root_stream):
+            if spec.emit_all_nodes:
+                prepared._output_internal.index_copy_(0, artifact.node_perm, state_tensor)
+                return
+
+            if spec.direction == Direction.UP:
+                output = prepared._output_internal
+                output.zero_()
+                if artifact.sel_mut_rows.numel() > 0:
+                    temp = self._aux[: artifact.sel_mut_rows.numel(), :k]
+                    torch.index_select(state_tensor, 0, artifact.sel_mut_cols, out=temp)
+                    if artifact.sel_mut_row_unique:
+                        output.index_copy_(0, artifact.sel_mut_rows, temp)
+                    else:
+                        output.index_add_(0, artifact.sel_mut_rows, temp)
+                if spec.use_miss:
+                    miss_output = prepared._miss_output_internal
+                    miss_output.zero_()
+                    if artifact.sel_miss_rows.numel() > 0:
+                        temp = self._aux[: artifact.sel_miss_rows.numel(), :k]
+                        torch.index_select(state_tensor, 0, artifact.sel_miss_cols, out=temp)
+                        if artifact.sel_miss_row_unique:
+                            miss_output.index_copy_(0, artifact.sel_miss_rows, temp)
+                        else:
+                            miss_output.index_add_(0, artifact.sel_miss_rows, temp)
+                self._apply_endpoint_bias(artifact, spec, prepared, output)
+                return
+
+            if spec.by_individual:
+                output = state_tensor[: artifact.state.num_samples, :k]
+                self._apply_endpoint_bias(artifact, spec, prepared, output)
+                prepared._output_internal.zero_()
+                prepared._output_internal.index_add_(0, artifact.sample_to_individual, output)
+            else:
+                prepared._output_internal.copy_(state_tensor[: artifact.state.num_samples, :k])
+                self._apply_endpoint_bias(artifact, spec, prepared, prepared._output_internal)
+
+    def _execute_prepared(self, artifact: _TritonArtifact, spec: _CudaMatmulSpec, prepared: _TritonPreparedMatmul) -> None:
+        with self._caller_root_scope():
+            self._seed_state(artifact, spec, prepared)
+            self._enqueue_wavefront(artifact, spec.direction, spec.k)
+            self._write_output(artifact, spec, prepared)
 
 
 __all__ = ["TritonLayout", "TritonRuntime", "plan_triton_layout"]

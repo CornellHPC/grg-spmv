@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from ctypes import c_void_p
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import warnings
@@ -20,6 +20,7 @@ from pygrgl_spmv.backends.base import (
     _require_struct_dtype,
     iter_direction_level_pairs,
     materialize_sparse_block,
+    relink_stream_dependencies,
     sparse_structure_lengths,
     split_selector_by_level,
     stored_block_shape,
@@ -32,7 +33,7 @@ from pygrgl_spmv.backends.cusparse.ffi import (
     cuda_dtype,
 )
 from pygrgl_spmv.backends.types import Direction, InitMode, SparseFormat, StoredMatrix
-from pygrgl_spmv.grg import BoundGRG, RuntimeRequirements
+from pygrgl_spmv.grg import BoundGRG, RuntimeRequirements, _CudaMatmulSpec
 from pygrgl_spmv.grg.artifact import _load_grg_spmv_host, iter_artifact_blocks, scan_grg_spmv
 
 from .plan import CusparsePlan, CusparsePlanPair, DenseOrder, Operation
@@ -103,6 +104,7 @@ class CusparseLayout:
     max_num_samples: int
     max_num_mutations: int
     max_num_nodes: int
+    max_selector_nnz: int
     max_levels: int
     max_rows_by_level: tuple[int, ...]
     max_up_ops_by_level: tuple[int, ...]
@@ -200,7 +202,13 @@ class _CuArtifact:
     state: object
     mut_selector: _SelectorLevels
     miss_selector: _SelectorLevels
+    node_perm: Any
+    sample_to_individual: Any
     xtx_bias: Any | None
+    init_vector_up_bias: Any | None
+    init_vector_down_bias: Any | None
+    init_xtx_up_bias: Any | None
+    init_xtx_down_bias: Any | None
     up_ops: list[list[_CuOp]]
     down_ops: list[list[_CuOp]]
     up_dense: _ArtifactDirectionState | None
@@ -213,6 +221,70 @@ def _round_up(value: int, alignment: int) -> int:
 
 def _numpy_ptr(value: np.ndarray) -> int:
     return int(np.asarray(value).__array_interface__["data"][0])
+
+
+def _torch_from_cupy(array):
+    import torch
+
+    return torch.from_dlpack(array)
+
+
+class _CusparsePreparedMatmul:
+    def __init__(self, runtime: "CusparseRuntime", artifact: _CuArtifact, spec: _CudaMatmulSpec) -> None:
+        self._runtime = runtime
+        self._artifact = artifact
+        self._spec = spec
+        k = int(spec.k)
+        self._input_internal = runtime._io0[: spec.input_cols, :k]
+        self.input = runtime._io0_torch[: spec.input_cols, :k].T
+        if spec.emit_all_nodes:
+            self._output_internal = runtime._aux[: artifact.state.num_nodes, :k]
+            self.output = runtime._aux_torch[: artifact.state.num_nodes, :k].T
+        else:
+            self._output_internal = runtime._io0[: spec.output_cols, :k]
+            self.output = runtime._io0_torch[: spec.output_cols, :k].T
+        if spec.use_miss:
+            assert runtime._io1 is not None and runtime._io1_torch is not None
+            miss_view = runtime._io1[: artifact.state.num_mutations, :k]
+            miss_torch = runtime._io1_torch[: artifact.state.num_mutations, :k].T
+            if spec.direction == Direction.DOWN:
+                self._miss_input_internal = miss_view
+                self.miss_input = miss_torch
+            else:
+                self._miss_output_internal = miss_view
+                self.miss_output = miss_torch
+        if spec.init_mode == InitMode.VECTOR:
+            assert runtime._io1 is not None and runtime._io1_torch is not None
+            self._init_vector_internal = runtime._io1[0, :k]
+            self.init_vector = runtime._io1_torch[0, :k]
+        if spec.init_mode == InitMode.MATRIX:
+            assert runtime._io1 is not None and runtime._io1_torch is not None
+            self._init_matrix_internal = runtime._io1[: artifact.state.num_nodes, :k]
+            self.init_matrix = runtime._io1_torch[: artifact.state.num_nodes, :k].T
+        self._dense_state: _ArtifactDirectionState | None = None
+
+    def __enter__(self) -> "_CusparsePreparedMatmul":
+        self._dense_state = self._runtime._build_prepared_direction_state(self._artifact, self._spec.direction, self._spec.k)
+        if self._spec.direction == Direction.UP:
+            self._artifact.up_dense = self._dense_state
+        else:
+            self._artifact.down_dense = self._dense_state
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._spec.direction == Direction.UP:
+            self._artifact.up_dense = None
+        else:
+            self._artifact.down_dense = None
+        self._runtime._destroy_direction_state(self._dense_state)
+        self._dense_state = None
+
+    def __call__(self) -> None:
+        with self._runtime._call_scope():
+            self._call_prelocked()
+
+    def _call_prelocked(self) -> None:
+        self._runtime._execute_prepared(self._artifact, self._spec, self)
 
 
 def _cusparse_index_type(dtype: np.dtype) -> int:
@@ -327,12 +399,68 @@ def _warn_ring_mismatch(*, requested: int, allocated: int) -> None:
     )
 
 
+def _enabled_max_k(pair: CusparsePlanPair, requirements: RuntimeRequirements) -> int:
+    values = []
+    if pair.plan_up is not None:
+        values.append(int(requirements.max_k_up))
+    if pair.plan_down is not None:
+        values.append(int(requirements.max_k_down))
+    if not values:
+        raise ValueError("cuSPARSE layout requires at least one configured direction plan")
+    return max(values)
+
+
+def _side_io_rows(pair: CusparsePlanPair, requirements: RuntimeRequirements, *, max_num_mutations: int, max_num_nodes: int) -> int:
+    need_miss_rows = (
+        (pair.plan_down is not None and requirements.need_down_miss_input)
+        or (pair.plan_up is not None and requirements.need_up_miss_output)
+    )
+    return max(
+        int(max_num_mutations) if need_miss_rows else 0,
+        1 if requirements.need_init_vector else 0,
+        int(max_num_nodes) if requirements.need_init_matrix else 0,
+    )
+
+
+def _metadata_bytes(state, pair: CusparsePlanPair, requirements: RuntimeRequirements, dtype: np.dtype) -> int:
+    total = int(np.asarray(state.node_perm).nbytes + np.asarray(state.sample_to_individual).nbytes)
+    if requirements.need_init_vector:
+        if pair.plan_up is not None:
+            total += int(np.asarray(state.init_vector_up_bias, dtype=dtype).nbytes)
+        if pair.plan_down is not None:
+            total += int(np.asarray(state.init_vector_down_bias, dtype=dtype).nbytes)
+    if requirements.need_init_xtx:
+        if pair.plan_up is not None and state.init_xtx_up_bias is not None:
+            total += int(np.asarray(state.init_xtx_up_bias, dtype=dtype).nbytes)
+        if pair.plan_down is not None and state.init_xtx_down_bias is not None:
+            total += int(np.asarray(state.init_xtx_down_bias, dtype=dtype).nbytes)
+    return total
+
+
 def _dense_order_char(order: DenseOrder) -> str:
     return "C" if order == DenseOrder.ROW else "F"
 
 
-def _dense_ld(*, rows: int, cols: int, order: DenseOrder) -> int:
-    return int(cols if order == DenseOrder.ROW else rows)
+def _dense_ld(buf, *, order: DenseOrder) -> int:
+    strides = tuple(int(value) for value in buf.strides)
+    itemsize = int(np.dtype(buf.dtype).itemsize)
+    unit0 = strides[0] == itemsize
+    unit1 = strides[1] == itemsize
+    match (order, unit0, unit1):
+        case (DenseOrder.ROW, _, True):
+            axis = 0
+        case (DenseOrder.COL, True, _):
+            axis = 1
+        case (DenseOrder.ROW, True, False):
+            axis = 1
+        case (DenseOrder.COL, False, True):
+            axis = 0
+        case _:
+            raise ValueError(
+                "dense descriptor requires unit stride along one matrix axis, "
+                f"got order={order} shape={tuple(int(v) for v in buf.shape)} strides={strides}"
+            )
+    return int(strides[axis] // itemsize)
 
 
 def _build_shared_ones_plan(dtype: np.dtype, max_nnz: int, *, device_id: int) -> _SharedOnesPlan:
@@ -353,8 +481,15 @@ def _build_shared_ones_plan(dtype: np.dtype, max_nnz: int, *, device_id: int) ->
         return _SharedOnesPlan(mode="materialized", logical_bytes=logical_bytes, physical_bytes=logical_bytes)
 
 
-def _create_dense_desc(*, cslib: CuSparseLib, buf, rows: int, cols: int, order: DenseOrder, cuda_dtype_id: int) -> c_void_p:
-    return cslib.create_dnmat(rows, cols, _dense_ld(rows=rows, cols=cols, order=order), buf.data.ptr, cuda_dtype_id, int(order))
+def _create_dense_desc(*, cslib: CuSparseLib, buf, order: DenseOrder, cuda_dtype_id: int) -> c_void_p:
+    return cslib.create_dnmat(
+        int(buf.shape[0]),
+        int(buf.shape[1]),
+        _dense_ld(buf, order=order),
+        buf.data.ptr,
+        cuda_dtype_id,
+        int(order),
+    )
 
 
 def _publish_level_source_view(cp, *, level_bufs, src_bufs, plan: CusparsePlan, level: int) -> None:
@@ -425,7 +560,7 @@ def _query_ext_sizes(
                     for level in range(scan.num_levels)
                 ]
                 dst_descs = [
-                    _create_dense_desc(cslib=cslib, buf=buf, rows=buf.shape[0], cols=buf.shape[1], order=plan.order_c, cuda_dtype_id=cuda_dtype_id)
+                    _create_dense_desc(cslib=cslib, buf=buf, order=plan.order_c, cuda_dtype_id=cuda_dtype_id)
                     for buf in level_bufs
                 ]
                 if not _needs_explicit_source(plan):
@@ -435,7 +570,7 @@ def _query_ext_sizes(
                     else:
                         src_bufs = None
                         src_descs = [
-                            _create_dense_desc(cslib=cslib, buf=buf, rows=max_k, cols=buf.shape[0], order=plan.order_b, cuda_dtype_id=cuda_dtype_id)
+                            _create_dense_desc(cslib=cslib, buf=buf.T, order=plan.order_b, cuda_dtype_id=cuda_dtype_id)
                             for buf in level_bufs
                         ]
                 else:
@@ -446,7 +581,7 @@ def _query_ext_sizes(
                         src = cp.zeros(src_shape, dtype=dtype, order=_dense_order_char(plan.order_b))
                         src_bufs.append(src)
                         src_descs.append(
-                            _create_dense_desc(cslib=cslib, buf=src, rows=src.shape[0], cols=src.shape[1], order=plan.order_b, cuda_dtype_id=cuda_dtype_id)
+                            _create_dense_desc(cslib=cslib, buf=src, order=plan.order_b, cuda_dtype_id=cuda_dtype_id)
                         )
                 up_plan_map = {(block.dst_level, block.src_level): block for block in artifact_layout.blocks_up}
                 down_plan_map = {(block.dst_level, block.src_level): block for block in artifact_layout.blocks_down}
@@ -534,7 +669,7 @@ def _query_ext_sizes(
                         op_index_by_level[dst_level] += 1
                         if scratch_enabled[dst_level]:
                             scratch = cp.zeros((level_sizes[dst_level], max_k), dtype=dtype, order=_dense_order_char(plan.order_c))
-                            dst_desc = _create_dense_desc(cslib=cslib, buf=scratch, rows=scratch.shape[0], cols=scratch.shape[1], order=plan.order_c, cuda_dtype_id=cuda_dtype_id)
+                            dst_desc = _create_dense_desc(cslib=cslib, buf=scratch, order=plan.order_c, cuda_dtype_id=cuda_dtype_id)
                             size = cslib.spmm_buffer_size(int(plan.algo), int(plan.op_a), int(plan.op_b), alpha.data.ptr, sp_desc, src_descs[src_level], beta_zero.data.ptr, dst_desc, cuda_dtype_id)
                             ext_scratch[dst_level][op_idx] = max(int(ext_scratch[dst_level][op_idx]), int(size))
                             cslib.destroy_dn_mat(dst_desc)
@@ -558,19 +693,6 @@ def _query_ext_sizes(
         tuple(tuple(int(v) for v in row) for row in ext_scratch_up),
         tuple(tuple(int(v) for v in row) for row in ext_scratch_down),
     )
-
-
-def _relink_stream_dependencies(ops_by_level: list[list["_CuOp"]], *, direction: Direction) -> list[list["_CuOp"]]:
-    prev_by_slot: dict[int, tuple[int, int]] = {}
-    height = len(ops_by_level)
-    level_iter = range(1, height) if direction == Direction.UP else range(height - 2, -1, -1)
-    for dst_level in level_iter:
-        for op_idx, op in enumerate(ops_by_level[dst_level]):
-            if op.slot is None:
-                continue
-            ops_by_level[dst_level][op_idx] = replace(op, prev_in_slot=prev_by_slot.get(op.slot))
-            prev_by_slot[op.slot] = (dst_level, op_idx)
-    return ops_by_level
 
 
 def plan_cusparse_layout(
@@ -609,12 +731,17 @@ def plan_cusparse_layout(
     max_down_ops_by_level = tuple(max(sum(1 for block in scan.blocks if block.nnz > 0 and block.src_level == level) for scan in scans) for level in range(max_levels))
     scratch_up_enabled = _resolve_scratch_levels(pair.plan_up, max_levels)
     scratch_down_enabled = _resolve_scratch_levels(pair.plan_down, max_levels)
-    max_samples = max(scan.num_samples for scan in scans)
-    max_mutations = max(scan.num_mutations for scan in scans)
-    max_nodes = max(scan.num_nodes for scan in scans)
+    max_num_samples = max(scan.num_samples for scan in scans)
+    max_num_mutations = max(scan.num_mutations for scan in scans)
+    max_num_nodes = max(scan.num_nodes for scan in scans)
+    max_selector_nnz = max(
+        max(int(scan.selector_mut_nnz), int(scan.selector_miss_nnz))
+        for scan in scans
+    )
 
     blocks: list[_CuBlockPlan] = []
     selector_bytes = 0
+    metadata_bytes = 0
     xtx_bias_bytes = 0
     planned: list[_CuArtifactLayout] = []
     max_block_nnz = 0
@@ -629,6 +756,7 @@ def plan_cusparse_layout(
         miss_pairs = split_selector_by_level(state.sel_miss, state.level_offsets)
         selector_bytes += sum(int(rows.nbytes + cols.nbytes) for rows, cols in mut_pairs)
         selector_bytes += sum(int(rows.nbytes + cols.nbytes) for rows, cols in miss_pairs)
+        metadata_bytes += _metadata_bytes(state, pair, requirements, dtype)
         if requirements.need_init_xtx and state.coalescence_counts is not None:
             xtx_bias_bytes += int(state.num_nodes * dtype.itemsize)
         max_block_nnz = max(max_block_nnz, max((block.nnz for block in scan.blocks), default=0))
@@ -643,7 +771,11 @@ def plan_cusparse_layout(
             )
         )
 
-    staging_bytes = 0
+    max_k_any = _enabled_max_k(pair, requirements)
+    io0_rows = int(max(max_num_samples, max_num_mutations))
+    side_io_rows = _side_io_rows(pair, requirements, max_num_mutations=max_num_mutations, max_num_nodes=max_num_nodes)
+    aux_rows = int(max(max_num_nodes, max_num_samples, max_num_mutations, max_selector_nnz))
+    dense_arena_bytes = int((io0_rows + side_io_rows + aux_rows) * max_k_any * dtype.itemsize)
     workspace_up = 0
     workspace_down = 0
     source_up = 0
@@ -653,14 +785,6 @@ def plan_cusparse_layout(
         workspace_up = int(sum(rows * int(requirements.max_k_up) * dtype.itemsize for rows in max_rows_by_level))
         if _needs_explicit_source(pair.plan_up):
             source_up = workspace_up
-        staging_bytes += int(max_samples * int(requirements.max_k_up) * dtype.itemsize)
-        staging_bytes += int(max_mutations * int(requirements.max_k_up) * dtype.itemsize)
-        if requirements.need_up_miss_output:
-            staging_bytes += int(max_mutations * int(requirements.max_k_up) * dtype.itemsize)
-        if requirements.need_init_vector:
-            staging_bytes += int(int(requirements.max_k_up) * dtype.itemsize)
-        if requirements.need_init_matrix:
-            staging_bytes += int(max_nodes * int(requirements.max_k_up) * dtype.itemsize)
         for level, enabled in enumerate(scratch_up_enabled):
             if enabled:
                 scratch_bytes += int(max_rows_by_level[level] * max_up_ops_by_level[level] * int(requirements.max_k_up) * dtype.itemsize)
@@ -668,14 +792,6 @@ def plan_cusparse_layout(
         workspace_down = int(sum(rows * int(requirements.max_k_down) * dtype.itemsize for rows in max_rows_by_level))
         if _needs_explicit_source(pair.plan_down):
             source_down = workspace_down
-        staging_bytes += int(max_mutations * int(requirements.max_k_down) * dtype.itemsize)
-        staging_bytes += int(max_samples * int(requirements.max_k_down) * dtype.itemsize)
-        if requirements.need_down_miss_input:
-            staging_bytes += int(max_mutations * int(requirements.max_k_down) * dtype.itemsize)
-        if requirements.need_init_vector:
-            staging_bytes += int(int(requirements.max_k_down) * dtype.itemsize)
-        if requirements.need_init_matrix:
-            staging_bytes += int(max_nodes * int(requirements.max_k_down) * dtype.itemsize)
         for level, enabled in enumerate(scratch_down_enabled):
             if enabled:
                 scratch_bytes += int(max_rows_by_level[level] * max_down_ops_by_level[level] * int(requirements.max_k_down) * dtype.itemsize)
@@ -703,16 +819,19 @@ def plan_cusparse_layout(
 
     ext_bytes = int(sum(ext_main_up) + sum(ext_main_down) + sum(sum(row) for row in ext_scratch_up) + sum(sum(row) for row in ext_scratch_down))
     shared_ones_plan = _build_shared_ones_plan(dtype, max_block_nnz, device_id=device_id)
+    scalar_bytes = int(3 * dtype.itemsize)
     fixed_bytes = int(
         selector_bytes
+        + metadata_bytes
         + xtx_bias_bytes
-        + staging_bytes
+        + dense_arena_bytes
         + workspace_up
         + workspace_down
         + source_up
         + source_down
         + scratch_bytes
         + shared_ones_plan.physical_bytes
+        + scalar_bytes
         + ext_bytes
     )
     resident_bytes_full = int(sum(block.nbytes for block in blocks))
@@ -774,22 +893,26 @@ def plan_cusparse_layout(
         "resident_sparse": resident_bytes,
         "ring_slots": ring_bytes,
         "selectors": int(selector_bytes),
+        "metadata": int(metadata_bytes),
         "xtx_bias": int(xtx_bias_bytes),
-        "staging": int(staging_bytes),
+        "dense_arena": int(dense_arena_bytes),
         "workspace_up": int(workspace_up + source_up),
         "workspace_down": int(workspace_down + source_down),
         "scratch": int(scratch_bytes),
         "shared_ones": int(shared_ones_plan.physical_bytes),
+        "scalars": int(scalar_bytes),
         "ext": int(ext_bytes),
     }
     budget_items: list[BudgetItem] = [
         BudgetItem(kind="fixed", name="selectors", nbytes=int(selector_bytes)),
+        BudgetItem(kind="fixed", name="metadata", nbytes=int(metadata_bytes)),
         BudgetItem(kind="fixed", name="xtx_bias", nbytes=int(xtx_bias_bytes)),
-        BudgetItem(kind="fixed", name="staging", nbytes=int(staging_bytes)),
+        BudgetItem(kind="fixed", name="dense_arena", nbytes=int(dense_arena_bytes)),
         BudgetItem(kind="fixed", name="workspace_up", nbytes=int(workspace_up + source_up)),
         BudgetItem(kind="fixed", name="workspace_down", nbytes=int(workspace_down + source_down)),
         BudgetItem(kind="fixed", name="scratch", nbytes=int(scratch_bytes)),
         BudgetItem(kind="fixed", name="shared_ones", nbytes=int(shared_ones_plan.physical_bytes)),
+        BudgetItem(kind="fixed", name="scalars", nbytes=int(scalar_bytes)),
         BudgetItem(kind="fixed", name="ext", nbytes=int(ext_bytes)),
     ]
     for artifact_index, artifact_layout in enumerate(planned):
@@ -820,9 +943,10 @@ def plan_cusparse_layout(
         requested_ring_buffer_size=requested_ring_buffer_size,
         allocated_ring_buffer_size=len(slot_plans),
         vram_budget_bytes=int(vram_budget_bytes),
-        max_num_samples=max_samples,
-        max_num_mutations=max_mutations,
-        max_num_nodes=max_nodes,
+        max_num_samples=max_num_samples,
+        max_num_mutations=max_num_mutations,
+        max_num_nodes=max_num_nodes,
+        max_selector_nnz=max_selector_nnz,
         max_levels=max_levels,
         max_rows_by_level=max_rows_by_level,
         max_up_ops_by_level=max_up_ops_by_level,
@@ -880,12 +1004,20 @@ class CusparseRuntime:
         self._down_src_bufs = None
         self._up_scratch = []
         self._down_scratch = []
-        self._up_staging = {}
-        self._down_staging = {}
+        self._io0 = None
+        self._io1 = None
+        self._aux = None
+        self._io0_torch = None
+        self._io1_torch = None
+        self._aux_torch = None
         self._ext_main_up = []
         self._ext_main_down = []
         self._ext_scratch_up = []
         self._ext_scratch_down = []
+        self._copy_done = []
+        self._compute_done = []
+        self._ready = []
+        self._launch_event = None
         self._artifacts: tuple[_CuArtifact, ...] = ()
         self._grgs: tuple[BoundGRG, ...] = ()
         self._entered = False
@@ -966,12 +1098,20 @@ class CusparseRuntime:
         self._down_src_bufs = None
         self._up_scratch = []
         self._down_scratch = []
-        self._up_staging = {}
-        self._down_staging = {}
+        self._io0 = None
+        self._io1 = None
+        self._aux = None
+        self._io0_torch = None
+        self._io1_torch = None
+        self._aux_torch = None
         self._ext_main_up = []
         self._ext_main_down = []
         self._ext_scratch_up = []
         self._ext_scratch_down = []
+        self._copy_done = []
+        self._compute_done = []
+        self._ready = []
+        self._launch_event = None
         self._artifacts = ()
         self._grgs = ()
         self._entered = False
@@ -1013,20 +1153,35 @@ class CusparseRuntime:
                 self._shared_ones = self._materialize_shared_ones()
                 self._slot_struct0 = [self._cp.zeros((slot.struct0_len,), dtype=slot.struct0_dtype) for slot in self.layout.slot_plans]
                 self._slot_struct1 = [self._cp.zeros((slot.struct1_len,), dtype=slot.struct1_dtype) for slot in self.layout.slot_plans]
+                max_k_any = _enabled_max_k(self.layout.pair, self.layout.requirements)
+                io0_rows = int(max(self.layout.max_num_samples, self.layout.max_num_mutations))
+                side_io_rows = _side_io_rows(
+                    self.layout.pair,
+                    self.layout.requirements,
+                    max_num_mutations=self.layout.max_num_mutations,
+                    max_num_nodes=self.layout.max_num_nodes,
+                )
+                aux_rows = int(max(self.layout.max_num_nodes, self.layout.max_num_samples, self.layout.max_num_mutations, self.layout.max_selector_nnz))
+                self._io0 = self._cp.zeros((io0_rows, max_k_any), dtype=self.layout.dtype, order="C")
+                self._io1 = None if side_io_rows == 0 else self._cp.zeros((side_io_rows, max_k_any), dtype=self.layout.dtype, order="C")
+                self._aux = self._cp.zeros((aux_rows, max_k_any), dtype=self.layout.dtype, order="C")
+                self._io0_torch = _torch_from_cupy(self._io0)
+                self._io1_torch = None if self._io1 is None else _torch_from_cupy(self._io1)
+                self._aux_torch = _torch_from_cupy(self._aux)
+                max_ops_by_level = [
+                    max(int(self.layout.max_up_ops_by_level[level]), int(self.layout.max_down_ops_by_level[level]))
+                    for level in range(self.layout.max_levels)
+                ]
+                self._copy_done = [[self._cp.cuda.Event() for _ in range(max_ops_by_level[level])] for level in range(self.layout.max_levels)]
+                self._compute_done = [[self._cp.cuda.Event() for _ in range(max_ops_by_level[level])] for level in range(self.layout.max_levels)]
+                self._ready = [self._cp.cuda.Event() for _ in range(self.layout.max_levels)]
+                self._launch_event = self._cp.cuda.Event()
                 if self.layout.pair.plan_up is not None:
                     self._up_level_bufs = [self._cp.zeros((rows, int(self.layout.requirements.max_k_up)), dtype=self.layout.dtype, order=_dense_order_char(self.layout.pair.plan_up.order_c)) for rows in self.layout.max_rows_by_level]
                     self._up_src_bufs = None if not _needs_explicit_source(self.layout.pair.plan_up) else [
                         self._cp.zeros(((rows, int(self.layout.requirements.max_k_up)) if self.layout.pair.plan_up.op_b == Operation.N else (int(self.layout.requirements.max_k_up), rows)), dtype=self.layout.dtype, order=_dense_order_char(self.layout.pair.plan_up.order_b))
                         for rows in self.layout.max_rows_by_level
                     ]
-                    self._up_staging["input_primary"] = self._cp.zeros((self.layout.max_num_samples, int(self.layout.requirements.max_k_up)), dtype=self.layout.dtype, order="C")
-                    self._up_staging["output_main"] = self._cp.zeros((self.layout.max_num_mutations, int(self.layout.requirements.max_k_up)), dtype=self.layout.dtype, order="C")
-                    if self.layout.requirements.need_up_miss_output:
-                        self._up_staging["output_miss"] = self._cp.zeros((self.layout.max_num_mutations, int(self.layout.requirements.max_k_up)), dtype=self.layout.dtype, order="C")
-                    if self.layout.requirements.need_init_vector:
-                        self._up_staging["init_vector"] = self._cp.zeros((1, int(self.layout.requirements.max_k_up)), dtype=self.layout.dtype, order="C")
-                    if self.layout.requirements.need_init_matrix:
-                        self._up_staging["init_matrix"] = self._cp.zeros((self.layout.max_num_nodes, int(self.layout.requirements.max_k_up)), dtype=self.layout.dtype, order="C")
                     self._up_scratch = [
                         [self._cp.zeros((rows, int(self.layout.requirements.max_k_up)), dtype=self.layout.dtype, order=_dense_order_char(self.layout.pair.plan_up.order_c)) for _ in range(self.layout.max_up_ops_by_level[level])]
                         if self.layout.scratch_up_enabled[level]
@@ -1041,14 +1196,6 @@ class CusparseRuntime:
                         self._cp.zeros(((rows, int(self.layout.requirements.max_k_down)) if self.layout.pair.plan_down.op_b == Operation.N else (int(self.layout.requirements.max_k_down), rows)), dtype=self.layout.dtype, order=_dense_order_char(self.layout.pair.plan_down.order_b))
                         for rows in self.layout.max_rows_by_level
                     ]
-                    self._down_staging["input_primary"] = self._cp.zeros((self.layout.max_num_mutations, int(self.layout.requirements.max_k_down)), dtype=self.layout.dtype, order="C")
-                    self._down_staging["output_main"] = self._cp.zeros((self.layout.max_num_samples, int(self.layout.requirements.max_k_down)), dtype=self.layout.dtype, order="C")
-                    if self.layout.requirements.need_down_miss_input:
-                        self._down_staging["input_miss"] = self._cp.zeros((self.layout.max_num_mutations, int(self.layout.requirements.max_k_down)), dtype=self.layout.dtype, order="C")
-                    if self.layout.requirements.need_init_vector:
-                        self._down_staging["init_vector"] = self._cp.zeros((1, int(self.layout.requirements.max_k_down)), dtype=self.layout.dtype, order="C")
-                    if self.layout.requirements.need_init_matrix:
-                        self._down_staging["init_matrix"] = self._cp.zeros((self.layout.max_num_nodes, int(self.layout.requirements.max_k_down)), dtype=self.layout.dtype, order="C")
                     self._down_scratch = [
                         [self._cp.zeros((rows, int(self.layout.requirements.max_k_down)), dtype=self.layout.dtype, order=_dense_order_char(self.layout.pair.plan_down.order_c)) for _ in range(self.layout.max_down_ops_by_level[level])]
                         if self.layout.scratch_down_enabled[level]
@@ -1081,6 +1228,14 @@ class CusparseRuntime:
                 self._stream_owner = token
             return self._cp.cuda.Stream.from_external(token)
         return self._cp.cuda.ExternalStream(self.stream_ptr, device_id=self.layout.device)
+
+    def _torch_caller_stream(self):
+        import torch
+
+        device = torch.device("cuda", int(self.layout.device))
+        if self.stream_ptr == 0:
+            return torch.cuda.default_stream(device=device)
+        return torch.cuda.get_stream_from_external(self.stream_ptr, device=device)
 
     @contextmanager
     def _call_scope(self):
@@ -1156,19 +1311,19 @@ class CusparseRuntime:
         try:
             for level, rows in enumerate(level_sizes):
                 dst_view = level_bufs[level][:rows, :max_k]
-                dst_descs.append(_create_dense_desc(cslib=self._cslib, buf=dst_view, rows=dst_view.shape[0], cols=dst_view.shape[1], order=plan.order_c, cuda_dtype_id=cuda_dtype_id))
+                dst_descs.append(_create_dense_desc(cslib=self._cslib, buf=dst_view, order=plan.order_c, cuda_dtype_id=cuda_dtype_id))
                 if src_bufs is None:
                     if plan.op_b == Operation.N:
                         src_descs.append(dst_descs[-1])
                     else:
-                        src_descs.append(_create_dense_desc(cslib=self._cslib, buf=dst_view, rows=max_k, cols=rows, order=plan.order_b, cuda_dtype_id=cuda_dtype_id))
+                        src_descs.append(_create_dense_desc(cslib=self._cslib, buf=dst_view.T, order=plan.order_b, cuda_dtype_id=cuda_dtype_id))
                 else:
                     src_view = src_bufs[level][:rows, :max_k] if plan.op_b == Operation.N else src_bufs[level][:max_k, :rows]
-                    src_descs.append(_create_dense_desc(cslib=self._cslib, buf=src_view, rows=src_view.shape[0], cols=src_view.shape[1], order=plan.order_b, cuda_dtype_id=cuda_dtype_id))
+                    src_descs.append(_create_dense_desc(cslib=self._cslib, buf=src_view, order=plan.order_b, cuda_dtype_id=cuda_dtype_id))
                 scratch_row = []
                 for scratch in scratch_bufs[level]:
                     scratch_view = scratch[:rows, :max_k]
-                    scratch_row.append(_create_dense_desc(cslib=self._cslib, buf=scratch_view, rows=scratch_view.shape[0], cols=scratch_view.shape[1], order=plan.order_c, cuda_dtype_id=cuda_dtype_id))
+                    scratch_row.append(_create_dense_desc(cslib=self._cslib, buf=scratch_view, order=plan.order_c, cuda_dtype_id=cuda_dtype_id))
                 scratch_descs_by_level.append(scratch_row)
             return _ArtifactDirectionState(dst_descs=dst_descs, src_descs=src_descs, src_bufs=src_bufs, scratch_descs_by_level=scratch_descs_by_level)
         except Exception:
@@ -1176,6 +1331,32 @@ class CusparseRuntime:
                 _ArtifactDirectionState(dst_descs=dst_descs, src_descs=src_descs, src_bufs=src_bufs, scratch_descs_by_level=scratch_descs_by_level)
             )
             raise
+
+    def _prepare_matmul_cuda(self, grg: BoundGRG, spec: _CudaMatmulSpec) -> _CusparsePreparedMatmul:
+        if spec.direction == Direction.UP and self.layout.pair.plan_up is None:
+            raise ValueError("UP plan is not configured")
+        if spec.direction == Direction.DOWN and self.layout.pair.plan_down is None:
+            raise ValueError("DOWN plan is not configured")
+        return _CusparsePreparedMatmul(self, self._artifacts[int(grg._artifact_index)], spec)
+
+    def _build_prepared_direction_state(self, artifact: _CuArtifact, direction: Direction, k: int) -> _ArtifactDirectionState:
+        if direction == Direction.UP:
+            return self._build_artifact_direction_state(
+                artifact.state,
+                self.layout.pair.plan_up,
+                self._up_level_bufs,
+                self._up_src_bufs,
+                self._up_scratch,
+                int(k),
+            )
+        return self._build_artifact_direction_state(
+            artifact.state,
+            self.layout.pair.plan_down,
+            self._down_level_bufs,
+            self._down_src_bufs,
+            self._down_scratch,
+            int(k),
+        )
 
     def _build_artifact(self, artifact_layout: _CuArtifactLayout, state) -> _CuArtifact:
         up_owner: dict[tuple[int, int], tuple[_CuRuntimeBlock, np.ndarray | None, np.ndarray | None, int | None]] = {}
@@ -1186,8 +1367,6 @@ class CusparseRuntime:
         down_plan_map = {(block.dst_level, block.src_level): block for block in artifact_layout.blocks_down}
         up_ops: list[list[_CuOp]] | None = None
         down_ops: list[list[_CuOp]] | None = None
-        up_dense: _ArtifactDirectionState | None = None
-        down_dense: _ArtifactDirectionState | None = None
         with self.device:
             try:
                 mut_selector = _selector_levels(self._cp, state.sel_mut, state.level_offsets)
@@ -1250,24 +1429,40 @@ class CusparseRuntime:
                 xtx_bias = None
                 if self.layout.requirements.need_init_xtx and state.coalescence_counts is not None:
                     xtx_bias = self._cp.asarray(2.0 * state.coalescence_counts.astype(self.layout.dtype, copy=False), dtype=self.layout.dtype)
+                init_vector_up_bias = None
+                init_vector_down_bias = None
+                if self.layout.requirements.need_init_vector:
+                    if self.layout.pair.plan_up is not None:
+                        init_vector_up_bias = self._cp.asarray(state.init_vector_up_bias, dtype=self.layout.dtype)
+                    if self.layout.pair.plan_down is not None:
+                        init_vector_down_bias = self._cp.asarray(state.init_vector_down_bias, dtype=self.layout.dtype)
+                init_xtx_up_bias = None
+                init_xtx_down_bias = None
+                if self.layout.requirements.need_init_xtx:
+                    if self.layout.pair.plan_up is not None and state.init_xtx_up_bias is not None:
+                        init_xtx_up_bias = self._cp.asarray(state.init_xtx_up_bias, dtype=self.layout.dtype)
+                    if self.layout.pair.plan_down is not None and state.init_xtx_down_bias is not None:
+                        init_xtx_down_bias = self._cp.asarray(state.init_xtx_down_bias, dtype=self.layout.dtype)
                 up_ops = self._build_ops(Direction.UP, artifact_layout, state, up_owner, down_owner)
                 down_ops = self._build_ops(Direction.DOWN, artifact_layout, state, up_owner, down_owner)
-                up_dense = self._build_artifact_direction_state(state, self.layout.pair.plan_up, self._up_level_bufs, self._up_src_bufs, self._up_scratch, int(self.layout.requirements.max_k_up)) if self.layout.pair.plan_up is not None else None
-                down_dense = self._build_artifact_direction_state(state, self.layout.pair.plan_down, self._down_level_bufs, self._down_src_bufs, self._down_scratch, int(self.layout.requirements.max_k_down)) if self.layout.pair.plan_down is not None else None
                 return _CuArtifact(
                     path=artifact_layout.path,
                     state=state,
                     mut_selector=mut_selector,
                     miss_selector=miss_selector,
+                    node_perm=self._cp.asarray(state.node_perm),
+                    sample_to_individual=self._cp.asarray(state.sample_to_individual),
                     xtx_bias=xtx_bias,
+                    init_vector_up_bias=init_vector_up_bias,
+                    init_vector_down_bias=init_vector_down_bias,
+                    init_xtx_up_bias=init_xtx_up_bias,
+                    init_xtx_down_bias=init_xtx_down_bias,
                     up_ops=up_ops,
                     down_ops=down_ops,
-                    up_dense=up_dense,
-                    down_dense=down_dense,
+                    up_dense=None,
+                    down_dense=None,
                 )
             except Exception:
-                self._destroy_direction_state(up_dense)
-                self._destroy_direction_state(down_dense)
                 self._destroy_ops(up_ops)
                 self._destroy_ops(down_ops)
                 raise
@@ -1304,7 +1499,7 @@ class CusparseRuntime:
                         prev_in_slot=None,
                     )
                 )
-            return _relink_stream_dependencies(ops, direction=direction)
+            return relink_stream_dependencies(ops, direction=direction)
         except Exception:
             self._destroy_ops(ops)
             raise
@@ -1353,44 +1548,6 @@ class CusparseRuntime:
             return
         _publish_level_source_view(self._cp, level_bufs=level_bufs, src_bufs=dense.src_bufs, plan=plan, level=level)
 
-    def _seed_workspace(self, artifact: _CuArtifact, direction: Direction, init_mode: InitMode, has_miss_input: bool) -> None:
-        plan = self.layout.pair.plan_up if direction == Direction.UP else self.layout.pair.plan_down
-        level_bufs = self._up_level_bufs if direction == Direction.UP else self._down_level_bufs
-        staging = self._up_staging if direction == Direction.UP else self._down_staging
-        assert plan is not None
-        with self._root_stream:
-            for level in range(len(artifact.state.level_offsets) - 1):
-                rows = int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])
-                level_bufs[level][:rows, :].fill(0)
-            if direction == Direction.UP:
-                level_bufs[0][: artifact.state.num_samples] += staging["input_primary"][: artifact.state.num_samples]
-            else:
-                for level, rows in enumerate(artifact.mut_selector.rows_by_level):
-                    if rows.size == 0:
-                        continue
-                    self._cp.add.at(level_bufs[level], artifact.mut_selector.cols_by_level[level], staging["input_primary"][rows])
-                if has_miss_input and "input_miss" in staging:
-                    for level, rows in enumerate(artifact.miss_selector.rows_by_level):
-                        if rows.size == 0:
-                            continue
-                        self._cp.add.at(level_bufs[level], artifact.miss_selector.cols_by_level[level], staging["input_miss"][rows])
-            if init_mode == InitMode.XTX:
-                if artifact.xtx_bias is None:
-                    raise ValueError("init_mode=xtx requires GRG coalescence counts")
-                for level in range(len(artifact.state.level_offsets) - 1):
-                    lo = int(artifact.state.level_offsets[level])
-                    hi = int(artifact.state.level_offsets[level + 1])
-                    level_bufs[level][: hi - lo] += artifact.xtx_bias[lo:hi, None]
-            elif init_mode == InitMode.VECTOR and "init_vector" in staging:
-                for level in range(len(artifact.state.level_offsets) - 1):
-                    rows = int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])
-                    level_bufs[level][:rows] += staging["init_vector"]
-            elif init_mode == InitMode.MATRIX and "init_matrix" in staging:
-                for level in range(len(artifact.state.level_offsets) - 1):
-                    lo = int(artifact.state.level_offsets[level])
-                    hi = int(artifact.state.level_offsets[level + 1])
-                    level_bufs[level][: hi - lo] += staging["init_matrix"][lo:hi]
-
     def _enqueue_wavefront(self, artifact: _CuArtifact, direction: Direction) -> None:
         dense = artifact.up_dense if direction == Direction.UP else artifact.down_dense
         ops_by_level = artifact.up_ops if direction == Direction.UP else artifact.down_ops
@@ -1400,25 +1557,25 @@ class CusparseRuntime:
         scratch_bufs = self._up_scratch if direction == Direction.UP else self._down_scratch
         h = len(artifact.state.level_offsets) - 1
         assert dense is not None
+        assert self._launch_event is not None
         if direction == Direction.UP:
             seed_level = 0
             level_iter = range(1, h)
         else:
             seed_level = h - 1
             level_iter = range(h - 2, -1, -1)
-        copy_done = [[self._cp.cuda.Event() for _ in ops] for ops in ops_by_level]
-        compute_done = [[self._cp.cuda.Event() for _ in ops] for ops in ops_by_level]
-        ready = [self._cp.cuda.Event() for _ in range(h)]
-        launch_event = self._cp.cuda.Event()
+        copy_done = self._copy_done
+        compute_done = self._compute_done
+        ready = self._ready
         with self._root_stream:
-            launch_event.record(self._root_stream)
+            self._launch_event.record(self._root_stream)
         for stream in self._slot_copy_streams:
-            stream.wait_event(launch_event)
+            stream.wait_event(self._launch_event)
         for stream in self._level_streams:
-            stream.wait_event(launch_event)
+            stream.wait_event(self._launch_event)
         for level_streams in scratch_streams:
             for stream in level_streams:
-                stream.wait_event(launch_event)
+                stream.wait_event(self._launch_event)
         if h > 0:
             with self._level_streams[seed_level]:
                 self._publish_level_source(artifact, direction, seed_level)
@@ -1426,7 +1583,6 @@ class CusparseRuntime:
         for dst_level in level_iter:
             stream = self._level_streams[dst_level]
             if scratch_enabled[dst_level]:
-                done = [self._cp.cuda.Event() for _ in ops_by_level[dst_level]]
                 for op_idx, op in enumerate(ops_by_level[dst_level]):
                     self._copy_to_slot(copy_done, compute_done, dst_level, op_idx, op)
                     helper = scratch_streams[dst_level][op_idx]
@@ -1439,11 +1595,10 @@ class CusparseRuntime:
                         ext = self._ext_for(direction, dst_level, op_idx, True)
                         self._launch_spmm(artifact, direction, op, dense.scratch_descs_by_level[dst_level][op_idx], self._beta_zero.data.ptr, dense.src_descs[op.src_level], ext)
                         compute_done[dst_level][op_idx].record(helper)
-                        done[op_idx].record(helper)
                 with stream:
                     rows = int(artifact.state.level_offsets[dst_level + 1] - artifact.state.level_offsets[dst_level])
-                    for op_idx, event in enumerate(done):
-                        stream.wait_event(event)
+                    for op_idx in range(len(ops_by_level[dst_level])):
+                        stream.wait_event(compute_done[dst_level][op_idx])
                         level_bufs[dst_level][:rows] += scratch_bufs[dst_level][op_idx][:rows]
                     self._publish_level_source(artifact, direction, dst_level)
                     ready[dst_level].record(stream)
@@ -1463,110 +1618,140 @@ class CusparseRuntime:
             for event in ready:
                 self._root_stream.wait_event(event)
 
-    def _collect_outputs(self, artifact: _CuArtifact, direction: Direction, need_miss_output: bool, k: int):
-        level_bufs = self._up_level_bufs if direction == Direction.UP else self._down_level_bufs
-        staging = self._up_staging if direction == Direction.UP else self._down_staging
-        if direction == Direction.UP:
-            staging["output_main"].fill(0)
+    def _seed_prepared(self, artifact: _CuArtifact, spec: _CudaMatmulSpec, prepared: _CusparsePreparedMatmul) -> None:
+        level_bufs = self._up_level_bufs if spec.direction == Direction.UP else self._down_level_bufs
+        assert level_bufs
+        k = int(spec.k)
+        with self._root_stream:
+            for level in range(len(artifact.state.level_offsets) - 1):
+                rows = int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])
+                level_bufs[level][:rows, :k].fill(0)
+            if spec.backend_init_mode == InitMode.XTX:
+                if artifact.xtx_bias is None:
+                    raise ValueError("init_mode=xtx requires GRG coalescence counts")
+                for level in range(len(artifact.state.level_offsets) - 1):
+                    lo = int(artifact.state.level_offsets[level])
+                    hi = int(artifact.state.level_offsets[level + 1])
+                    level_bufs[level][: hi - lo, :k] += artifact.xtx_bias[lo:hi, None]
+            elif spec.backend_init_mode == InitMode.VECTOR:
+                for level in range(len(artifact.state.level_offsets) - 1):
+                    rows = int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])
+                    level_bufs[level][:rows, :k] += prepared._init_vector_internal[None, :]
+            elif spec.backend_init_mode == InitMode.MATRIX:
+                for level in range(len(artifact.state.level_offsets) - 1):
+                    lo = int(artifact.state.level_offsets[level])
+                    hi = int(artifact.state.level_offsets[level + 1])
+                    self._cp.take(prepared._init_matrix_internal, artifact.node_perm[lo:hi], axis=0, out=level_bufs[level][: hi - lo, :k])
+
+            if spec.direction == Direction.UP:
+                if spec.by_individual:
+                    temp = self._aux[: artifact.state.num_samples, :k]
+                    self._cp.take(prepared._input_internal, artifact.sample_to_individual, axis=0, out=temp)
+                    level_bufs[0][: artifact.state.num_samples, :k] += temp
+                else:
+                    level_bufs[0][: artifact.state.num_samples, :k] += prepared._input_internal
+                return
+
             for level, rows in enumerate(artifact.mut_selector.rows_by_level):
                 if rows.size == 0:
                     continue
-                values = level_bufs[level][: int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])][artifact.mut_selector.cols_by_level[level]]
-                if artifact.mut_selector.row_unique:
-                    staging["output_main"][rows] = values
-                else:
-                    self._cp.add.at(staging["output_main"], rows, values)
-            out_miss = None
-            if need_miss_output:
-                staging["output_miss"].fill(0)
+                count = int(rows.size)
+                level_rows = int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])
+                temp = self._aux[:count, :k]
+                self._cp.take(prepared._input_internal, rows, axis=0, out=temp)
+                self._cp.add.at(level_bufs[level][:level_rows, :k], artifact.mut_selector.cols_by_level[level], temp)
+            if spec.use_miss:
                 for level, rows in enumerate(artifact.miss_selector.rows_by_level):
                     if rows.size == 0:
                         continue
-                    values = level_bufs[level][: int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])][artifact.miss_selector.cols_by_level[level]]
-                    if artifact.miss_selector.row_unique:
-                        staging["output_miss"][rows] = values
-                    else:
-                        self._cp.add.at(staging["output_miss"], rows, values)
-                out_miss = staging["output_miss"][:, :k].get()
-            return staging["output_main"][:, :k].get(), out_miss
-        rows = artifact.state.num_samples
-        self._cp.copyto(staging["output_main"][:rows, :k], level_bufs[0][:rows, :k])
-        return staging["output_main"][:rows, :k].get()
+                    count = int(rows.size)
+                    level_rows = int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])
+                    temp = self._aux[:count, :k]
+                    self._cp.take(prepared._miss_input_internal, rows, axis=0, out=temp)
+                    self._cp.add.at(level_bufs[level][:level_rows, :k], artifact.miss_selector.cols_by_level[level], temp)
 
-    def _copy_node_outputs_to_host(self, artifact: _CuArtifact, direction: Direction, k: int) -> np.ndarray:
-        level_bufs = self._up_level_bufs if direction == Direction.UP else self._down_level_bufs
-        out = np.empty((artifact.state.num_nodes, int(k)), dtype=self.layout.dtype)
-        offset = 0
-        for level in range(len(artifact.state.level_offsets) - 1):
-            rows = int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])
-            out[offset : offset + rows] = level_bufs[level][:rows, :k].get()
-            offset += rows
-        return out
-
-    def _stage_inputs(self, direction: Direction, primary: np.ndarray, miss: np.ndarray | None, init_mode: InitMode, init_payload: np.ndarray | None) -> None:
-        staging = self._up_staging if direction == Direction.UP else self._down_staging
-
-        def _set_matrix(buffer, host: np.ndarray) -> None:
-            host_rows = int(host.shape[0])
-            if int(host.shape[1]) == int(buffer.shape[1]):
-                buffer[:host_rows].set(host)
-                return
-            padded = np.zeros((host_rows, int(buffer.shape[1])), dtype=self.layout.dtype)
-            padded[:, : int(host.shape[1])] = host
-            buffer[:host_rows].set(padded)
-
-        def _set_vector(buffer, host: np.ndarray) -> None:
-            padded = np.zeros(buffer.shape, dtype=self.layout.dtype)
-            padded[0, : int(host.shape[0])] = host
-            buffer.set(padded)
-
-        host_primary = np.asarray(primary, dtype=self.layout.dtype, order="C")
-        with self._root_stream:
-            staging["input_primary"].fill(0)
-            _set_matrix(staging["input_primary"], host_primary)
-            if direction == Direction.DOWN and miss is not None and "input_miss" in staging:
-                host_miss = np.asarray(miss, dtype=self.layout.dtype, order="C")
-                staging["input_miss"].fill(0)
-                _set_matrix(staging["input_miss"], host_miss)
-            if init_mode == InitMode.VECTOR and "init_vector" in staging and init_payload is not None:
-                host_init = np.asarray(init_payload, dtype=self.layout.dtype, order="C")
-                staging["init_vector"].fill(0)
-                _set_vector(staging["init_vector"], host_init)
-            if init_mode == InitMode.MATRIX and "init_matrix" in staging and init_payload is not None:
-                host_init = np.asarray(init_payload, dtype=self.layout.dtype, order="C")
-                staging["init_matrix"].fill(0)
-                _set_matrix(staging["init_matrix"], host_init)
-
-    def _run(
+    def _apply_endpoint_bias_prepared(
         self,
-        artifact_index: int,
-        direction: Direction,
-        primary: np.ndarray,
-        *,
-        miss: np.ndarray | None,
-        init_mode: InitMode,
-        init_payload: np.ndarray | None,
-        need_miss_output: bool,
-        emit_all_nodes: bool,
-    ):
-        with self.device:
-            if direction == Direction.UP and self.layout.pair.plan_up is None:
-                raise ValueError("UP plan is not configured")
-            if direction == Direction.DOWN and self.layout.pair.plan_down is None:
-                raise ValueError("DOWN plan is not configured")
-            artifact = self._artifacts[int(artifact_index)]
-            k = int(primary.shape[1])
-            with self._caller_root_scope():
-                self._stage_inputs(direction, primary, miss, init_mode, init_payload)
-                self._seed_workspace(artifact, direction, init_mode, has_miss_input=miss is not None)
-                self._enqueue_wavefront(artifact, direction)
-                self._root_stream.synchronize()
-            if emit_all_nodes:
-                return self._copy_node_outputs_to_host(artifact, direction, k)
-            if direction == Direction.UP:
-                out_main, out_miss = self._collect_outputs(artifact, direction, need_miss_output, k)
-                return np.asarray(out_main, dtype=self.layout.dtype), (None if out_miss is None else np.asarray(out_miss, dtype=self.layout.dtype))
-            return np.asarray(self._collect_outputs(artifact, direction, need_miss_output, k), dtype=self.layout.dtype)
+        artifact: _CuArtifact,
+        spec: _CudaMatmulSpec,
+        prepared: _CusparsePreparedMatmul,
+        output,
+    ) -> None:
+        if not spec.apply_endpoint_bias:
+            return
+        rows = int(output.shape[0])
+        if spec.init_mode == InitMode.XTX:
+            bias = artifact.init_xtx_up_bias if spec.direction == Direction.UP else artifact.init_xtx_down_bias
+            if bias is None:
+                raise RuntimeError(f"missing cuSPARSE {spec.direction.value} XTX endpoint bias")
+            output += bias[:rows, None]
+            return
+        bias = artifact.init_vector_up_bias if spec.direction == Direction.UP else artifact.init_vector_down_bias
+        if bias is None:
+            raise RuntimeError(f"missing cuSPARSE {spec.direction.value} vector endpoint bias")
+        temp = self._aux[:rows, : spec.k]
+        temp.fill(0)
+        temp += bias[:rows, None]
+        temp *= prepared._init_vector_internal[None, :]
+        output += temp
 
+    def _write_prepared_output(self, artifact: _CuArtifact, spec: _CudaMatmulSpec, prepared: _CusparsePreparedMatmul) -> None:
+        level_bufs = self._up_level_bufs if spec.direction == Direction.UP else self._down_level_bufs
+        assert level_bufs
+        k = int(spec.k)
+        with self._root_stream:
+            if spec.emit_all_nodes:
+                for level in range(len(artifact.state.level_offsets) - 1):
+                    lo = int(artifact.state.level_offsets[level])
+                    hi = int(artifact.state.level_offsets[level + 1])
+                    prepared._output_internal[artifact.node_perm[lo:hi]] = level_bufs[level][: hi - lo, :k]
+                return
+
+            if spec.direction == Direction.UP:
+                output = prepared._output_internal
+                output.fill(0)
+                for level, rows in enumerate(artifact.mut_selector.rows_by_level):
+                    if rows.size == 0:
+                        continue
+                    count = int(rows.size)
+                    level_rows = int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])
+                    temp = self._aux[:count, :k]
+                    self._cp.take(level_bufs[level][:level_rows, :k], artifact.mut_selector.cols_by_level[level], axis=0, out=temp)
+                    if artifact.mut_selector.row_unique:
+                        output[rows] = temp
+                    else:
+                        self._cp.add.at(output, rows, temp)
+                if spec.use_miss:
+                    miss_output = prepared._miss_output_internal
+                    miss_output.fill(0)
+                    for level, rows in enumerate(artifact.miss_selector.rows_by_level):
+                        if rows.size == 0:
+                            continue
+                        count = int(rows.size)
+                        level_rows = int(artifact.state.level_offsets[level + 1] - artifact.state.level_offsets[level])
+                        temp = self._aux[:count, :k]
+                        self._cp.take(level_bufs[level][:level_rows, :k], artifact.miss_selector.cols_by_level[level], axis=0, out=temp)
+                        if artifact.miss_selector.row_unique:
+                            miss_output[rows] = temp
+                        else:
+                            self._cp.add.at(miss_output, rows, temp)
+                self._apply_endpoint_bias_prepared(artifact, spec, prepared, output)
+                return
+
+            if spec.by_individual:
+                output = level_bufs[0][: artifact.state.num_samples, :k]
+                self._apply_endpoint_bias_prepared(artifact, spec, prepared, output)
+                prepared._output_internal.fill(0)
+                self._cp.add.at(prepared._output_internal, artifact.sample_to_individual, output)
+            else:
+                self._cp.copyto(prepared._output_internal[: artifact.state.num_samples, :k], level_bufs[0][: artifact.state.num_samples, :k])
+                self._apply_endpoint_bias_prepared(artifact, spec, prepared, prepared._output_internal)
+
+    def _execute_prepared(self, artifact: _CuArtifact, spec: _CudaMatmulSpec, prepared: _CusparsePreparedMatmul) -> None:
+        with self.device:
+            with self._caller_root_scope():
+                self._seed_prepared(artifact, spec, prepared)
+                self._enqueue_wavefront(artifact, spec.direction)
+                self._write_prepared_output(artifact, spec, prepared)
 
 __all__ = ["CusparseLayout", "CusparseRuntime", "plan_cusparse_layout"]

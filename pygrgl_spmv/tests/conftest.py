@@ -29,9 +29,10 @@ def _has_mkl_runtime() -> bool:
 def _has_cusparse_runtime() -> bool:
     try:
         import cupy as cp
+        import torch
 
         cp.cuda.runtime.getDeviceCount()
-        return True
+        return bool(torch.cuda.is_available())
     except Exception:
         return False
 
