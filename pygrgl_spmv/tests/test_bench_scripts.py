@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import argparse
 import numpy as np
+import pytest
 
+from pygrgl_spmv.backends.cusparse import SpMMAlgorithm
+from scripts.bench.cusparse import (
+    DEFAULT_CUSPARSE_PLAN_NAME,
+    add_cusparse_plan_arg,
+    parse_cusparse_plan,
+)
 from scripts.bench.cli import add_common_args, parse_args
 from scripts.bench.run import benchmark_runtime
 
@@ -64,3 +71,57 @@ def test_gpu_bench_parser_accepts_no_allow_residency():
         ["--artifact", "/tmp/a.grg_spmv", "--vram-budget-bytes", "123", "--no-allow-residency"]
     )
     assert args.allow_residency is False
+
+
+def _parse_cusparse_plan_args(argv: list[str]):
+    parser = argparse.ArgumentParser()
+    add_cusparse_plan_arg(parser)
+    return parser.parse_args(argv)
+
+
+def test_cusparse_plan_arg_defaults_to_exhaustive_best_plan():
+    args = _parse_cusparse_plan_args([])
+    pair = args.plan
+    assert pair == parse_cusparse_plan(DEFAULT_CUSPARSE_PLAN_NAME)
+    assert pair.plan_up.store == "N"
+    assert pair.plan_up.fmt == "CSR"
+    assert pair.plan_up.order_b.name == "COL"
+    assert pair.plan_up.order_c.name == "COL"
+    assert pair.plan_up.algo == SpMMAlgorithm.DEFAULT
+    assert pair.plan_down.store == "T"
+    assert pair.plan_down.fmt == "CSC"
+    assert pair.plan_down.order_b.name == "COL"
+    assert pair.plan_down.order_c.name == "COL"
+    assert pair.plan_down.algo == SpMMAlgorithm.DEFAULT
+
+
+def test_cusparse_plan_arg_accepts_named_preset():
+    args = _parse_cusparse_plan_args(["--plan", "shared-csr-reinterpret"])
+    assert args.plan.plan_up.store == "N"
+    assert args.plan.plan_up.fmt == "CSR"
+    assert args.plan.plan_up.op_b.name == "T"
+    assert args.plan.plan_up.order_b.name == "COL"
+    assert args.plan.plan_down.store == "T"
+    assert args.plan.plan_down.fmt == "CSC"
+    assert args.plan.plan_down.op_b.name == "T"
+    assert args.plan.plan_down.order_b.name == "COL"
+
+
+def test_cusparse_plan_arg_accepts_json_plan():
+    args = _parse_cusparse_plan_args(
+        [
+            "--plan",
+            (
+                '{"plan_up": {"store": "N", "fmt": "CSR", "opA": "N", '
+                '"opB": "N", "orderB": "ROW", "orderC": "ROW", '
+                '"algo": "CSR_ALG1"}, "plan_down": null}'
+            ),
+        ]
+    )
+    assert args.plan.plan_up.algo == SpMMAlgorithm.CSR_ALG1
+    assert args.plan.plan_down is None
+
+
+def test_cusparse_plan_arg_rejects_invalid_value():
+    with pytest.raises(SystemExit):
+        _parse_cusparse_plan_args(["--plan", "not-a-plan"])
