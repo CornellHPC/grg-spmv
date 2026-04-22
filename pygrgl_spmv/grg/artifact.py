@@ -170,7 +170,7 @@ def _validate_archive(data: np.lib.npyio.NpzFile, artifact_path) -> None:
 def _log_struct_array(key: str, arr: np.ndarray) -> None:
     if not _LOGGER.isEnabledFor(logging.INFO):
         return
-    _LOGGER.info(
+    _LOGGER.debug(
         "artifact array key=%s dtype=%s shape=%s nbytes=%d",
         key,
         np.asarray(arr).dtype,
