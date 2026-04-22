@@ -215,8 +215,8 @@ def _setup_mkl_signatures(lib, ct_int) -> None:
     lib.mkl_sparse_optimize.argtypes = [c_void_p]
     lib.mkl_sparse_optimize.restype = c_int
 
-    lib.MKL_Set_Num_Threads.argtypes = [c_int]
-    lib.MKL_Set_Num_Threads.restype = None
+    lib.MKL_Set_Num_Threads_Local.argtypes = [c_int]
+    lib.MKL_Set_Num_Threads_Local.restype = c_int
 
 
 _mkl_lib = None
@@ -493,6 +493,6 @@ class MklSparseHandle:
             self._handle = None
 
 
-def mkl_set_num_threads(n):
+def mkl_set_num_threads_local(n):
     lib, _, _ = _ensure_loaded()
-    lib.MKL_Set_Num_Threads(c_int(n))
+    return int(lib.MKL_Set_Num_Threads_Local(c_int(n)))

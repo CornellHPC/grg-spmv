@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
+import threading
 
 import numpy as np
 import pygrgl
@@ -23,6 +25,8 @@ class _FakeMklLib:
         self.created_handles: list[int] = []
         self.destroyed_handles: list[int] = []
         self.destroy_calls = 0
+        self.local_thread_calls: list[int] = []
+        self._local_thread_count = 0
         self._next_handle = 1
 
     def _record_create(self, scalar: str, _handle, m, n):
@@ -59,6 +63,12 @@ class _FakeMklLib:
     def mkl_sparse_optimize(self, handle):
         self.optimize_calls.append(int(getattr(handle, "value", handle)))
         return 0
+
+    def MKL_Set_Num_Threads_Local(self, n):
+        previous = self._local_thread_count
+        self._local_thread_count = int(getattr(n, "value", n))
+        self.local_thread_calls.append(self._local_thread_count)
+        return previous
 
 
 class _FakeCsr:
@@ -153,11 +163,37 @@ def test_mkl_format_sweep_matches_reference(primary_artifact, primary_grg, fmt):
         np.testing.assert_allclose(grg.matmul(x_down, "down"), np.asarray(pygrgl.matmul(primary_grg, x_down, pygrgl.TraversalDirection.DOWN)), atol=atol, rtol=rtol)
 
 
+def test_mkl_set_num_threads_local_uses_thread_local_mkl_api(monkeypatch):
+    import pygrgl_spmv.backends.mkl.ffi as mkl_ffi
+
+    fake_lib = _FakeMklLib()
+    monkeypatch.setattr(mkl_ffi, "_ensure_loaded", lambda: (fake_lib, np.int32, ctypes.c_int))
+
+    assert mkl_ffi.mkl_set_num_threads_local(3) == 0
+    assert mkl_ffi.mkl_set_num_threads_local(0) == 3
+    assert fake_lib.local_thread_calls == [3, 0]
+
+
+def test_enter_scopes_setup_thread_count(primary_artifact, monkeypatch):
+    import pygrgl_spmv.backends.mkl.backend as mkl_backend
+
+    calls: list[int] = []
+    monkeypatch.setattr(mkl_backend, "mkl_set_num_threads_local", lambda n: calls.append(int(n)) or 0)
+    pair = mkl_pair(
+        plan_up=MklPlan(store="N", fmt="CSR", n_threads=2),
+        plan_down=MklPlan(store="T", fmt="CSC", n_threads=4),
+    )
+    layout = build_mkl_layout([primary_artifact], pair=pair, requirements=full_requirements(max_k_up=2, max_k_down=2))
+    with MklRuntime(layout):
+        pass
+    assert calls == [4, 0]
+
+
 def test_run_uses_per_direction_thread_counts(primary_artifact, monkeypatch):
     import pygrgl_spmv.backends.mkl.backend as mkl_backend
 
     calls: list[int] = []
-    monkeypatch.setattr(mkl_backend, "mkl_set_num_threads", lambda n: calls.append(int(n)))
+    monkeypatch.setattr(mkl_backend, "mkl_set_num_threads_local", lambda n: calls.append(int(n)) or 0)
     pair = mkl_pair(
         plan_up=mkl_pair().plan_up.__class__(store="N", fmt="CSR", n_threads=1),
         plan_down=mkl_pair().plan_down.__class__(store="T", fmt="CSC", n_threads=4),
@@ -169,7 +205,61 @@ def test_run_uses_per_direction_thread_counts(primary_artifact, monkeypatch):
         rng = np.random.default_rng(6401)
         _ = grg.matmul(rng.standard_normal((2, grg.num_samples), dtype=DATA_DTYPE), "up")
         _ = grg.matmul(rng.standard_normal((2, grg.num_mutations), dtype=DATA_DTYPE), "down")
-        assert calls == [1, 4]
+        assert calls == [1, 0, 4, 0]
+
+
+def test_separate_mkl_runtimes_support_parallel_worker_threads(primary_artifact, primary_grg, monkeypatch):
+    import pygrgl_spmv.backends.mkl.backend as mkl_backend
+
+    original = mkl_backend.mkl_set_num_threads_local
+    calls: list[tuple[int, int, int]] = []
+    calls_lock = threading.Lock()
+
+    def record_local_threads(n):
+        previous = original(int(n))
+        with calls_lock:
+            calls.append((threading.get_ident(), int(n), int(previous)))
+        return previous
+
+    monkeypatch.setattr(mkl_backend, "mkl_set_num_threads_local", record_local_threads)
+    layout_up = build_mkl_layout(
+        [primary_artifact],
+        pair=MklPlanPair(plan_up=MklPlan(store="N", fmt="CSR", n_threads=1), plan_down=None),
+        requirements=full_requirements(max_k_up=2, max_k_down=1),
+    )
+    layout_down = build_mkl_layout(
+        [primary_artifact],
+        pair=MklPlanPair(plan_up=None, plan_down=MklPlan(store="T", fmt="CSC", n_threads=2)),
+        requirements=full_requirements(max_k_up=1, max_k_down=2),
+    )
+    rng = np.random.default_rng(9401)
+    x_up = rng.standard_normal((2, primary_grg.num_samples), dtype=DATA_DTYPE)
+    x_down = rng.standard_normal((2, primary_grg.num_mutations), dtype=DATA_DTYPE)
+    barrier = threading.Barrier(2)
+
+    def run_worker(grg, matrix, direction):
+        barrier.wait(timeout=10)
+        return grg.matmul(matrix, direction), threading.get_ident()
+
+    with MklRuntime(layout_up) as runtime_up, MklRuntime(layout_down) as runtime_down:
+        (grg_up,) = runtime_up.grgs
+        (grg_down,) = runtime_down.grgs
+        calls.clear()
+        main_tid = threading.get_ident()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_up = pool.submit(run_worker, grg_up, x_up, "up")
+            future_down = pool.submit(run_worker, grg_down, x_down, "down")
+            out_up, up_tid = future_up.result(timeout=20)
+            out_down, down_tid = future_down.result(timeout=20)
+
+    atol, rtol = tol(DATA_DTYPE)
+    np.testing.assert_allclose(out_up, np.asarray(pygrgl.matmul(primary_grg, x_up, pygrgl.TraversalDirection.UP)), atol=atol, rtol=rtol)
+    np.testing.assert_allclose(out_down, np.asarray(pygrgl.matmul(primary_grg, x_down, pygrgl.TraversalDirection.DOWN)), atol=atol, rtol=rtol)
+    worker_tids = {up_tid, down_tid}
+    assert main_tid not in worker_tids
+    assert len(worker_tids) == 2
+    by_thread = {tid: [n for call_tid, n, _previous in calls if call_tid == tid] for tid in worker_tids}
+    assert sorted(tuple(values) for values in by_thread.values()) == [(1, 0), (2, 0)]
 
 
 def test_lp64_rejects_int64_csr_indices_before_mkl_call(monkeypatch):

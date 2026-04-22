@@ -55,7 +55,7 @@ The suite protects five things:
 - `runtime/test_reference.py`
   - Reference runtime parity and exact byte accounting for resident sparse blocks, selectors, and workspaces.
 - `runtime/test_mkl.py`
-  - MKL runtime parity, format/thread behavior, LP64 ABI checks, `float32` dispatch, shared-value budgeting, and optimize-flag semantics.
+  - MKL runtime parity, format/thread-local behavior, separate-runtime threaded execution, LP64 ABI checks, `float32` dispatch, shared-value budgeting, and optimize-flag semantics.
 - `runtime/test_plans.py`
   - CUDA device/stream parsing plus backend plan/pair validation and storage-sharing rules.
 - `runtime/test_directional_layouts.py`

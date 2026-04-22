@@ -20,7 +20,7 @@ from pygrgl_spmv.backends.base import (
     stored_block_shape,
 )
 import pygrgl_spmv.backends.mkl.ffi as mkl_ffi
-from pygrgl_spmv.backends.mkl.ffi import MklSparseHandle, _address_array, _mmap, _munmap, mkl_set_num_threads
+from pygrgl_spmv.backends.mkl.ffi import MklSparseHandle, _address_array, _mmap, _munmap, mkl_set_num_threads_local
 from pygrgl_spmv.backends.types import Direction, InitMode, StoredMatrix
 from pygrgl_spmv.grg import BoundGRG, RuntimeRequirements
 from pygrgl_spmv.grg.artifact import _load_grg_spmv_host, iter_artifact_blocks, scan_grg_spmv
@@ -293,11 +293,20 @@ def _needs_transpose(direction: Direction, store: StoredMatrix) -> bool:
     return (direction == Direction.DOWN) != (store == StoredMatrix.T)
 
 
-def _thread_count(plan: MklPlan | None) -> int | None:
+def _resolve_thread_count(plan: MklPlan | None) -> int | None:
     if plan is None:
         return None
     count = os.cpu_count() or 1
     return count if int(plan.n_threads) == 0 else int(plan.n_threads)
+
+
+@contextmanager
+def _mkl_local_threads(n: int):
+    previous = mkl_set_num_threads_local(int(n))
+    try:
+        yield
+    finally:
+        mkl_set_num_threads_local(int(previous))
 
 
 class MklRuntime:
@@ -315,8 +324,8 @@ class MklRuntime:
         self._entered = False
         self._active_call = False
         self._grgs: tuple[BoundGRG, ...] = ()
-        self._threads_up = _thread_count(layout.pair.plan_up)
-        self._threads_down = _thread_count(layout.pair.plan_down)
+        self._thread_count_up = _resolve_thread_count(layout.pair.plan_up)
+        self._thread_count_down = _resolve_thread_count(layout.pair.plan_down)
 
     @property
     def grgs(self) -> tuple[BoundGRG, ...]:
@@ -332,61 +341,61 @@ class MklRuntime:
             self._up_workspace = np.zeros((max_nodes, int(self.layout.requirements.max_k_up)), dtype=dtype)
         if self.layout.pair.plan_down is not None:
             self._down_workspace = np.zeros((max_nodes, int(self.layout.requirements.max_k_down)), dtype=dtype)
-        setup_threads = max(count for count in (self._threads_up, self._threads_down) if count is not None)
-        mkl_set_num_threads(int(setup_threads))
-        self._shared_values = self._materialize_shared_values()
-        artifacts: list[_MklArtifact] = []
-        try:
-            for artifact_layout, state in zip(self.layout.artifacts, states, strict=True):
-                h = len(state.level_offsets) - 1
-                up_grid = [[None] * dst_level for dst_level in range(h)]
-                down_grid = [[None] * dst_level for dst_level in range(h)]
-                for block in iter_artifact_blocks(artifact_layout.path):
-                    base = sp.csr_matrix(
-                        (
-                            np.ones(block.nnz, dtype=np.bool_),
-                            np.asarray(block.indices),
-                            np.asarray(block.indptr),
-                        ),
-                        shape=block.shape,
-                    )
-                    if self.layout.pair.plan_up is not None:
-                        matrix = materialize_sparse_block(
-                            base,
-                            store=self.layout.pair.plan_up.store,
-                            fmt=self.layout.pair.plan_up.fmt,
+        setup_threads = max(count for count in (self._thread_count_up, self._thread_count_down) if count is not None)
+        with _mkl_local_threads(setup_threads):
+            self._shared_values = self._materialize_shared_values()
+            artifacts: list[_MklArtifact] = []
+            try:
+                for artifact_layout, state in zip(self.layout.artifacts, states, strict=True):
+                    h = len(state.level_offsets) - 1
+                    up_grid = [[None] * dst_level for dst_level in range(h)]
+                    down_grid = [[None] * dst_level for dst_level in range(h)]
+                    for block in iter_artifact_blocks(artifact_layout.path):
+                        base = sp.csr_matrix(
+                            (
+                                np.ones(block.nnz, dtype=np.bool_),
+                                np.asarray(block.indices),
+                                np.asarray(block.indptr),
+                            ),
+                            shape=block.shape,
                         )
-                        up_grid[block.dst_level][block.src_level] = self._build_handle(matrix, self.layout.pair.plan_up)
-                    if self.layout.pair.plan_down is not None and not artifact_layout.share_storage:
-                        matrix = materialize_sparse_block(
-                            base,
-                            store=self.layout.pair.plan_down.store,
-                            fmt=self.layout.pair.plan_down.fmt,
+                        if self.layout.pair.plan_up is not None:
+                            matrix = materialize_sparse_block(
+                                base,
+                                store=self.layout.pair.plan_up.store,
+                                fmt=self.layout.pair.plan_up.fmt,
+                            )
+                            up_grid[block.dst_level][block.src_level] = self._build_handle(matrix, self.layout.pair.plan_up)
+                        if self.layout.pair.plan_down is not None and not artifact_layout.share_storage:
+                            matrix = materialize_sparse_block(
+                                base,
+                                store=self.layout.pair.plan_down.store,
+                                fmt=self.layout.pair.plan_down.fmt,
+                            )
+                            down_grid[block.dst_level][block.src_level] = self._build_handle(matrix, self.layout.pair.plan_down)
+                    artifacts.append(
+                        _MklArtifact(
+                            path=artifact_layout.path,
+                            state=state,
+                            up_grid=up_grid,
+                            down_grid=down_grid,
+                            up_ops=self._build_ops(Direction.UP, state, up_grid, down_grid, artifact_layout),
+                            down_ops=self._build_ops(Direction.DOWN, state, up_grid, down_grid, artifact_layout),
                         )
-                        down_grid[block.dst_level][block.src_level] = self._build_handle(matrix, self.layout.pair.plan_down)
-                artifacts.append(
-                    _MklArtifact(
-                        path=artifact_layout.path,
-                        state=state,
-                        up_grid=up_grid,
-                        down_grid=down_grid,
-                        up_ops=self._build_ops(Direction.UP, state, up_grid, down_grid, artifact_layout),
-                        down_ops=self._build_ops(Direction.DOWN, state, up_grid, down_grid, artifact_layout),
                     )
-                )
-            self._artifacts = tuple(artifacts)
-            self._configure_handle_hints()
-            self._grgs = tuple(BoundGRG(self, idx, artifact.state, artifact.path) for idx, artifact in enumerate(self._artifacts))
-            self._entered = True
-            return self
-        except Exception:
-            self._destroy_handles(artifacts)
-            if self._shared_values is not None:
-                self._shared_values.destroy()
-                self._shared_values = None
-            self._up_workspace = None
-            self._down_workspace = None
-            raise
+                self._artifacts = tuple(artifacts)
+                self._configure_handle_hints()
+                self._grgs = tuple(BoundGRG(self, idx, artifact.state, artifact.path) for idx, artifact in enumerate(self._artifacts))
+                self._entered = True
+                return self
+            except Exception:
+                self._destroy_handles(artifacts)
+                if self._shared_values is not None:
+                    self._shared_values.destroy()
+                    self._shared_values = None
+                self._up_workspace = None
+                self._down_workspace = None
+                raise
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self._destroy_handles(self._artifacts)
@@ -564,29 +573,62 @@ class MklRuntime:
         workspace = self._up_workspace if direction == Direction.UP else self._down_workspace
         if workspace is None:
             raise ValueError(f"{direction.value.upper()} plan is not configured")
-        thread_count = self._threads_up if direction == Direction.UP else self._threads_down
+        thread_count = self._thread_count_up if direction == Direction.UP else self._thread_count_down
         assert thread_count is not None
-        mkl_set_num_threads(int(thread_count))
-        x = np.asarray(primary, dtype=self.layout.dtype, order="C")
-        k = int(x.shape[1])
-        node_values = workspace[: state.num_nodes, :k]
-        node_values.fill(0)
-        if init_mode == InitMode.XTX:
-            if state.coalescence_counts is None:
-                raise ValueError("init_mode=xtx requires GRG coalescence counts")
-            node_values += (2.0 * state.coalescence_counts.astype(self.layout.dtype, copy=False))[:, None]
-        elif init_mode == InitMode.VECTOR:
-            assert init_payload is not None
-            node_values += init_payload[None, :]
-        elif init_mode == InitMode.MATRIX:
-            assert init_payload is not None
-            node_values += init_payload
+        with _mkl_local_threads(thread_count):
+            x = np.asarray(primary, dtype=self.layout.dtype, order="C")
+            k = int(x.shape[1])
+            node_values = workspace[: state.num_nodes, :k]
+            node_values.fill(0)
+            if init_mode == InitMode.XTX:
+                if state.coalescence_counts is None:
+                    raise ValueError("init_mode=xtx requires GRG coalescence counts")
+                node_values += (2.0 * state.coalescence_counts.astype(self.layout.dtype, copy=False))[:, None]
+            elif init_mode == InitMode.VECTOR:
+                assert init_payload is not None
+                node_values += init_payload[None, :]
+            elif init_mode == InitMode.MATRIX:
+                assert init_payload is not None
+                node_values += init_payload
 
-        use_mv = k == 1 and workspace.shape[1] == 1
-        if direction == Direction.UP:
-            node_values[: state.num_samples] += x
-            ops = artifact.up_ops
-            for dst_level in range(1, len(state.level_offsets) - 1):
+            use_mv = k == 1 and workspace.shape[1] == 1
+            if direction == Direction.UP:
+                node_values[: state.num_samples] += x
+                ops = artifact.up_ops
+                for dst_level in range(1, len(state.level_offsets) - 1):
+                    lo = int(state.level_offsets[dst_level])
+                    hi = int(state.level_offsets[dst_level + 1])
+                    dst = node_values[lo:hi]
+                    for op in ops[dst_level]:
+                        src_lo = int(state.level_offsets[op.src_level])
+                        src_hi = int(state.level_offsets[op.src_level + 1])
+                        src = node_values[src_lo:src_hi]
+                        if use_mv:
+                            op.handle.mv(src[:, 0], dst[:, 0], alpha=1.0, beta=1.0, transpose=op.transpose)
+                        else:
+                            op.handle.mm(src, dst, alpha=1.0, beta=1.0, transpose=op.transpose)
+                if emit_all_nodes:
+                    return np.array(node_values, copy=True)
+                out_mut = (
+                    np.asarray(state.sel_mut @ node_values, dtype=self.layout.dtype)
+                    if state.sel_mut.nnz
+                    else np.zeros((state.num_mutations, k), dtype=self.layout.dtype)
+                )
+                out_miss = None
+                if need_miss_output:
+                    out_miss = (
+                        np.asarray(state.sel_miss @ node_values, dtype=self.layout.dtype)
+                        if state.sel_miss.nnz
+                        else np.zeros((state.num_mutations, k), dtype=self.layout.dtype)
+                    )
+                return out_mut, out_miss
+
+            if state.sel_mut.nnz:
+                node_values += state.sel_mut.T @ x
+            if miss is not None and state.sel_miss.nnz:
+                node_values += state.sel_miss.T @ np.asarray(miss, dtype=self.layout.dtype, order="C")
+            ops = artifact.down_ops
+            for dst_level in range(len(state.level_offsets) - 2, -1, -1):
                 lo = int(state.level_offsets[dst_level])
                 hi = int(state.level_offsets[dst_level + 1])
                 dst = node_values[lo:hi]
@@ -600,40 +642,7 @@ class MklRuntime:
                         op.handle.mm(src, dst, alpha=1.0, beta=1.0, transpose=op.transpose)
             if emit_all_nodes:
                 return np.array(node_values, copy=True)
-            out_mut = (
-                np.asarray(state.sel_mut @ node_values, dtype=self.layout.dtype)
-                if state.sel_mut.nnz
-                else np.zeros((state.num_mutations, k), dtype=self.layout.dtype)
-            )
-            out_miss = None
-            if need_miss_output:
-                out_miss = (
-                    np.asarray(state.sel_miss @ node_values, dtype=self.layout.dtype)
-                    if state.sel_miss.nnz
-                    else np.zeros((state.num_mutations, k), dtype=self.layout.dtype)
-                )
-            return out_mut, out_miss
-
-        if state.sel_mut.nnz:
-            node_values += state.sel_mut.T @ x
-        if miss is not None and state.sel_miss.nnz:
-            node_values += state.sel_miss.T @ np.asarray(miss, dtype=self.layout.dtype, order="C")
-        ops = artifact.down_ops
-        for dst_level in range(len(state.level_offsets) - 2, -1, -1):
-            lo = int(state.level_offsets[dst_level])
-            hi = int(state.level_offsets[dst_level + 1])
-            dst = node_values[lo:hi]
-            for op in ops[dst_level]:
-                src_lo = int(state.level_offsets[op.src_level])
-                src_hi = int(state.level_offsets[op.src_level + 1])
-                src = node_values[src_lo:src_hi]
-                if use_mv:
-                    op.handle.mv(src[:, 0], dst[:, 0], alpha=1.0, beta=1.0, transpose=op.transpose)
-                else:
-                    op.handle.mm(src, dst, alpha=1.0, beta=1.0, transpose=op.transpose)
-        if emit_all_nodes:
-            return np.array(node_values, copy=True)
-        return np.array(node_values[: state.num_samples], copy=True)
+            return np.array(node_values[: state.num_samples], copy=True)
 
 
 __all__ = ["MklLayout", "MklRuntime", "plan_mkl_layout"]
