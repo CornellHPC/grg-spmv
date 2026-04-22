@@ -19,7 +19,7 @@ class MklPlan:
     store: StoredMatrix
     fmt: SparseFormat
     n_threads: int = 0
-    optimize: bool = True
+    optimize: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store", parse_store(self.store))
@@ -38,7 +38,7 @@ class MklPlan:
             store=parse_store(value["store"]),
             fmt=parse_sparse_format(value["fmt"]),
             n_threads=int(value.get("n_threads", 0)),
-            optimize=bool(value.get("optimize", True)),
+            optimize=bool(value.get("optimize", False)),
         )
 
     def can_share_storage_with(self, other: "MklPlan") -> bool:
