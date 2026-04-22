@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import functools
 from types import SimpleNamespace
 
@@ -42,6 +43,7 @@ pytestmark = [pytest.mark.gpu, pytest.mark.cusparse]
 
 _MODE_BY_NAME = {mode.name: mode for mode in THREE_BLOCK_TRANSITION_MODES}
 _THREE_BLOCK_KEYS = ((1, 0), (2, 0), (2, 1))
+_MIXED_HEIGHT_GRAPH_ORDERS = (("up", "down"), ("down", "up"))
 
 
 def _requirements(runtime_k: int):
@@ -213,6 +215,84 @@ def _full_budget_components(artifact, *, runtime_k: int) -> tuple[int, int, int]
         vram_budget_bytes=1_000_000_000_000,
     )
     return _equal_block_budget_components(layout)
+
+
+def _source_cols(grg, direction: str) -> int:
+    return int(grg.num_samples if direction == "up" else grg.num_mutations)
+
+
+def _expected_prepared_chain(ref_grg, order, src: np.ndarray, init_first: np.ndarray, init_second: np.ndarray) -> np.ndarray:
+    mid = ref_grg.matmul(src, order[0], init=init_first)
+    return ref_grg.matmul(mid, order[1], init=init_second)
+
+
+def _enter_prepared_chain(stack: ExitStack, grg, order, *, k: int):
+    first = stack.enter_context(grg.prepare_matmul_cuda(direction=order[0], k=int(k), init_mode="vector"))
+    second = stack.enter_context(grg.prepare_matmul_cuda(direction=order[1], k=int(k), init_mode="vector"))
+    assert first.output.data_ptr() == second.input.data_ptr()
+    return first, second
+
+
+def _capture_prepared_chain(first, second, src, init_first, init_second, result=None) -> None:
+    first.input.copy_(src)
+    first.init_vector.copy_(init_first)
+    first()
+    second.init_vector.copy_(init_second)
+    second()
+    if result is not None:
+        result.copy_(second.output)
+
+
+def _mixed_height_graph_artifacts(tmp_path) -> tuple[object, object]:
+    tall = write_overlap_band_artifact(tmp_path, "tall-h4", n=16, bandwidth=4)
+    short = write_three_level_band_artifact(tmp_path, "short-h3", n=16, bandwidth=4)
+    assert scan_grg_spmv(tall).num_levels == 4
+    assert scan_grg_spmv(short).num_levels == 3
+    return tall, short
+
+
+def _build_multi_grg_graph_layout(artifacts, *, streamed: bool, stream):
+    layout = build_cusparse_layout(
+        artifacts,
+        requirements=_requirements(1),
+        ring_buffer_size=2 if streamed else 0,
+        vram_budget_bytes=1_000_000_000,
+        allow_residency=not bool(streamed),
+        stream=stream,
+    )
+    if streamed:
+        assert layout.allow_residency is False
+        assert layout.requested_ring_buffer_size == 2
+        assert layout.allocated_ring_buffer_size == 2
+        assert all(
+            not block.resident
+            for artifact in layout.artifacts
+            for block in (*artifact.blocks_up, *artifact.blocks_down)
+        )
+    else:
+        assert layout.allocated_ring_buffer_size == 0
+    return layout
+
+
+def _multi_grg_graph_cases(artifacts) -> list[SimpleNamespace]:
+    out = []
+    ref_layout = build_reference_layout(artifacts, requirements=_requirements(1))
+    with ReferenceRuntime(ref_layout) as ref_runtime:
+        for idx, (ref_grg, order) in enumerate(zip(ref_runtime.grgs, _MIXED_HEIGHT_GRAPH_ORDERS, strict=True)):
+            cols = _source_cols(ref_grg, order[0])
+            src = np.arange(cols, dtype=DATA_DTYPE).reshape(1, cols) + DATA_DTYPE(idx * 100)
+            init_first = np.asarray([0.25 + idx], dtype=DATA_DTYPE)
+            init_second = np.asarray([0.75 + idx], dtype=DATA_DTYPE)
+            out.append(
+                SimpleNamespace(
+                    order=order,
+                    src=src,
+                    init_first=init_first,
+                    init_second=init_second,
+                    expected=_expected_prepared_chain(ref_grg, order, src, init_first, init_second),
+                )
+            )
+    return out
 
 
 def _assert_budget_accounting(layout, *, chosen_budget: int, fixed_bytes: int, block_bytes: int) -> None:
@@ -1000,33 +1080,37 @@ def test_cusparse_stream_copy_overlaps_compute(tmp_path, order, requested_ring_b
     _run_overlap_case(tmp_path, order, requested_ring_buffer_size, monkeypatch, n=4096, bandwidth=64, runtime_k=2)
 
 
-def test_cusparse_prepare_cuda_graph_capture_resident(primary_artifact, primary_grg):
+def test_cusparse_prepare_cuda_graph_capture_resident(primary_artifact):
     torch = pytest.importorskip("torch")
     with torch.cuda.device(0):
         capture_stream = torch.cuda.Stream()
     layout = build_cusparse_layout([primary_artifact], requirements=_requirements(2), stream=capture_stream)
-    with CusparseRuntime(layout) as runtime:
-        (grg,) = runtime.grgs
+    ref_layout = build_reference_layout([primary_artifact], requirements=_requirements(2))
+    with ReferenceRuntime(ref_layout) as ref_runtime:
+        (ref_grg,) = ref_runtime.grgs
         rng = np.random.default_rng(98_201)
-        src_np = rng.standard_normal((2, primary_grg.num_samples), dtype=DATA_DTYPE)
-        init_np = rng.standard_normal((2,), dtype=DATA_DTYPE)
-        expected = np.asarray(pygrgl.matmul(primary_grg, src_np, pygrgl.TraversalDirection.UP, init=init_np))
-        with grg.prepare_matmul_cuda(direction="up", k=2, init_mode="vector") as op:
-            src = torch.from_numpy(src_np).to(device=op.input.device)
-            init = torch.from_numpy(init_np).to(device=op.init_vector.device)
-            graph = torch.cuda.CUDAGraph()
-            # All capture-sensitive setup must already be complete once the prepared op is entered.
-            with torch.cuda.graph(graph, stream=capture_stream):
-                op.input.copy_(src)
-                op.init_vector.copy_(init)
-                op()
-            graph.replay()
-            cp.cuda.runtime.deviceSynchronize()
-            actual = op.output.cpu().numpy().copy()
-        np.testing.assert_allclose(actual, expected, atol=tol(DATA_DTYPE)[0], rtol=tol(DATA_DTYPE)[1])
+        order = ("down", "up")
+        src_np = rng.standard_normal((2, _source_cols(ref_grg, order[0])), dtype=DATA_DTYPE)
+        init_first_np = rng.standard_normal((2,), dtype=DATA_DTYPE)
+        init_second_np = rng.standard_normal((2,), dtype=DATA_DTYPE)
+        expected = _expected_prepared_chain(ref_grg, order, src_np, init_first_np, init_second_np)
+    with CusparseRuntime(layout) as runtime, ExitStack() as stack:
+        (grg,) = runtime.grgs
+        first, second = _enter_prepared_chain(stack, grg, order, k=2)
+        src = torch.from_numpy(src_np).to(device=first.input.device)
+        init_first = torch.from_numpy(init_first_np).to(device=first.init_vector.device)
+        init_second = torch.from_numpy(init_second_np).to(device=second.init_vector.device)
+        graph = torch.cuda.CUDAGraph()
+        # All capture-sensitive setup must already be complete once the prepared ops are entered.
+        with torch.cuda.graph(graph, stream=capture_stream):
+            _capture_prepared_chain(first, second, src, init_first, init_second)
+        graph.replay()
+        cp.cuda.runtime.deviceSynchronize()
+        actual = second.output.cpu().numpy().copy()
+    np.testing.assert_allclose(actual, expected, atol=tol(DATA_DTYPE)[0], rtol=tol(DATA_DTYPE)[1])
 
 
-def test_cusparse_prepare_cuda_graph_capture_streamed(cusparse_small_stream_artifact, gpu_small_stream_case):
+def test_cusparse_prepare_cuda_graph_capture_streamed(cusparse_small_stream_artifact):
     torch = pytest.importorskip("torch")
     fixed_bytes, block_bytes, owner_block_count = _full_budget_components(cusparse_small_stream_artifact, runtime_k=1)
     assert owner_block_count == 3
@@ -1035,23 +1119,107 @@ def test_cusparse_prepare_cuda_graph_capture_streamed(cusparse_small_stream_arti
     layout = _build_layout(
         cusparse_small_stream_artifact,
         runtime_k=1,
-        ring_buffer_size=1,
-        budget_bytes=fixed_bytes + block_bytes,
+        ring_buffer_size=2,
+        budget_bytes=fixed_bytes + 2 * block_bytes,
         allow_residency=False,
         stream=capture_stream,
     )
-    with CusparseRuntime(layout) as runtime:
+    ref_layout = build_reference_layout([cusparse_small_stream_artifact], requirements=_requirements(1))
+    with ReferenceRuntime(ref_layout) as ref_runtime:
+        (ref_grg,) = ref_runtime.grgs
+        order = ("down", "up")
+        src_np = np.arange(_source_cols(ref_grg, order[0]), dtype=DATA_DTYPE).reshape(1, -1)
+        init_first_np = np.asarray([0.5], dtype=DATA_DTYPE)
+        init_second_np = np.asarray([1.5], dtype=DATA_DTYPE)
+        expected = _expected_prepared_chain(ref_grg, order, src_np, init_first_np, init_second_np)
+    with CusparseRuntime(layout) as runtime, ExitStack() as stack:
         (grg,) = runtime.grgs
-        src_np = np.arange(gpu_small_stream_case.n, dtype=DATA_DTYPE).reshape(1, gpu_small_stream_case.n)
-        expected = expected_up(src_np.T, shifts=gpu_small_stream_case.shifts, bandwidth=gpu_small_stream_case.bandwidth).T
-        with grg.prepare_matmul_cuda(direction="up", k=1) as op:
-            src = torch.from_numpy(src_np).to(device=op.input.device)
+        first, second = _enter_prepared_chain(stack, grg, order, k=1)
+        src = torch.from_numpy(src_np).to(device=first.input.device)
+        init_first = torch.from_numpy(init_first_np).to(device=first.init_vector.device)
+        init_second = torch.from_numpy(init_second_np).to(device=second.init_vector.device)
+        graph = torch.cuda.CUDAGraph()
+        # All capture-sensitive setup must already be complete once the prepared ops are entered.
+        with torch.cuda.graph(graph, stream=capture_stream):
+            _capture_prepared_chain(first, second, src, init_first, init_second)
+        graph.replay()
+        cp.cuda.runtime.deviceSynchronize()
+        actual = second.output.cpu().numpy().copy()
+    np.testing.assert_allclose(actual, expected, atol=tol(DATA_DTYPE)[0], rtol=tol(DATA_DTYPE)[1])
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["resident", "streamed"])
+def test_cusparse_cuda_graph_capture_multi_grg_single_graph_mixed_heights(tmp_path, streamed):
+    torch = pytest.importorskip("torch")
+    artifacts = _mixed_height_graph_artifacts(tmp_path)
+    cases = _multi_grg_graph_cases(artifacts)
+    with torch.cuda.device(0):
+        capture_stream = torch.cuda.Stream()
+    layout = _build_multi_grg_graph_layout(artifacts, streamed=streamed, stream=capture_stream)
+    with CusparseRuntime(layout) as runtime, ExitStack() as stack:
+        chains = [
+            _enter_prepared_chain(stack, grg, case.order, k=1)
+            for grg, case in zip(runtime.grgs, cases, strict=True)
+        ]
+        srcs = [
+            torch.from_numpy(case.src).to(device=chain[0].input.device)
+            for chain, case in zip(chains, cases, strict=True)
+        ]
+        init_first = [
+            torch.from_numpy(case.init_first).to(device=chain[0].init_vector.device)
+            for chain, case in zip(chains, cases, strict=True)
+        ]
+        init_second = [
+            torch.from_numpy(case.init_second).to(device=chain[1].init_vector.device)
+            for chain, case in zip(chains, cases, strict=True)
+        ]
+        results = [torch.empty_like(chain[1].output) for chain in chains]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            for chain, src, first_init, second_init, result in zip(chains, srcs, init_first, init_second, results, strict=True):
+                _capture_prepared_chain(chain[0], chain[1], src, first_init, second_init, result)
+        graph.replay()
+        cp.cuda.runtime.deviceSynchronize()
+        actual = [result.cpu().numpy().copy() for result in results]
+    for case, value in zip(cases, actual, strict=True):
+        np.testing.assert_allclose(value, case.expected, atol=tol(DATA_DTYPE)[0], rtol=tol(DATA_DTYPE)[1])
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["resident", "streamed"])
+def test_cusparse_cuda_graph_capture_multi_grg_sequential_mixed_heights(tmp_path, streamed):
+    torch = pytest.importorskip("torch")
+    artifacts = _mixed_height_graph_artifacts(tmp_path)
+    cases = _multi_grg_graph_cases(artifacts)
+    with torch.cuda.device(0):
+        capture_stream = torch.cuda.Stream()
+    layout = _build_multi_grg_graph_layout(artifacts, streamed=streamed, stream=capture_stream)
+    with CusparseRuntime(layout) as runtime, ExitStack() as stack:
+        chains = [
+            _enter_prepared_chain(stack, grg, case.order, k=1)
+            for grg, case in zip(runtime.grgs, cases, strict=True)
+        ]
+        srcs = [
+            torch.from_numpy(case.src).to(device=chain[0].input.device)
+            for chain, case in zip(chains, cases, strict=True)
+        ]
+        init_first = [
+            torch.from_numpy(case.init_first).to(device=chain[0].init_vector.device)
+            for chain, case in zip(chains, cases, strict=True)
+        ]
+        init_second = [
+            torch.from_numpy(case.init_second).to(device=chain[1].init_vector.device)
+            for chain, case in zip(chains, cases, strict=True)
+        ]
+        captures = []
+        for chain, src, first_init, second_init in zip(chains, srcs, init_first, init_second, strict=True):
             graph = torch.cuda.CUDAGraph()
-            # All capture-sensitive setup must already be complete once the prepared op is entered.
             with torch.cuda.graph(graph, stream=capture_stream):
-                op.input.copy_(src)
-                op()
+                _capture_prepared_chain(chain[0], chain[1], src, first_init, second_init)
+            captures.append((graph, chain[1]))
+        actual = []
+        for graph, final in captures:
             graph.replay()
             cp.cuda.runtime.deviceSynchronize()
-            actual = op.output.cpu().numpy().copy()
-        np.testing.assert_allclose(actual, expected, atol=0.0, rtol=0.0)
+            actual.append(final.output.cpu().numpy().copy())
+    for case, value in zip(cases, actual, strict=True):
+        np.testing.assert_allclose(value, case.expected, atol=tol(DATA_DTYPE)[0], rtol=tol(DATA_DTYPE)[1])

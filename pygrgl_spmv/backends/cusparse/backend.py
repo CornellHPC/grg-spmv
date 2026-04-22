@@ -1615,7 +1615,7 @@ class CusparseRuntime:
                 self._publish_level_source(artifact, direction, dst_level)
                 ready[dst_level].record(stream)
         with self._root_stream:
-            for event in ready:
+            for event in ready[:h]:
                 self._root_stream.wait_event(event)
 
     def _seed_prepared(self, artifact: _CuArtifact, spec: _CudaMatmulSpec, prepared: _CusparsePreparedMatmul) -> None:
