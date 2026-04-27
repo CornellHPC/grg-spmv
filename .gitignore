@@ -256,10 +256,14 @@ tags
 
 inputs/
 archived/
+external/
 text/
 figs/
 *.pygrgl_spmv.npz
 investigation/
+notes.txt
+output.txt
+prompt.txt
 pygrgl_spmv_artifacts/
 # symlink
 pygrgl_spmv_artifacts

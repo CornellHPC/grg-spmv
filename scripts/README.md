@@ -42,3 +42,15 @@ cuSPARSE-only flags:
 
 `PLAN` may be a named preset or a JSON object with `plan_up` and `plan_down` fields accepted by `CusparsePlanPair.from_dicts(...)`.
 The default is `exhaustive-best`, selected from an exhaustive CSR/CSC cuSPARSE sweep with `float64`, `scratch=none`, and residency allowed.
+
+## PCA Benchmark
+
+`python -m scripts.pca_bench` benchmarks PCA eigensolvers on one `.grg_spmv` artifact with the cuSPARSE backend and the default `exhaustive-best` plan.
+
+Full benchmark:
+
+```bash
+uv run python -u -m scripts.pca_bench --artifact /pscratch/sd/q/qys/grg/pygrgl_spmv_artifacts/_abs/pscratch/sd/q/qys/grg/simulation-mutation-200m.trees.v4.igd.final.grg_spmv --pcs 20
+```
+
+The randomized Rayleigh-Ritz solver defaults to `--rr-oversample 40 --rr-power-iters 10`. LOBPCG methods are reported as `status=skipped` when local SciPy/CuPy would switch to their dense fallback (`num_mutations < 5 * pcs`).

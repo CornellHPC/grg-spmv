@@ -189,11 +189,17 @@ class _SelectorLevels:
 
 
 @dataclass
-class _ArtifactDirectionState:
+class _DenseDescriptorSet:
     dst_descs: list[c_void_p]
     src_descs: list[c_void_p]
     src_bufs: list[Any] | None
     scratch_descs_by_level: list[list[c_void_p]]
+
+
+@dataclass
+class _PreparedDenseEntry:
+    state: _DenseDescriptorSet
+    refs: int = 0
 
 
 @dataclass
@@ -211,8 +217,8 @@ class _CuArtifact:
     init_xtx_down_bias: Any | None
     up_ops: list[list[_CuOp]]
     down_ops: list[list[_CuOp]]
-    up_dense: _ArtifactDirectionState | None
-    down_dense: _ArtifactDirectionState | None
+    up_dense_by_k: dict[int, _PreparedDenseEntry]
+    down_dense_by_k: dict[int, _PreparedDenseEntry]
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -227,6 +233,10 @@ def _torch_from_cupy(array):
     import torch
 
     return torch.from_dlpack(array)
+
+
+def _dense_entries(artifact: _CuArtifact, direction: Direction) -> dict[int, _PreparedDenseEntry]:
+    return artifact.up_dense_by_k if direction == Direction.UP else artifact.down_dense_by_k
 
 
 class _CusparsePreparedMatmul:
@@ -261,23 +271,25 @@ class _CusparsePreparedMatmul:
             assert runtime._io1 is not None and runtime._io1_torch is not None
             self._init_matrix_internal = runtime._io1[: artifact.state.num_nodes, :k]
             self.init_matrix = runtime._io1_torch[: artifact.state.num_nodes, :k].T
-        self._dense_state: _ArtifactDirectionState | None = None
+        self._dense_entry: _PreparedDenseEntry | None = None
+        self._dense_state: _DenseDescriptorSet | None = None
 
     def __enter__(self) -> "_CusparsePreparedMatmul":
-        self._dense_state = self._runtime._build_prepared_direction_state(self._artifact, self._spec.direction, self._spec.k)
-        if self._spec.direction == Direction.UP:
-            self._artifact.up_dense = self._dense_state
-        else:
-            self._artifact.down_dense = self._dense_state
+        if self._dense_entry is not None:
+            raise RuntimeError("cuSPARSE prepared matmul is already entered")
+        entry = self._runtime._acquire_dense_descriptors(self._artifact, self._spec.direction, self._spec.k)
+        self._dense_entry = entry
+        self._dense_state = entry.state
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self._spec.direction == Direction.UP:
-            self._artifact.up_dense = None
-        else:
-            self._artifact.down_dense = None
-        self._runtime._destroy_direction_state(self._dense_state)
-        self._dense_state = None
+        entry = self._dense_entry
+        try:
+            if entry is not None:
+                self._runtime._release_dense_descriptors(self._artifact, self._spec.direction, self._spec.k, entry)
+        finally:
+            self._dense_entry = None
+            self._dense_state = None
 
     def __call__(self) -> None:
         with self._runtime._call_scope():
@@ -1029,7 +1041,7 @@ class CusparseRuntime:
             raise RuntimeError("CusparseRuntime must be entered before accessing grgs")
         return self._grgs
 
-    def _destroy_direction_state(self, direction_state: _ArtifactDirectionState | None) -> None:
+    def _destroy_direction_state(self, direction_state: _DenseDescriptorSet | None) -> None:
         if direction_state is None or self._cslib is None:
             return
         seen: set[int] = set()
@@ -1047,6 +1059,12 @@ class CusparseRuntime:
                 seen.add(key)
                 self._cslib.destroy_dn_mat(desc)
 
+    def _destroy_dense_entries(self, entries: dict[int, _PreparedDenseEntry]) -> None:
+        for entry in entries.values():
+            self._destroy_direction_state(entry.state)
+            entry.refs = 0
+        entries.clear()
+
     def _destroy_ops(self, ops_by_level: list[list[_CuOp]] | None) -> None:
         if ops_by_level is None or self._cslib is None:
             return
@@ -1062,8 +1080,8 @@ class CusparseRuntime:
                 self._cslib.destroy_sp_mat(op.sp_desc)
 
     def _destroy_artifact_resources(self, artifact: _CuArtifact) -> None:
-        self._destroy_direction_state(artifact.up_dense)
-        self._destroy_direction_state(artifact.down_dense)
+        self._destroy_dense_entries(artifact.up_dense_by_k)
+        self._destroy_dense_entries(artifact.down_dense_by_k)
         self._destroy_ops(artifact.up_ops)
         self._destroy_ops(artifact.down_ops)
 
@@ -1325,10 +1343,10 @@ class CusparseRuntime:
                     scratch_view = scratch[:rows, :max_k]
                     scratch_row.append(_create_dense_desc(cslib=self._cslib, buf=scratch_view, order=plan.order_c, cuda_dtype_id=cuda_dtype_id))
                 scratch_descs_by_level.append(scratch_row)
-            return _ArtifactDirectionState(dst_descs=dst_descs, src_descs=src_descs, src_bufs=src_bufs, scratch_descs_by_level=scratch_descs_by_level)
+            return _DenseDescriptorSet(dst_descs=dst_descs, src_descs=src_descs, src_bufs=src_bufs, scratch_descs_by_level=scratch_descs_by_level)
         except Exception:
             self._destroy_direction_state(
-                _ArtifactDirectionState(dst_descs=dst_descs, src_descs=src_descs, src_bufs=src_bufs, scratch_descs_by_level=scratch_descs_by_level)
+                _DenseDescriptorSet(dst_descs=dst_descs, src_descs=src_descs, src_bufs=src_bufs, scratch_descs_by_level=scratch_descs_by_level)
             )
             raise
 
@@ -1339,7 +1357,7 @@ class CusparseRuntime:
             raise ValueError("DOWN plan is not configured")
         return _CusparsePreparedMatmul(self, self._artifacts[int(grg._artifact_index)], spec)
 
-    def _build_prepared_direction_state(self, artifact: _CuArtifact, direction: Direction, k: int) -> _ArtifactDirectionState:
+    def _build_prepared_direction_state(self, artifact: _CuArtifact, direction: Direction, k: int) -> _DenseDescriptorSet:
         if direction == Direction.UP:
             return self._build_artifact_direction_state(
                 artifact.state,
@@ -1357,6 +1375,28 @@ class CusparseRuntime:
             self._down_scratch,
             int(k),
         )
+
+    def _acquire_dense_descriptors(self, artifact: _CuArtifact, direction: Direction, k: int) -> _PreparedDenseEntry:
+        key = int(k)
+        entries = _dense_entries(artifact, direction)
+        entry = entries.get(key)
+        if entry is None:
+            entry = _PreparedDenseEntry(self._build_prepared_direction_state(artifact, direction, key))
+            entries[key] = entry
+        entry.refs += 1
+        return entry
+
+    def _release_dense_descriptors(self, artifact: _CuArtifact, direction: Direction, k: int, entry: _PreparedDenseEntry) -> None:
+        key = int(k)
+        entries = _dense_entries(artifact, direction)
+        if entries.get(key) is not entry:
+            raise RuntimeError("cuSPARSE prepared dense descriptor entry mismatch")
+        if entry.refs <= 0:
+            raise RuntimeError("cuSPARSE prepared dense descriptor refcount underflow")
+        entry.refs -= 1
+        if entry.refs == 0:
+            self._destroy_direction_state(entry.state)
+            del entries[key]
 
     def _build_artifact(self, artifact_layout: _CuArtifactLayout, state) -> _CuArtifact:
         up_owner: dict[tuple[int, int], tuple[_CuRuntimeBlock, np.ndarray | None, np.ndarray | None, int | None]] = {}
@@ -1459,8 +1499,8 @@ class CusparseRuntime:
                     init_xtx_down_bias=init_xtx_down_bias,
                     up_ops=up_ops,
                     down_ops=down_ops,
-                    up_dense=None,
-                    down_dense=None,
+                    up_dense_by_k={},
+                    down_dense_by_k={},
                 )
             except Exception:
                 self._destroy_ops(up_ops)
@@ -1540,23 +1580,20 @@ class CusparseRuntime:
             0 if ext is None else int(ext.data.ptr),
         )
 
-    def _publish_level_source(self, artifact: _CuArtifact, direction: Direction, level: int) -> None:
+    def _publish_level_source(self, direction: Direction, dense: _DenseDescriptorSet, level: int) -> None:
         plan = self.layout.pair.plan_up if direction == Direction.UP else self.layout.pair.plan_down
-        dense = artifact.up_dense if direction == Direction.UP else artifact.down_dense
         level_bufs = self._up_level_bufs if direction == Direction.UP else self._down_level_bufs
-        if plan is None or dense is None:
+        if plan is None:
             return
         _publish_level_source_view(self._cp, level_bufs=level_bufs, src_bufs=dense.src_bufs, plan=plan, level=level)
 
-    def _enqueue_wavefront(self, artifact: _CuArtifact, direction: Direction) -> None:
-        dense = artifact.up_dense if direction == Direction.UP else artifact.down_dense
+    def _enqueue_wavefront(self, artifact: _CuArtifact, direction: Direction, dense: _DenseDescriptorSet) -> None:
         ops_by_level = artifact.up_ops if direction == Direction.UP else artifact.down_ops
         level_bufs = self._up_level_bufs if direction == Direction.UP else self._down_level_bufs
         scratch_enabled = self.layout.scratch_up_enabled if direction == Direction.UP else self.layout.scratch_down_enabled
         scratch_streams = self._scratch_streams_up if direction == Direction.UP else self._scratch_streams_down
         scratch_bufs = self._up_scratch if direction == Direction.UP else self._down_scratch
         h = len(artifact.state.level_offsets) - 1
-        assert dense is not None
         assert self._launch_event is not None
         if direction == Direction.UP:
             seed_level = 0
@@ -1578,7 +1615,7 @@ class CusparseRuntime:
                 stream.wait_event(self._launch_event)
         if h > 0:
             with self._level_streams[seed_level]:
-                self._publish_level_source(artifact, direction, seed_level)
+                self._publish_level_source(direction, dense, seed_level)
                 ready[seed_level].record(self._level_streams[seed_level])
         for dst_level in level_iter:
             stream = self._level_streams[dst_level]
@@ -1600,7 +1637,7 @@ class CusparseRuntime:
                     for op_idx in range(len(ops_by_level[dst_level])):
                         stream.wait_event(compute_done[dst_level][op_idx])
                         level_bufs[dst_level][:rows] += scratch_bufs[dst_level][op_idx][:rows]
-                    self._publish_level_source(artifact, direction, dst_level)
+                    self._publish_level_source(direction, dense, dst_level)
                     ready[dst_level].record(stream)
                 continue
             with stream:
@@ -1612,7 +1649,7 @@ class CusparseRuntime:
                     ext = self._ext_for(direction, dst_level, op_idx, False)
                     self._launch_spmm(artifact, direction, op, dense.dst_descs[dst_level], self._beta_one.data.ptr, dense.src_descs[op.src_level], ext)
                     compute_done[dst_level][op_idx].record(stream)
-                self._publish_level_source(artifact, direction, dst_level)
+                self._publish_level_source(direction, dense, dst_level)
                 ready[dst_level].record(stream)
         with self._root_stream:
             for event in ready[:h]:
@@ -1748,10 +1785,13 @@ class CusparseRuntime:
                 self._apply_endpoint_bias_prepared(artifact, spec, prepared, prepared._output_internal)
 
     def _execute_prepared(self, artifact: _CuArtifact, spec: _CudaMatmulSpec, prepared: _CusparsePreparedMatmul) -> None:
+        dense = prepared._dense_state
+        if dense is None:
+            raise RuntimeError("cuSPARSE prepared matmul must be entered before use")
         with self.device:
             with self._caller_root_scope():
                 self._seed_prepared(artifact, spec, prepared)
-                self._enqueue_wavefront(artifact, spec.direction)
+                self._enqueue_wavefront(artifact, spec.direction, dense)
                 self._write_prepared_output(artifact, spec, prepared)
 
 __all__ = ["CusparseLayout", "CusparseRuntime", "plan_cusparse_layout"]

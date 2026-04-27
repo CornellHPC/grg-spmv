@@ -243,6 +243,91 @@ def _capture_prepared_chain(first, second, src, init_first, init_second, result=
         result.copy_(second.output)
 
 
+def _prepared_dense_map(runtime: CusparseRuntime, direction: str):
+    artifact = runtime._artifacts[0]
+    return artifact.up_dense_by_k if direction == "up" else artifact.down_dense_by_k
+
+
+def _prepared_direction_enum(direction: str):
+    return pygrgl.TraversalDirection.UP if direction == "up" else pygrgl.TraversalDirection.DOWN
+
+
+def _prepared_input_cols(grg, direction: str) -> int:
+    return int(grg.num_samples if direction == "up" else grg.num_mutations)
+
+
+def _copy_prepared_input(torch, op, values: np.ndarray) -> None:
+    op.input.copy_(torch.from_numpy(values).to(device=op.input.device))
+
+
+@pytest.mark.parametrize("direction", ["up", "down"])
+def test_cusparse_prepared_same_direction_mixed_widths(primary_artifact, primary_grg, monkeypatch, direction):
+    torch = pytest.importorskip("torch")
+    layout = build_cusparse_layout([primary_artifact], requirements=_requirements(4))
+    rng = np.random.default_rng(120_401 if direction == "up" else 120_402)
+    x1_a = rng.standard_normal((1, _prepared_input_cols(primary_grg, direction)), dtype=DATA_DTYPE)
+    x4 = rng.standard_normal((4, _prepared_input_cols(primary_grg, direction)), dtype=DATA_DTYPE)
+    x1_b = rng.standard_normal((1, _prepared_input_cols(primary_grg, direction)), dtype=DATA_DTYPE)
+    direction_enum = _prepared_direction_enum(direction)
+    expected = [
+        np.asarray(pygrgl.matmul(primary_grg, x1_a, direction_enum)),
+        np.asarray(pygrgl.matmul(primary_grg, x4, direction_enum)),
+        np.asarray(pygrgl.matmul(primary_grg, x1_b, direction_enum)),
+    ]
+    seen = []
+    with CusparseRuntime(layout) as runtime, ExitStack() as stack:
+        (grg,) = runtime.grgs
+        op1 = stack.enter_context(grg.prepare_matmul_cuda(direction=direction, k=1))
+        op4 = stack.enter_context(grg.prepare_matmul_cuda(direction=direction, k=4))
+        dense_map = _prepared_dense_map(runtime, direction)
+        assert set(dense_map) == {1, 4}
+        assert dense_map[1].state is op1._dense_state
+        assert dense_map[4].state is op4._dense_state
+
+        original = runtime._enqueue_wavefront
+
+        def record_dense(artifact, direction_arg, dense):
+            seen.append(dense)
+            return original(artifact, direction_arg, dense)
+
+        monkeypatch.setattr(runtime, "_enqueue_wavefront", record_dense)
+        actual = []
+        for op, values in ((op1, x1_a), (op4, x4), (op1, x1_b)):
+            _copy_prepared_input(torch, op, values)
+            op()
+            actual.append(op.output.cpu().numpy().copy())
+        assert seen == [op1._dense_state, op4._dense_state, op1._dense_state]
+    assert dense_map == {}
+    for value, expected_value in zip(actual, expected, strict=True):
+        np.testing.assert_allclose(value, expected_value, atol=tol(DATA_DTYPE)[0], rtol=tol(DATA_DTYPE)[1])
+
+
+@pytest.mark.parametrize("direction", ["up", "down"])
+def test_cusparse_prepared_same_width_refcount(primary_artifact, primary_grg, direction):
+    torch = pytest.importorskip("torch")
+    layout = build_cusparse_layout([primary_artifact], requirements=_requirements(4))
+    rng = np.random.default_rng(120_501 if direction == "up" else 120_502)
+    x = rng.standard_normal((2, _prepared_input_cols(primary_grg, direction)), dtype=DATA_DTYPE)
+    expected = np.asarray(pygrgl.matmul(primary_grg, x, _prepared_direction_enum(direction)))
+    with CusparseRuntime(layout) as runtime:
+        (grg,) = runtime.grgs
+        with grg.prepare_matmul_cuda(direction=direction, k=2) as outer:
+            with grg.prepare_matmul_cuda(direction=direction, k=2) as inner:
+                dense_map = _prepared_dense_map(runtime, direction)
+                assert set(dense_map) == {2}
+                assert outer._dense_state is inner._dense_state
+                assert dense_map[2].state is outer._dense_state
+                assert dense_map[2].refs == 2
+            dense_map = _prepared_dense_map(runtime, direction)
+            assert set(dense_map) == {2}
+            assert dense_map[2].refs == 1
+            _copy_prepared_input(torch, outer, x)
+            outer()
+            actual = outer.output.cpu().numpy().copy()
+    assert dense_map == {}
+    np.testing.assert_allclose(actual, expected, atol=tol(DATA_DTYPE)[0], rtol=tol(DATA_DTYPE)[1])
+
+
 def _mixed_height_graph_artifacts(tmp_path) -> tuple[object, object]:
     tall = write_overlap_band_artifact(tmp_path, "tall-h4", n=16, bandwidth=4)
     short = write_three_level_band_artifact(tmp_path, "short-h3", n=16, bandwidth=4)
