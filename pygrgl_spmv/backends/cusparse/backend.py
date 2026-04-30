@@ -1226,7 +1226,7 @@ class CusparseRuntime:
             for artifact_layout, state in zip(self.layout.artifacts, states, strict=True):
                 artifacts.append(self._build_artifact(artifact_layout, state))
             self._artifacts = tuple(artifacts)
-            self._grgs = tuple(BoundGRG(self, idx, artifact.state, artifact.path) for idx, artifact in enumerate(self._artifacts))
+            self._grgs = tuple(BoundGRG(self, idx, artifact.state, artifact.path, self.layout.device) for idx, artifact in enumerate(self._artifacts))
             self._entered = True
             return self
         except Exception:

@@ -260,12 +260,17 @@ def _build_init_biases(compiled: CompiledOperatorState, dtype: np.dtype) -> None
 class BoundGRG:
     """Lightweight runtime-bound GRG operator."""
 
-    def __init__(self, runtime, artifact_index: int, state: CompiledOperatorState, artifact_path: Path):
+    def __init__(self, runtime, artifact_index: int, state: CompiledOperatorState, artifact_path: Path, device_id: int | None = None):
         self._runtime = runtime
         self._artifact_index = int(artifact_index)
         self._state = state
         self._artifact_path = Path(artifact_path)
         self._dtype = np.dtype(runtime.layout.dtype)
+        self._device_id = device_id
+
+    @property
+    def device(self) -> int | None:
+        return self._device_id
 
     @property
     def shape(self) -> tuple[int, int]:
