@@ -349,10 +349,15 @@ def plan_triton_layout(
     dtype = np.dtype(dtype)
     if dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
         raise ValueError(f"Triton runtime supports only float32/float64, got {dtype}")
+    requested_ring_buffer_size = int(ring_buffer_size)
+    requested_vram_budget_bytes = int(vram_budget_bytes)
+    if requested_ring_buffer_size < 0:
+        raise ValueError("ring_buffer_size must be >= 0")
+    if requested_vram_budget_bytes < 0:
+        raise ValueError("vram_budget_bytes must be >= 0")
     paths = _resolve_artifacts(artifacts)
     device_id = parse_cuda_device(device)
     stream_ptr, stream_owner = parse_cuda_stream(stream)
-    requested_ring_buffer_size = int(ring_buffer_size)
     allow_residency = bool(allow_residency)
     if stream_ptr != 0:
         stream_device = _cuda_stream_device(stream_ptr)
@@ -432,6 +437,10 @@ def plan_triton_layout(
     fixed_bytes = int(selector_bytes + metadata_bytes + xtx_bias_bytes + dense_arena_bytes + state_bytes + scratch_bytes)
     resident_bytes_full = int(sum(block.nbytes for block in blocks))
     required_budget_for_full_residency = int(fixed_bytes + resident_bytes_full)
+    if requested_vram_budget_bytes == 0:
+        effective_vram_budget_bytes = required_budget_for_full_residency
+    else:
+        effective_vram_budget_bytes = requested_vram_budget_bytes
     if not allow_residency:
         if blocks and requested_ring_buffer_size < 1:
             raise ValueError("ring_buffer_size must be >= 1 when any Triton block is streamed")
@@ -441,13 +450,13 @@ def plan_triton_layout(
         resident_bytes = 0
         total_bytes = int(fixed_bytes + ring_bytes)
         allocated_ring_buffer_size = len(slot_plans)
-        if total_bytes > int(vram_budget_bytes):
+        if total_bytes > effective_vram_budget_bytes:
             raise ValueError(
-                f"Triton layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={vram_budget_bytes}"
+                f"Triton layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={effective_vram_budget_bytes}"
             )
         if allocated_ring_buffer_size != requested_ring_buffer_size:
             _warn_ring_mismatch(requested=requested_ring_buffer_size, allocated=allocated_ring_buffer_size)
-    elif required_budget_for_full_residency <= int(vram_budget_bytes):
+    elif required_budget_for_full_residency <= effective_vram_budget_bytes:
         for block in blocks:
             block.resident = True
         slot_plans = ()
@@ -465,16 +474,16 @@ def plan_triton_layout(
         slot_plans, ring_bytes = _assign_slots(blocks, requested_ring_buffer_size)
         resident_bytes = 0
         total_bytes = int(fixed_bytes + ring_bytes)
-        if total_bytes > int(vram_budget_bytes):
+        if total_bytes > effective_vram_budget_bytes:
             raise ValueError(
-                f"Triton layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={vram_budget_bytes}"
+                f"Triton layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={effective_vram_budget_bytes}"
             )
         for block in sorted(blocks, key=_promotion_key):
             block.resident = True
             resident_bytes = int(sum(item.nbytes for item in blocks if item.resident))
             slot_plans, ring_bytes = _assign_slots(blocks, requested_ring_buffer_size)
             total_bytes = int(fixed_bytes + resident_bytes + ring_bytes)
-            if total_bytes > int(vram_budget_bytes):
+            if total_bytes > effective_vram_budget_bytes:
                 block.resident = False
         resident_bytes = int(sum(item.nbytes for item in blocks if item.resident))
         slot_plans, ring_bytes = _assign_slots(blocks, requested_ring_buffer_size)
@@ -482,9 +491,9 @@ def plan_triton_layout(
         allocated_ring_buffer_size = len(slot_plans)
         if allocated_ring_buffer_size != requested_ring_buffer_size:
             _warn_ring_mismatch(requested=requested_ring_buffer_size, allocated=allocated_ring_buffer_size)
-    if total_bytes > int(vram_budget_bytes):
+    if total_bytes > effective_vram_budget_bytes:
         raise ValueError(
-            f"Triton layout requires {total_bytes} owned device bytes, exceeds vram_budget_bytes={vram_budget_bytes}"
+            f"Triton layout requires {total_bytes} owned device bytes, exceeds vram_budget_bytes={effective_vram_budget_bytes}"
         )
     bytes_by_category = {
         "resident_sparse": resident_bytes,
@@ -531,7 +540,7 @@ def plan_triton_layout(
         allow_residency=allow_residency,
         requested_ring_buffer_size=requested_ring_buffer_size,
         allocated_ring_buffer_size=len(slot_plans),
-        vram_budget_bytes=int(vram_budget_bytes),
+        vram_budget_bytes=effective_vram_budget_bytes,
         max_num_samples=max_num_samples,
         max_num_mutations=max_num_mutations,
         max_num_nodes=max_num_nodes,

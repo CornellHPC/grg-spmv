@@ -33,8 +33,8 @@ def add_common_args(parser: argparse.ArgumentParser, *, gpu: bool) -> None:
     if gpu:
         parser.add_argument("--device", type=int, default=0)
         parser.add_argument("--stream", type=int, default=0)
-        parser.add_argument("--ring-buffer-size", type=int, default=2)
-        parser.add_argument("--vram-budget-bytes", type=int, required=True)
+        parser.add_argument("--ring-buffer-size", type=int, default=0)
+        parser.add_argument("--vram-budget-bytes", type=int, default=0)
         parser.add_argument("--allow-residency", action=argparse.BooleanOptionalAction, default=True)
 
 
@@ -46,6 +46,10 @@ def parse_args(args: argparse.Namespace, *, gpu: bool) -> BenchArgs:
         raise ValueError(f"--trials must be >= 1, got {args.trials}")
     if int(args.warmup) < 0:
         raise ValueError(f"--warmup must be >= 0, got {args.warmup}")
+    if gpu and int(args.ring_buffer_size) < 0:
+        raise ValueError(f"--ring-buffer-size must be >= 0, got {args.ring_buffer_size}")
+    if gpu and int(args.vram_budget_bytes) < 0:
+        raise ValueError(f"--vram-budget-bytes must be >= 0, got {args.vram_budget_bytes}")
     return BenchArgs(
         artifact=str(args.artifact),
         direction=str(args.direction),

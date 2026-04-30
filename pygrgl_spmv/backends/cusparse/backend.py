@@ -504,6 +504,64 @@ def _create_dense_desc(*, cslib: CuSparseLib, buf, order: DenseOrder, cuda_dtype
     )
 
 
+def _create_spmm_buffer_size_sparse_desc(
+    cslib: CuSparseLib,
+    block: _CuBlockPlan,
+    *,
+    transpose: bool,
+    cuda_dtype_id: int,
+) -> c_void_p:
+    # This intentionally relies on observed, unsupported cuSPARSE behavior:
+    # cusparseSpMM_bufferSize appears to use descriptor metadata, not sparse
+    # contents. Passing real sparse pointers here would require repeated full
+    # artifact structure reads during planning. Do not use this helper for
+    # cusparseSpMM execution or preprocess.
+    nrows, ncols = (int(block.stored_shape[0]), int(block.stored_shape[1]))
+    fmt = block.fmt
+    if transpose:
+        nrows, ncols = ncols, nrows
+        if fmt == SparseFormat.CSR:
+            fmt = SparseFormat.CSC
+        elif fmt == SparseFormat.CSC:
+            fmt = SparseFormat.CSR
+    if fmt == SparseFormat.CSR:
+        return cslib.create_csr(
+            nrows,
+            ncols,
+            int(block.nnz),
+            0,
+            0,
+            0,
+            _cusparse_index_type(block.struct0_dtype),
+            _cusparse_index_type(block.struct1_dtype),
+            cuda_dtype_id,
+        )
+    if fmt == SparseFormat.CSC:
+        return cslib.create_csc(
+            nrows,
+            ncols,
+            int(block.nnz),
+            0,
+            0,
+            0,
+            _cusparse_index_type(block.struct0_dtype),
+            _cusparse_index_type(block.struct1_dtype),
+            cuda_dtype_id,
+        )
+    if fmt == SparseFormat.COO:
+        return cslib.create_coo(
+            nrows,
+            ncols,
+            int(block.nnz),
+            0,
+            0,
+            0,
+            _cusparse_index_type(block.struct0_dtype),
+            cuda_dtype_id,
+        )
+    raise ValueError(f"unsupported sparse format: {fmt}")
+
+
 def _publish_level_source_view(cp, *, level_bufs, src_bufs, plan: CusparsePlan, level: int) -> None:
     if src_bufs is None:
         return
@@ -532,11 +590,10 @@ def _selector_levels(cp, selector: sp.csr_matrix, level_offsets: np.ndarray) -> 
     )
 
 
-def _query_ext_sizes(
+def _query_spmm_buffer_sizes(
     *,
     cp,
     cslib: CuSparseLib,
-    shared_ones_ptr: int,
     layout_artifacts: tuple[_CuArtifactLayout, ...],
     scans,
     pair: CusparsePlanPair,
@@ -558,147 +615,91 @@ def _query_ext_sizes(
     max_down_ops = [max(sum(1 for block in scan.blocks if block.nnz > 0 and block.src_level == level) for scan in scans) for level in range(max_h)]
     ext_scratch_up = [list(0 for _ in range(max_up_ops[level])) for level in range(max_h)]
     ext_scratch_down = [list(0 for _ in range(max_down_ops[level])) for level in range(max_h)]
-    try:
-        for artifact_layout, scan in zip(layout_artifacts, scans, strict=True):
-            for direction, plan, max_k, scratch_enabled, ext_main, ext_scratch in (
-                (Direction.UP, pair.plan_up, max_k_up, scratch_up_enabled, ext_main_up, ext_scratch_up),
-                (Direction.DOWN, pair.plan_down, max_k_down, scratch_down_enabled, ext_main_down, ext_scratch_down),
-            ):
-                if plan is None:
-                    continue
-                level_sizes = [int(scan.level_offsets[level + 1] - scan.level_offsets[level]) for level in range(scan.num_levels)]
-                level_bufs = [
-                    cp.zeros((level_sizes[level], max_k), dtype=dtype, order=_dense_order_char(plan.order_c))
-                    for level in range(scan.num_levels)
-                ]
+    for artifact_layout, scan in zip(layout_artifacts, scans, strict=True):
+        for direction, plan, max_k, scratch_enabled, ext_main, ext_scratch in (
+            (Direction.UP, pair.plan_up, max_k_up, scratch_up_enabled, ext_main_up, ext_scratch_up),
+            (Direction.DOWN, pair.plan_down, max_k_down, scratch_down_enabled, ext_main_down, ext_scratch_down),
+        ):
+            if plan is None:
+                continue
+            level_sizes = [int(scan.level_offsets[level + 1] - scan.level_offsets[level]) for level in range(scan.num_levels)]
+            level_bufs = [
+                cp.zeros((level_sizes[level], max_k), dtype=dtype, order=_dense_order_char(plan.order_c))
+                for level in range(scan.num_levels)
+            ]
+            dst_descs: list[c_void_p] = []
+            src_descs: list[c_void_p] = []
+            try:
                 dst_descs = [
                     _create_dense_desc(cslib=cslib, buf=buf, order=plan.order_c, cuda_dtype_id=cuda_dtype_id)
                     for buf in level_bufs
                 ]
                 if not _needs_explicit_source(plan):
                     if plan.op_b == Operation.N:
-                        src_bufs = None
                         src_descs = dst_descs
                     else:
-                        src_bufs = None
                         src_descs = [
                             _create_dense_desc(cslib=cslib, buf=buf.T, order=plan.order_b, cuda_dtype_id=cuda_dtype_id)
                             for buf in level_bufs
                         ]
                 else:
                     src_bufs = []
-                    src_descs = []
-                    for level, rows in enumerate(level_sizes):
+                    for rows in level_sizes:
                         src_shape = (rows, max_k) if plan.op_b == Operation.N else (max_k, rows)
                         src = cp.zeros(src_shape, dtype=dtype, order=_dense_order_char(plan.order_b))
                         src_bufs.append(src)
                         src_descs.append(
                             _create_dense_desc(cslib=cslib, buf=src, order=plan.order_b, cuda_dtype_id=cuda_dtype_id)
                         )
-                up_plan_map = {(block.dst_level, block.src_level): block for block in artifact_layout.blocks_up}
-                down_plan_map = {(block.dst_level, block.src_level): block for block in artifact_layout.blocks_down}
+                if direction == Direction.UP:
+                    query_blocks = artifact_layout.blocks_up
+                    transpose_sparse = False
+                elif artifact_layout.share_storage:
+                    query_blocks = artifact_layout.blocks_up
+                    transpose_sparse = True
+                else:
+                    query_blocks = artifact_layout.blocks_down
+                    transpose_sparse = False
                 op_index_by_level = [0 for _ in range(scan.num_levels)]
-                for block in iter_artifact_blocks(artifact_layout.path):
-                    shared_from_up = False
+                for block in query_blocks:
                     if direction == Direction.UP:
-                        owner = up_plan_map.get((block.dst_level, block.src_level))
-                        if owner is None:
-                            continue
-                        dst_level = block.dst_level
-                        src_level = block.src_level
+                        dst_level = int(block.dst_level)
+                        src_level = int(block.src_level)
                     else:
-                        shared_from_up = artifact_layout.share_storage
-                        owner = (up_plan_map if shared_from_up else down_plan_map).get((block.dst_level, block.src_level))
-                        if owner is None:
-                            continue
-                        dst_level = block.src_level
-                        src_level = block.dst_level
-                    sparse = materialize_sparse_block(
-                        sp.csr_matrix((np.ones(block.nnz, dtype=np.bool_), np.asarray(block.indices), np.asarray(block.indptr)), shape=block.shape),
-                        store=owner.store,
-                        fmt=owner.fmt,
+                        dst_level = int(block.src_level)
+                        src_level = int(block.dst_level)
+                    sp_desc = _create_spmm_buffer_size_sparse_desc(
+                        cslib,
+                        block,
+                        transpose=transpose_sparse,
+                        cuda_dtype_id=cuda_dtype_id,
                     )
-                    if owner.fmt == SparseFormat.CSR:
-                        struct0 = cp.asarray(np.asarray(sparse.indptr, dtype=owner.struct0_dtype))
-                        struct1 = cp.asarray(np.asarray(sparse.indices, dtype=owner.struct1_dtype))
-                        if shared_from_up:
-                            sp_desc = cslib.create_csc(
-                                owner.stored_shape[1],
-                                owner.stored_shape[0],
-                                owner.nnz,
-                                struct0.data.ptr,
-                                struct1.data.ptr,
-                                shared_ones_ptr,
-                                _cusparse_index_type(owner.struct0_dtype),
-                                _cusparse_index_type(owner.struct1_dtype),
-                                cuda_dtype_id,
-                            )
-                        else:
-                            sp_desc = cslib.create_csr(
-                                owner.stored_shape[0],
-                                owner.stored_shape[1],
-                                owner.nnz,
-                                struct0.data.ptr,
-                                struct1.data.ptr,
-                                shared_ones_ptr,
-                                _cusparse_index_type(owner.struct0_dtype),
-                                _cusparse_index_type(owner.struct1_dtype),
-                                cuda_dtype_id,
-                            )
-                    elif owner.fmt == SparseFormat.CSC:
-                        struct0 = cp.asarray(np.asarray(sparse.indptr, dtype=owner.struct0_dtype))
-                        struct1 = cp.asarray(np.asarray(sparse.indices, dtype=owner.struct1_dtype))
-                        if shared_from_up:
-                            sp_desc = cslib.create_csr(
-                                owner.stored_shape[1],
-                                owner.stored_shape[0],
-                                owner.nnz,
-                                struct0.data.ptr,
-                                struct1.data.ptr,
-                                shared_ones_ptr,
-                                _cusparse_index_type(owner.struct0_dtype),
-                                _cusparse_index_type(owner.struct1_dtype),
-                                cuda_dtype_id,
-                            )
-                        else:
-                            sp_desc = cslib.create_csc(
-                                owner.stored_shape[0],
-                                owner.stored_shape[1],
-                                owner.nnz,
-                                struct0.data.ptr,
-                                struct1.data.ptr,
-                                shared_ones_ptr,
-                                _cusparse_index_type(owner.struct0_dtype),
-                                _cusparse_index_type(owner.struct1_dtype),
-                                cuda_dtype_id,
-                            )
-                    else:
-                        struct0 = cp.asarray(np.asarray(sparse.row, dtype=owner.struct0_dtype))
-                        struct1 = cp.asarray(np.asarray(sparse.col, dtype=owner.struct1_dtype))
-                        sp_desc = cslib.create_coo(owner.stored_shape[0], owner.stored_shape[1], owner.nnz, struct0.data.ptr, struct1.data.ptr, shared_ones_ptr, _cusparse_index_type(owner.struct0_dtype), cuda_dtype_id)
                     try:
                         op_idx = op_index_by_level[dst_level]
                         op_index_by_level[dst_level] += 1
                         if scratch_enabled[dst_level]:
                             scratch = cp.zeros((level_sizes[dst_level], max_k), dtype=dtype, order=_dense_order_char(plan.order_c))
                             dst_desc = _create_dense_desc(cslib=cslib, buf=scratch, order=plan.order_c, cuda_dtype_id=cuda_dtype_id)
-                            size = cslib.spmm_buffer_size(int(plan.algo), int(plan.op_a), int(plan.op_b), alpha.data.ptr, sp_desc, src_descs[src_level], beta_zero.data.ptr, dst_desc, cuda_dtype_id)
+                            try:
+                                size = cslib.spmm_buffer_size(int(plan.algo), int(plan.op_a), int(plan.op_b), alpha.data.ptr, sp_desc, src_descs[src_level], beta_zero.data.ptr, dst_desc, cuda_dtype_id)
+                            finally:
+                                cslib.destroy_dn_mat(dst_desc)
                             ext_scratch[dst_level][op_idx] = max(int(ext_scratch[dst_level][op_idx]), int(size))
-                            cslib.destroy_dn_mat(dst_desc)
                         else:
                             size = cslib.spmm_buffer_size(int(plan.algo), int(plan.op_a), int(plan.op_b), alpha.data.ptr, sp_desc, src_descs[src_level], beta_one.data.ptr, dst_descs[dst_level], cuda_dtype_id)
                             ext_main[dst_level] = max(int(ext_main[dst_level]), int(size))
                     finally:
                         cslib.destroy_sp_mat(sp_desc)
-                for desc in dst_descs:
-                    cslib.destroy_dn_mat(desc)
-                seen = {id(desc) for desc in dst_descs}
-                for desc in src_descs:
-                    if id(desc) in seen:
+            finally:
+                seen: set[int] = set()
+                for desc in (*dst_descs, *src_descs):
+                    if desc.value is None:
                         continue
+                    key = int(desc.value)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     cslib.destroy_dn_mat(desc)
-    finally:
-        pass
     return (
         tuple(int(v) for v in ext_main_up),
         tuple(int(v) for v in ext_main_down),
@@ -722,12 +723,17 @@ def plan_cusparse_layout(
     dtype = np.dtype(dtype)
     if dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
         raise ValueError(f"cuSPARSE runtime supports only float32/float64, got {dtype}")
+    requested_ring_buffer_size = int(ring_buffer_size)
+    requested_vram_budget_bytes = int(vram_budget_bytes)
+    if requested_ring_buffer_size < 0:
+        raise ValueError("ring_buffer_size must be >= 0")
+    if requested_vram_budget_bytes < 0:
+        raise ValueError("vram_budget_bytes must be >= 0")
     try:
         import cupy as cp
     except ImportError as exc:
         raise ImportError("CuPy required: pip install cupy-cuda12x") from exc
 
-    requested_ring_buffer_size = int(ring_buffer_size)
     allow_residency = bool(allow_residency)
     device_id = parse_cuda_device(device)
     stream_ptr, stream_owner = parse_cuda_stream(stream)
@@ -810,12 +816,10 @@ def plan_cusparse_layout(
 
     with cp.cuda.Device(device_id):
         cslib = CuSparseLib()
-        shared_vals = cp.ones((max(max_block_nnz, 1),), dtype=dtype)
         try:
-            ext_main_up, ext_main_down, ext_scratch_up, ext_scratch_down = _query_ext_sizes(
+            ext_main_up, ext_main_down, ext_scratch_up, ext_scratch_down = _query_spmm_buffer_sizes(
                 cp=cp,
                 cslib=cslib,
-                shared_ones_ptr=int(shared_vals.data.ptr),
                 layout_artifacts=tuple(planned),
                 scans=scans,
                 pair=pair,
@@ -827,7 +831,6 @@ def plan_cusparse_layout(
             )
         finally:
             cslib.destroy()
-            del shared_vals
 
     ext_bytes = int(sum(ext_main_up) + sum(ext_main_down) + sum(sum(row) for row in ext_scratch_up) + sum(sum(row) for row in ext_scratch_down))
     shared_ones_plan = _build_shared_ones_plan(dtype, max_block_nnz, device_id=device_id)
@@ -848,6 +851,10 @@ def plan_cusparse_layout(
     )
     resident_bytes_full = int(sum(block.nbytes for block in blocks))
     required_budget_for_full_residency = int(fixed_bytes + resident_bytes_full)
+    if requested_vram_budget_bytes == 0:
+        effective_vram_budget_bytes = required_budget_for_full_residency
+    else:
+        effective_vram_budget_bytes = requested_vram_budget_bytes
     if not allow_residency:
         if blocks and requested_ring_buffer_size < 1:
             raise ValueError("ring_buffer_size must be >= 1 when any cuSPARSE block is streamed")
@@ -856,13 +863,13 @@ def plan_cusparse_layout(
         slot_plans, ring_bytes = _assign_slots(blocks, requested_ring_buffer_size) if blocks else ((), 0)
         resident_bytes = 0
         total_bytes = int(fixed_bytes + ring_bytes)
-        if total_bytes > int(vram_budget_bytes):
+        if total_bytes > effective_vram_budget_bytes:
             raise ValueError(
-                f"cuSPARSE layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={vram_budget_bytes}"
+                f"cuSPARSE layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={effective_vram_budget_bytes}"
             )
         if len(slot_plans) != requested_ring_buffer_size:
             _warn_ring_mismatch(requested=requested_ring_buffer_size, allocated=len(slot_plans))
-    elif required_budget_for_full_residency <= int(vram_budget_bytes):
+    elif required_budget_for_full_residency <= effective_vram_budget_bytes:
         for block in blocks:
             block.resident = True
         slot_plans = ()
@@ -879,16 +886,16 @@ def plan_cusparse_layout(
         slot_plans, ring_bytes = _assign_slots(blocks, requested_ring_buffer_size)
         resident_bytes = 0
         total_bytes = int(fixed_bytes + ring_bytes)
-        if total_bytes > int(vram_budget_bytes):
+        if total_bytes > effective_vram_budget_bytes:
             raise ValueError(
-                f"cuSPARSE layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={vram_budget_bytes}"
+                f"cuSPARSE layout requires at least {total_bytes} owned device bytes, exceeds vram_budget_bytes={effective_vram_budget_bytes}"
             )
         for block in sorted(blocks, key=_promotion_key):
             block.resident = True
             resident_bytes = int(sum(item.nbytes for item in blocks if item.resident))
             slot_plans, ring_bytes = _assign_slots(blocks, requested_ring_buffer_size)
             total_bytes = int(fixed_bytes + resident_bytes + ring_bytes)
-            if total_bytes > int(vram_budget_bytes):
+            if total_bytes > effective_vram_budget_bytes:
                 block.resident = False
         resident_bytes = int(sum(item.nbytes for item in blocks if item.resident))
         slot_plans, ring_bytes = _assign_slots(blocks, requested_ring_buffer_size)
@@ -896,9 +903,9 @@ def plan_cusparse_layout(
         if len(slot_plans) != requested_ring_buffer_size:
             _warn_ring_mismatch(requested=requested_ring_buffer_size, allocated=len(slot_plans))
 
-    if total_bytes > int(vram_budget_bytes):
+    if total_bytes > effective_vram_budget_bytes:
         raise ValueError(
-            f"cuSPARSE layout requires {total_bytes} owned device bytes, exceeds vram_budget_bytes={vram_budget_bytes}"
+            f"cuSPARSE layout requires {total_bytes} owned device bytes, exceeds vram_budget_bytes={effective_vram_budget_bytes}"
         )
 
     bytes_by_category = {
@@ -954,7 +961,7 @@ def plan_cusparse_layout(
         allow_residency=allow_residency,
         requested_ring_buffer_size=requested_ring_buffer_size,
         allocated_ring_buffer_size=len(slot_plans),
-        vram_budget_bytes=int(vram_budget_bytes),
+        vram_budget_bytes=effective_vram_budget_bytes,
         max_num_samples=max_num_samples,
         max_num_mutations=max_num_mutations,
         max_num_nodes=max_num_nodes,

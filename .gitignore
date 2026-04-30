@@ -262,8 +262,9 @@ figs/
 *.pygrgl_spmv.npz
 investigation/
 notes.txt
-output.txt
+output*.txt
 prompt.txt
+*.tsv
 pygrgl_spmv_artifacts/
 # symlink
 pygrgl_spmv_artifacts

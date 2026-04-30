@@ -38,6 +38,8 @@ The suite protects five things:
   - CPU-safe package import surface under blocked optional GPU modules.
 - `test_bench_scripts.py`
   - Minimal benchmark runner loop counts and reporting contract.
+- `test_bolt_lmm_inf.py`
+  - BOLT-LMM-inf script math contracts, including CG solves, dense GPU formula parity, synthetic null/infinitesimal validation, scan summaries, effect checks, monomorphic SNP skipping, and CUDA device restoration.
 - `runtime/test_convert.py`
   - `convert()` path/object behavior, artifact writing, init-bias persistence, and down-edge-only compilation.
 - `runtime/test_artifacts.py`

@@ -11,3 +11,5 @@ Parent docs: [Backend Docs](../README.md)
 - selector tensors
 - shared dense workspaces
 - shared scratch buffers
+
+Planner `vram_budget_bytes=0` means use `required_budget_for_full_residency`; planners do not query current free VRAM.

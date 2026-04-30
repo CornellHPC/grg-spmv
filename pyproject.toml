@@ -40,7 +40,6 @@ dev = [
     "matplotlib>=3.10.8",
     "seaborn>=0.13.2",
     "igdtools>=2.6",
-    "statsmodels>=0.14.6",
     "pandas>=2.3.3",
 ]
 

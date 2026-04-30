@@ -7,7 +7,6 @@ import functools
 import logging
 import os
 from pathlib import Path
-import re
 import tempfile
 import warnings
 
@@ -17,10 +16,9 @@ from pygrgl_spmv.grg.compile import CompiledOperatorState, _invert_permutation
 from pygrgl_spmv.grg.sparse import binary_csr_from_parts
 
 GRG_SPMV_FORMAT_MAGIC = "grg_spmv"
-GRG_SPMV_FORMAT_VERSION = 5
+GRG_SPMV_FORMAT_VERSION = 6
 _FORMAT_MAGIC_KEY = "grg_spmv_magic"
 _FORMAT_VERSION_KEY = "grg_spmv_format_version"
-_BLOCK_SHAPE_RE = re.compile(r"^A_blocks_(\d+)_(\d+)_shape$")
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -126,11 +124,25 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         save_dict["init_xtx_up_bias"] = np.asarray(state.init_xtx_up_bias)
     if state.init_xtx_down_bias is not None:
         save_dict["init_xtx_down_bias"] = np.asarray(state.init_xtx_down_bias)
+    scan_block_levels: list[tuple[int, int]] = []
+    scan_block_shapes: list[tuple[int, int]] = []
+    scan_block_nnzs: list[int] = []
+    scan_block_struct_itemsize: list[tuple[int, int]] = []
     for dst_level, blocks in enumerate(state.A_blocks):
         for src_level, block in enumerate(blocks):
-            save_dict[f"A_blocks_{dst_level}_{src_level}_indices"] = np.asarray(block.indices)
-            save_dict[f"A_blocks_{dst_level}_{src_level}_indptr"] = np.asarray(block.indptr)
-            save_dict[f"A_blocks_{dst_level}_{src_level}_shape"] = np.asarray(block.shape, dtype=np.int64)
+            indices = np.asarray(block.indices)
+            indptr = np.asarray(block.indptr)
+            save_dict[f"A_blocks_{dst_level}_{src_level}_indices"] = indices
+            save_dict[f"A_blocks_{dst_level}_{src_level}_indptr"] = indptr
+            scan_block_levels.append((int(dst_level), int(src_level)))
+            scan_block_shapes.append((int(block.shape[0]), int(block.shape[1])))
+            scan_block_nnzs.append(int(indices.size))
+            scan_block_struct_itemsize.append((int(indices.dtype.itemsize), int(indptr.dtype.itemsize)))
+    save_dict["scan_block_levels"] = np.asarray(scan_block_levels, dtype=np.int32).reshape((-1, 2))
+    save_dict["scan_block_shapes"] = np.asarray(scan_block_shapes, dtype=np.int64).reshape((-1, 2))
+    save_dict["scan_block_nnzs"] = np.asarray(scan_block_nnzs, dtype=np.int64)
+    save_dict["scan_block_struct_itemsize"] = np.asarray(scan_block_struct_itemsize, dtype=np.uint8).reshape((-1, 2))
+    save_dict["scan_selector_nnzs"] = np.asarray((int(state.sel_mut.nnz), int(state.sel_miss.nnz)), dtype=np.int64)
 
     path = Path(artifact_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -138,7 +150,7 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
     tmp_path = Path(raw_tmp_path)
     try:
         with os.fdopen(fd, "wb") as handle:
-            np.savez_compressed(handle, **save_dict)
+            np.savez(handle, **save_dict)
             handle.flush()
             os.fsync(handle.fileno())
         tmp_path.replace(path)
@@ -189,15 +201,14 @@ def _load_struct_array(data: np.lib.npyio.NpzFile, key: str, *, non_negative: bo
     return arr
 
 
-def _scan_block_keys(data: np.lib.npyio.NpzFile) -> list[tuple[int, int]]:
-    keys: list[tuple[int, int]] = []
-    for key in data.files:
-        match = _BLOCK_SHAPE_RE.fullmatch(key)
-        if match is None:
-            continue
-        keys.append((int(match.group(1)), int(match.group(2))))
-    keys.sort()
-    return keys
+def _struct_dtype_from_itemsize(itemsize: int) -> np.dtype:
+    match int(itemsize):
+        case 4:
+            return np.dtype(np.int32)
+        case 8:
+            return np.dtype(np.int64)
+        case _:
+            raise ValueError(f"unsupported structural itemsize: {itemsize}")
 
 
 @functools.cache
@@ -210,19 +221,49 @@ def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
             int(level_offsets[level + 1]) - int(level_offsets[level])
             for level in range(len(level_offsets) - 1)
         )
+        block_levels = np.asarray(data["scan_block_levels"])
+        block_shapes = np.asarray(data["scan_block_shapes"])
+        block_nnzs = np.asarray(data["scan_block_nnzs"])
+        block_struct_itemsize = np.asarray(data["scan_block_struct_itemsize"])
+        selector_nnzs = np.asarray(data["scan_selector_nnzs"])
+        if block_levels.ndim != 2 or block_levels.shape[1] != 2:
+            raise ValueError(f"scan_block_levels must have shape (num_blocks, 2), got {block_levels.shape}")
+        if block_shapes.ndim != 2 or block_shapes.shape[1] != 2:
+            raise ValueError(f"scan_block_shapes must have shape (num_blocks, 2), got {block_shapes.shape}")
+        if block_struct_itemsize.ndim != 2 or block_struct_itemsize.shape[1] != 2:
+            raise ValueError(
+                f"scan_block_struct_itemsize must have shape (num_blocks, 2), got {block_struct_itemsize.shape}"
+            )
+        if block_nnzs.ndim != 1:
+            raise ValueError(f"scan_block_nnzs must be one-dimensional, got {block_nnzs.shape}")
+        num_blocks = int(block_levels.shape[0])
+        if block_shapes.shape[0] != num_blocks or block_nnzs.shape[0] != num_blocks or block_struct_itemsize.shape[0] != num_blocks:
+            raise ValueError("scan block metadata arrays must have matching lengths")
+        if selector_nnzs.shape != (2,):
+            raise ValueError(f"scan_selector_nnzs must have shape (2,), got {selector_nnzs.shape}")
+        if (
+            (block_levels.size and np.any(block_levels < 0))
+            or (block_shapes.size and np.any(block_shapes < 0))
+            or (block_nnzs.size and np.any(block_nnzs < 0))
+            or np.any(selector_nnzs < 0)
+        ):
+            raise ValueError("scan metadata arrays must be non-negative")
         blocks: list[ArtifactBlockScan] = []
-        for dst_level, src_level in _scan_block_keys(data):
-            indices = _load_struct_array(data, f"A_blocks_{dst_level}_{src_level}_indices")
-            indptr = _load_struct_array(data, f"A_blocks_{dst_level}_{src_level}_indptr")
-            shape = tuple(int(v) for v in np.asarray(data[f"A_blocks_{dst_level}_{src_level}_shape"], dtype=np.int64))
+        for (dst_level, src_level), shape, nnz, itemsize in zip(
+            block_levels,
+            block_shapes,
+            block_nnzs,
+            block_struct_itemsize,
+            strict=True,
+        ):
             blocks.append(
                 ArtifactBlockScan(
-                    dst_level=dst_level,
-                    src_level=src_level,
-                    shape=(shape[0], shape[1]),
-                    nnz=int(indices.size),
-                    indices_dtype=np.dtype(indices.dtype),
-                    indptr_dtype=np.dtype(indptr.dtype),
+                    dst_level=int(dst_level),
+                    src_level=int(src_level),
+                    shape=(int(shape[0]), int(shape[1])),
+                    nnz=int(nnz),
+                    indices_dtype=_struct_dtype_from_itemsize(int(itemsize[0])),
+                    indptr_dtype=_struct_dtype_from_itemsize(int(itemsize[1])),
                 )
             )
         return ArtifactScan(
@@ -238,8 +279,8 @@ def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
             level_offsets=np.asarray(level_offsets),
             level_sizes=level_sizes,
             num_levels=len(level_sizes),
-            selector_mut_nnz=int(np.asarray(data["sel_mut_indices"]).size),
-            selector_miss_nnz=int(np.asarray(data["sel_miss_indices"]).size),
+            selector_mut_nnz=int(selector_nnzs[0]),
+            selector_miss_nnz=int(selector_nnzs[1]),
             blocks=tuple(blocks),
         )
 
@@ -253,14 +294,23 @@ def iter_artifact_blocks(path):
     artifact_path = Path(path)
     with _open_archive(artifact_path) as data:
         _validate_archive(data, artifact_path)
-        for dst_level, src_level in _scan_block_keys(data):
+        block_levels = np.asarray(data["scan_block_levels"])
+        block_shapes = np.asarray(data["scan_block_shapes"])
+        if block_levels.ndim != 2 or block_levels.shape[1] != 2:
+            raise ValueError(f"scan_block_levels must have shape (num_blocks, 2), got {block_levels.shape}")
+        if block_shapes.ndim != 2 or block_shapes.shape[1] != 2:
+            raise ValueError(f"scan_block_shapes must have shape (num_blocks, 2), got {block_shapes.shape}")
+        if block_levels.shape[0] != block_shapes.shape[0]:
+            raise ValueError("scan block metadata arrays must have matching lengths")
+        for (dst_level, src_level), shape in zip(block_levels, block_shapes, strict=True):
+            dst_level = int(dst_level)
+            src_level = int(src_level)
             indices = _load_struct_array(data, f"A_blocks_{dst_level}_{src_level}_indices")
             indptr = _load_struct_array(data, f"A_blocks_{dst_level}_{src_level}_indptr")
-            shape = tuple(int(v) for v in np.asarray(data[f"A_blocks_{dst_level}_{src_level}_shape"], dtype=np.int64))
             yield ArtifactBlock(
                 dst_level=dst_level,
                 src_level=src_level,
-                shape=(shape[0], shape[1]),
+                shape=(int(shape[0]), int(shape[1])),
                 indices=indices,
                 indptr=indptr,
             )

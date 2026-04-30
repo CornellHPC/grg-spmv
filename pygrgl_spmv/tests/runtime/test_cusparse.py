@@ -207,6 +207,24 @@ def _build_layout(artifact, *, runtime_k: int, ring_buffer_size: int, budget_byt
     )
 
 
+def test_cusparse_layout_planning_uses_sparse_metadata_only(tmp_path, monkeypatch):
+    artifact = write_three_level_band_artifact(tmp_path, "metadata-only-cusparse", n=8, bandwidth=2)
+
+    def _fail_sparse_block_read(_path):
+        raise AssertionError("cuSPARSE layout planning should not read sparse block arrays")
+
+    monkeypatch.setattr("pygrgl_spmv.backends.cusparse.backend.iter_artifact_blocks", _fail_sparse_block_read)
+    layout = build_cusparse_layout([artifact], requirements=_requirements(2))
+    assert layout.max_levels == 3
+    assert len(layout.ext_main_up) == layout.max_levels
+    assert len(layout.ext_main_down) == layout.max_levels
+    assert len(layout.ext_scratch_up) == layout.max_levels
+    assert len(layout.ext_scratch_down) == layout.max_levels
+    assert layout.bytes_by_category["ext"] >= 0
+    assert layout.budget_items
+    assert layout.bytes_total > 0
+
+
 def _full_budget_components(artifact, *, runtime_k: int) -> tuple[int, int, int]:
     layout = build_cusparse_layout(
         [artifact],
@@ -908,6 +926,74 @@ def test_cusparse_owned_device_bytes_do_not_exceed_tight_budget(primary_artifact
     with CusparseRuntime(layout) as runtime:
         assert _cusparse_owned_device_nbytes(runtime) <= layout.vram_budget_bytes
     clear_cupy_state()
+
+
+@pytest.mark.parametrize(
+    ("vram_budget_bytes", "ring_buffer_size", "case"),
+    [
+        pytest.param(0, 0, "full", id="zero-budget-ring0"),
+        pytest.param(0, 1, "full_warn", id="zero-budget-ring1"),
+        pytest.param("tight", 0, "ring_error", id="tight-ring0"),
+        pytest.param("tight", 1, "streamed", id="tight-ring1"),
+    ],
+)
+def test_cusparse_vram_budget_zero_sentinel_and_tight_ring(
+    cusparse_small_stream_artifact,
+    vram_budget_bytes,
+    ring_buffer_size,
+    case,
+):
+    full = _build_layout(
+        cusparse_small_stream_artifact,
+        runtime_k=2,
+        ring_buffer_size=0,
+        budget_bytes=0,
+    )
+    block_bytes = min(block.nbytes for artifact in full.artifacts for block in (*artifact.blocks_up, *artifact.blocks_down))
+    budget = full.required_budget_for_full_residency - block_bytes if vram_budget_bytes == "tight" else vram_budget_bytes
+    if case == "ring_error":
+        with pytest.raises(ValueError, match="ring_buffer_size"):
+            _build_layout(
+                cusparse_small_stream_artifact,
+                runtime_k=2,
+                ring_buffer_size=ring_buffer_size,
+                budget_bytes=budget,
+            )
+        return
+    if case == "full_warn":
+        with pytest.warns(RuntimeWarning, match="all sparse blocks fit resident"):
+            layout = _build_layout(
+                cusparse_small_stream_artifact,
+                runtime_k=2,
+                ring_buffer_size=ring_buffer_size,
+                budget_bytes=budget,
+            )
+    else:
+        layout = _build_layout(
+            cusparse_small_stream_artifact,
+            runtime_k=2,
+            ring_buffer_size=ring_buffer_size,
+            budget_bytes=budget,
+        )
+    if case in {"full", "full_warn"}:
+        assert _owner_keys(layout, resident=False) == ()
+        assert layout.allocated_ring_buffer_size == 0
+        assert layout.vram_budget_bytes == layout.required_budget_for_full_residency
+        assert layout.bytes_total == layout.required_budget_for_full_residency
+    else:
+        assert layout.allocated_ring_buffer_size == 1
+        assert layout.bytes_total <= layout.vram_budget_bytes
+        assert layout.bytes_total < layout.required_budget_for_full_residency
+
+
+def test_cusparse_layout_rejects_negative_vram_budget(cusparse_small_stream_artifact):
+    with pytest.raises(ValueError, match="vram_budget_bytes"):
+        _build_layout(
+            cusparse_small_stream_artifact,
+            runtime_k=2,
+            ring_buffer_size=0,
+            budget_bytes=-1,
+        )
 
 
 @pytest.mark.parametrize("requested_ring_buffer_size", [1, 2, 3], ids=["ring1", "ring2", "ring3"])

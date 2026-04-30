@@ -674,6 +674,74 @@ def test_triton_owned_device_bytes_do_not_exceed_tight_budget(primary_artifact):
     clear_torch_state()
 
 
+@pytest.mark.parametrize(
+    ("vram_budget_bytes", "ring_buffer_size", "case"),
+    [
+        pytest.param(0, 0, "full", id="zero-budget-ring0"),
+        pytest.param(0, 1, "full_warn", id="zero-budget-ring1"),
+        pytest.param("tight", 0, "ring_error", id="tight-ring0"),
+        pytest.param("tight", 1, "streamed", id="tight-ring1"),
+    ],
+)
+def test_triton_vram_budget_zero_sentinel_and_tight_ring(
+    triton_small_stream_artifact,
+    vram_budget_bytes,
+    ring_buffer_size,
+    case,
+):
+    full = _build_layout(
+        triton_small_stream_artifact,
+        runtime_k=2,
+        ring_buffer_size=0,
+        budget_bytes=0,
+    )
+    block_bytes = min(block.nbytes for artifact in full.artifacts for block in (*artifact.blocks_up, *artifact.blocks_down))
+    budget = full.required_budget_for_full_residency - block_bytes if vram_budget_bytes == "tight" else vram_budget_bytes
+    if case == "ring_error":
+        with pytest.raises(ValueError, match="ring_buffer_size"):
+            _build_layout(
+                triton_small_stream_artifact,
+                runtime_k=2,
+                ring_buffer_size=ring_buffer_size,
+                budget_bytes=budget,
+            )
+        return
+    if case == "full_warn":
+        with pytest.warns(RuntimeWarning, match="all sparse blocks fit resident"):
+            layout = _build_layout(
+                triton_small_stream_artifact,
+                runtime_k=2,
+                ring_buffer_size=ring_buffer_size,
+                budget_bytes=budget,
+            )
+    else:
+        layout = _build_layout(
+            triton_small_stream_artifact,
+            runtime_k=2,
+            ring_buffer_size=ring_buffer_size,
+            budget_bytes=budget,
+        )
+    if case in {"full", "full_warn"}:
+        assert _owner_keys(layout, resident=False) == ()
+        assert layout.allocated_ring_buffer_size == 0
+        assert layout.vram_budget_bytes == layout.required_budget_for_full_residency
+        assert layout.bytes_total == layout.required_budget_for_full_residency
+    else:
+        assert layout.allocated_ring_buffer_size == 1
+        assert layout.bytes_total <= layout.vram_budget_bytes
+        assert layout.bytes_total < layout.required_budget_for_full_residency
+
+
+def test_triton_layout_rejects_negative_vram_budget(triton_small_stream_artifact):
+    with pytest.raises(ValueError, match="vram_budget_bytes"):
+        _build_layout(
+            triton_small_stream_artifact,
+            runtime_k=2,
+            ring_buffer_size=0,
+            budget_bytes=-1,
+        )
+
+
 @pytest.mark.parametrize("requested_ring_buffer_size", [1, 2, 3], ids=["ring1", "ring2", "ring3"])
 def test_triton_allow_residency_false_forces_all_streamed_layout(triton_small_stream_artifact, requested_ring_buffer_size):
     fixed_bytes, block_bytes, owner_block_count = _full_budget_components(triton_small_stream_artifact, runtime_k=2)

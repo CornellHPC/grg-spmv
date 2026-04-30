@@ -463,7 +463,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=int, default=0, help="CUDA device ordinal")
     parser.add_argument("--stream", type=int, default=0, help="CUDA stream handle")
     parser.add_argument("--ring-buffer-size", type=int, default=0, help="cuSPARSE streamed ring-buffer size")
-    parser.add_argument("--vram-budget-bytes", type=int, default=None, help="Owned device memory budget")
+    parser.add_argument(
+        "--vram-budget-bytes",
+        type=int,
+        default=None,
+        help="Owned device memory budget; omit to probe free VRAM, 0 requests planner full residency",
+    )
     parser.add_argument("--graph", action="store_true", help="Capture hot X.T @ X calls in a CUDA graph")
     args = parser.parse_args()
     if int(args.pcs) < 1:
@@ -482,8 +487,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error(f"--rr-power-iters must be >= 0, got {args.rr_power_iters}")
     if int(args.ring_buffer_size) < 0:
         parser.error(f"--ring-buffer-size must be >= 0, got {args.ring_buffer_size}")
-    if args.vram_budget_bytes is not None and int(args.vram_budget_bytes) < 1:
-        parser.error(f"--vram-budget-bytes must be >= 1, got {args.vram_budget_bytes}")
+    if args.vram_budget_bytes is not None and int(args.vram_budget_bytes) < 0:
+        parser.error(f"--vram-budget-bytes must be >= 0, got {args.vram_budget_bytes}")
     if args.graph and int(args.stream) != 0:
         parser.error("--graph requires --stream 0 because the benchmark owns the capture stream")
     return args
@@ -558,7 +563,7 @@ def _plan_layout(
         stream=stream,
     )
     _stats_add_setup(stats, "layout_planning", perf_counter() - start)
-    return layout, int(budget)
+    return layout, int(layout.vram_budget_bytes)
 
 
 def _reported_eigsh_ncv(method: str, n: int, k: int, requested: int | None) -> int:

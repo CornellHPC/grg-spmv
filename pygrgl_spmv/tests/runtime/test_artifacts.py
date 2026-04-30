@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+import zipfile
 
 import numpy as np
 import pytest
 
 from pygrgl_spmv import ReferenceRuntime
-from pygrgl_spmv.grg.artifact import iter_artifact_blocks, load_grg_spmv, save_grg_spmv, scan_grg_spmv
+import pygrgl_spmv.grg.artifact as artifact_module
+from pygrgl_spmv.grg.artifact import (
+    GRG_SPMV_FORMAT_MAGIC,
+    GRG_SPMV_FORMAT_VERSION,
+    iter_artifact_blocks,
+    load_grg_spmv,
+    save_grg_spmv,
+    scan_grg_spmv,
+)
 from pygrgl_spmv.tests.runtime._runtime_builders import build_reference_layout
 from pygrgl_spmv.tests.runtime._streaming_cases import write_three_level_band_artifact
 
@@ -109,7 +118,7 @@ def test_save_grg_spmv_is_atomic_on_failure(primary_artifact, tmp_path, monkeypa
         handle.flush()
         raise RuntimeError("save failed")
 
-    monkeypatch.setattr(np, "savez_compressed", _broken_savez)
+    monkeypatch.setattr(np, "savez", _broken_savez)
 
     with pytest.raises(RuntimeError, match="save failed"):
         save_grg_spmv(state, target)
@@ -119,6 +128,66 @@ def test_save_grg_spmv_is_atomic_on_failure(primary_artifact, tmp_path, monkeypa
     loaded = load_grg_spmv(target, np.float64)
     assert scan.num_nodes == loaded.num_nodes
     assert not list(target.parent.glob(f".{target.name}.*.tmp"))
+
+
+def test_saved_artifact_is_uncompressed_and_has_direct_scan_metadata(primary_artifact):
+    with zipfile.ZipFile(primary_artifact) as archive:
+        infos = archive.infolist()
+        assert infos
+        assert {info.compress_type for info in infos} == {zipfile.ZIP_STORED}
+        names = set(archive.namelist())
+
+    with np.load(primary_artifact, allow_pickle=False) as data:
+        for key in (
+            "scan_block_levels",
+            "scan_block_shapes",
+            "scan_block_nnzs",
+            "scan_block_struct_itemsize",
+            "scan_selector_nnzs",
+        ):
+            assert key in data.files
+        assert np.asarray(data["scan_block_levels"]).ndim == 2
+        assert np.asarray(data["scan_block_levels"]).shape[1] == 2
+        assert np.asarray(data["scan_block_shapes"]).shape[1] == 2
+        assert np.asarray(data["scan_block_struct_itemsize"]).shape[1] == 2
+    assert not any(name.startswith("A_blocks_") and name.endswith("_shape.npy") for name in names)
+
+
+def test_scan_uses_direct_metadata_without_loading_block_or_selector_arrays(tmp_path, monkeypatch):
+    artifact = write_three_level_band_artifact(tmp_path, "direct-scan", n=4, bandwidth=1)
+    real_load_struct_array = artifact_module._load_struct_array
+
+    def _guarded_load_struct_array(data, key: str, *, non_negative: bool = True):
+        if key != "level_offsets":
+            raise AssertionError(f"scan loaded structural array {key}")
+        return real_load_struct_array(data, key, non_negative=non_negative)
+
+    artifact_module._scan_grg_spmv_cached.cache_clear()
+    monkeypatch.setattr(artifact_module, "_load_struct_array", _guarded_load_struct_array)
+
+    scan = scan_grg_spmv(artifact)
+
+    assert scan.num_levels == 3
+    assert scan.selector_mut_nnz == 4
+    assert scan.selector_miss_nnz == 0
+    assert [(block.dst_level, block.src_level, block.nnz) for block in scan.blocks] == [
+        (1, 0, 4),
+        (2, 0, 4),
+        (2, 1, 4),
+    ]
+
+
+def test_v5_artifacts_are_rejected(tmp_path):
+    artifact = tmp_path / "old.grg_spmv"
+    with artifact.open("wb") as handle:
+        np.savez(
+            handle,
+            grg_spmv_magic=np.asarray(GRG_SPMV_FORMAT_MAGIC),
+            grg_spmv_format_version=np.asarray(5, dtype=np.int32),
+        )
+
+    with pytest.raises(ValueError, match=f"got 5, expected {GRG_SPMV_FORMAT_VERSION}"):
+        scan_grg_spmv(artifact)
 
 
 def test_load_grg_spmv_warns_when_stored_struct_arrays_are_wider_than_loaded(tmp_path):
