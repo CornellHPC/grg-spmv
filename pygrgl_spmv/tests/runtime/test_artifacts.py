@@ -6,7 +6,10 @@ import numpy as np
 import pytest
 
 from pygrgl_spmv import ReferenceRuntime
+import scipy.sparse as sp
+
 from pygrgl_spmv.grg.artifact import iter_artifact_blocks, load_grg_spmv, save_grg_spmv, scan_grg_spmv
+from pygrgl_spmv.backends.base import split_selector_by_level
 from pygrgl_spmv.tests.runtime._runtime_builders import build_reference_layout
 from pygrgl_spmv.tests.runtime._streaming_cases import write_three_level_band_artifact
 
@@ -26,6 +29,20 @@ def test_scan_matches_loaded_state(primary_artifact):
     assert scan.has_xtx_bias == bool(state.init_xtx_up_bias is not None and state.init_xtx_down_bias is not None)
     np.testing.assert_array_equal(scan.level_offsets, state.level_offsets)
     assert scan.num_levels == len(state.level_offsets) - 1
+    assert scan.has_individual_coals == (state.coalescence_counts is not None)
+    assert scan.init_vector_up_bias_size == np.asarray(state.init_vector_up_bias).size
+    assert scan.init_vector_down_bias_size == np.asarray(state.init_vector_down_bias).size
+    assert len(scan.sel_mut_nnz_by_level) == scan.num_levels
+    assert len(scan.sel_miss_nnz_by_level) == scan.num_levels
+    assert int(scan.sel_mut_nnz_by_level.sum()) == scan.selector_mut_nnz
+    assert int(scan.sel_miss_nnz_by_level.sum()) == scan.selector_miss_nnz
+    # verify per-level nnz matches split_selector_by_level
+    mut_pairs = split_selector_by_level(state.sel_mut, state.level_offsets)
+    miss_pairs = split_selector_by_level(state.sel_miss, state.level_offsets)
+    for level, (rows, _) in enumerate(mut_pairs):
+        assert int(scan.sel_mut_nnz_by_level[level]) == rows.size
+    for level, (rows, _) in enumerate(miss_pairs):
+        assert int(scan.sel_miss_nnz_by_level[level]) == rows.size
 
     loaded_blocks = {(dst_level, src_level): block for dst_level, row in enumerate(state.A_blocks or []) for src_level, block in enumerate(row)}
     assert len(scan.blocks) == len(loaded_blocks)
@@ -109,7 +126,7 @@ def test_save_grg_spmv_is_atomic_on_failure(primary_artifact, tmp_path, monkeypa
         handle.flush()
         raise RuntimeError("save failed")
 
-    monkeypatch.setattr(np, "savez_compressed", _broken_savez)
+    monkeypatch.setattr(np, "savez", _broken_savez)
 
     with pytest.raises(RuntimeError, match="save failed"):
         save_grg_spmv(state, target)

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 import warnings
 
 import numpy as np
@@ -17,7 +18,7 @@ from pygrgl_spmv.grg.compile import CompiledOperatorState, _invert_permutation
 from pygrgl_spmv.grg.sparse import binary_csr_from_parts
 
 GRG_SPMV_FORMAT_MAGIC = "grg_spmv"
-GRG_SPMV_FORMAT_VERSION = 5
+GRG_SPMV_FORMAT_VERSION = 6
 _FORMAT_MAGIC_KEY = "grg_spmv_magic"
 _FORMAT_VERSION_KEY = "grg_spmv_format_version"
 _BLOCK_SHAPE_RE = re.compile(r"^A_blocks_(\d+)_(\d+)_shape$")
@@ -76,6 +77,11 @@ class ArtifactScan:
     num_levels: int
     selector_mut_nnz: int
     selector_miss_nnz: int
+    has_individual_coals: bool
+    sel_mut_nnz_by_level: np.ndarray
+    sel_miss_nnz_by_level: np.ndarray
+    init_vector_up_bias_size: int
+    init_vector_down_bias_size: int
     blocks: tuple[ArtifactBlockScan, ...]
 
     @property
@@ -89,6 +95,13 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
     if state.init_vector_up_bias is None or state.init_vector_down_bias is None:
         raise RuntimeError("init vector bias cache must be populated before .grg_spmv save")
 
+    t0 = time.perf_counter()
+    sel_mut_indices = np.asarray(state.sel_mut.indices)
+    sel_miss_indices = np.asarray(state.sel_miss.indices)
+    level_offsets_arr = np.asarray(state.level_offsets)
+    level_spans = [(int(level_offsets_arr[i]), int(level_offsets_arr[i + 1])) for i in range(len(level_offsets_arr) - 1)]
+    sel_mut_nnz_by_level = np.asarray([int(state.sel_mut[:, lo:hi].nnz) for lo, hi in level_spans], dtype=np.int64)
+    sel_miss_nnz_by_level = np.asarray([int(state.sel_miss[:, lo:hi].nnz) for lo, hi in level_spans], dtype=np.int64)
     save_dict = {
         _FORMAT_MAGIC_KEY: np.asarray(GRG_SPMV_FORMAT_MAGIC),
         _FORMAT_VERSION_KEY: np.asarray(GRG_SPMV_FORMAT_VERSION, dtype=np.int32),
@@ -115,10 +128,16 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
             state.init_xtx_up_bias is not None and state.init_xtx_down_bias is not None,
             dtype=bool,
         ),
-        "sel_mut_indices": np.asarray(state.sel_mut.indices),
+        "sel_mut_indices": sel_mut_indices,
         "sel_mut_indptr": np.asarray(state.sel_mut.indptr),
-        "sel_miss_indices": np.asarray(state.sel_miss.indices),
+        "sel_mut_nnz": np.asarray(sel_mut_indices.size, dtype=np.int64),
+        "sel_mut_nnz_by_level": sel_mut_nnz_by_level,
+        "sel_miss_indices": sel_miss_indices,
         "sel_miss_indptr": np.asarray(state.sel_miss.indptr),
+        "sel_miss_nnz": np.asarray(sel_miss_indices.size, dtype=np.int64),
+        "sel_miss_nnz_by_level": sel_miss_nnz_by_level,
+        "init_vector_up_bias_size": np.asarray(np.asarray(state.init_vector_up_bias).size, dtype=np.int64),
+        "init_vector_down_bias_size": np.asarray(np.asarray(state.init_vector_down_bias).size, dtype=np.int64),
     }
     if state.coalescence_counts is not None:
         save_dict["coalescence_counts"] = np.asarray(state.coalescence_counts, dtype=np.int64)
@@ -126,11 +145,18 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         save_dict["init_xtx_up_bias"] = np.asarray(state.init_xtx_up_bias)
     if state.init_xtx_down_bias is not None:
         save_dict["init_xtx_down_bias"] = np.asarray(state.init_xtx_down_bias)
+    num_blocks = 0
     for dst_level, blocks in enumerate(state.A_blocks):
         for src_level, block in enumerate(blocks):
-            save_dict[f"A_blocks_{dst_level}_{src_level}_indices"] = np.asarray(block.indices)
-            save_dict[f"A_blocks_{dst_level}_{src_level}_indptr"] = np.asarray(block.indptr)
+            indices_arr = np.asarray(block.indices)
+            indptr_arr = np.asarray(block.indptr)
+            save_dict[f"A_blocks_{dst_level}_{src_level}_indices"] = indices_arr
+            save_dict[f"A_blocks_{dst_level}_{src_level}_indptr"] = indptr_arr
             save_dict[f"A_blocks_{dst_level}_{src_level}_shape"] = np.asarray(block.shape, dtype=np.int64)
+            save_dict[f"A_blocks_{dst_level}_{src_level}_nnz"] = np.asarray(indices_arr.size, dtype=np.int64)
+            save_dict[f"A_blocks_{dst_level}_{src_level}_indices_dtype"] = np.asarray(str(indices_arr.dtype))
+            save_dict[f"A_blocks_{dst_level}_{src_level}_indptr_dtype"] = np.asarray(str(indptr_arr.dtype))
+            num_blocks += 1
 
     path = Path(artifact_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -138,7 +164,7 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
     tmp_path = Path(raw_tmp_path)
     try:
         with os.fdopen(fd, "wb") as handle:
-            np.savez_compressed(handle, **save_dict)
+            np.savez(handle, **save_dict)
             handle.flush()
             os.fsync(handle.fileno())
         tmp_path.replace(path)
@@ -146,6 +172,10 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         tmp_path.unlink(missing_ok=True)
         raise
     _scan_grg_spmv_cached.cache_clear()
+    _LOGGER.debug(
+        "save_grg_spmv path=%s blocks=%d size=%.1fMB elapsed=%.3fs",
+        path, num_blocks, path.stat().st_size / 1e6, time.perf_counter() - t0,
+    )
 
 
 def _open_archive(artifact_path) -> np.lib.npyio.NpzFile:
@@ -163,12 +193,12 @@ def _validate_archive(data: np.lib.npyio.NpzFile, artifact_path) -> None:
     version = int(np.asarray(data[_FORMAT_VERSION_KEY]).item())
     if version != GRG_SPMV_FORMAT_VERSION:
         raise ValueError(
-            f"unsupported .grg_spmv artifact in {artifact_path}: got {version}, expected {GRG_SPMV_FORMAT_VERSION}"
+            f"unsupported .grg_spmv artifact in {artifact_path}: got version {version}, expected {GRG_SPMV_FORMAT_VERSION}"
         )
 
 
 def _log_struct_array(key: str, arr: np.ndarray) -> None:
-    if not _LOGGER.isEnabledFor(logging.INFO):
+    if not _LOGGER.isEnabledFor(logging.DEBUG):
         return
     _LOGGER.debug(
         "artifact array key=%s dtype=%s shape=%s nbytes=%d",
@@ -202,6 +232,7 @@ def _scan_block_keys(data: np.lib.npyio.NpzFile) -> list[tuple[int, int]]:
 
 @functools.cache
 def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
+    t0 = time.perf_counter()
     with _open_archive(artifact_path) as data:
         _validate_archive(data, artifact_path)
         level_offsets = _load_struct_array(data, "level_offsets")
@@ -212,20 +243,25 @@ def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
         )
         blocks: list[ArtifactBlockScan] = []
         for dst_level, src_level in _scan_block_keys(data):
-            indices = _load_struct_array(data, f"A_blocks_{dst_level}_{src_level}_indices")
-            indptr = _load_struct_array(data, f"A_blocks_{dst_level}_{src_level}_indptr")
             shape = tuple(int(v) for v in np.asarray(data[f"A_blocks_{dst_level}_{src_level}_shape"], dtype=np.int64))
+            nnz = int(np.asarray(data[f"A_blocks_{dst_level}_{src_level}_nnz"]).item())
+            indices_dtype = np.dtype(str(np.asarray(data[f"A_blocks_{dst_level}_{src_level}_indices_dtype"]).item()))
+            indptr_dtype = np.dtype(str(np.asarray(data[f"A_blocks_{dst_level}_{src_level}_indptr_dtype"]).item()))
             blocks.append(
                 ArtifactBlockScan(
                     dst_level=dst_level,
                     src_level=src_level,
                     shape=(shape[0], shape[1]),
-                    nnz=int(indices.size),
-                    indices_dtype=np.dtype(indices.dtype),
-                    indptr_dtype=np.dtype(indptr.dtype),
+                    nnz=nnz,
+                    indices_dtype=indices_dtype,
+                    indptr_dtype=indptr_dtype,
                 )
             )
-        return ArtifactScan(
+        sel_mut_nnz_by_level = np.asarray(data["sel_mut_nnz_by_level"], dtype=np.int64)
+        sel_miss_nnz_by_level = np.asarray(data["sel_miss_nnz_by_level"], dtype=np.int64)
+        sel_mut_nnz_by_level.setflags(write=False)
+        sel_miss_nnz_by_level.setflags(write=False)
+        result = ArtifactScan(
             path=artifact_path,
             num_samples=int(np.asarray(data["num_samples"]).item()),
             num_mutations=int(np.asarray(data["num_mutations"]).item()),
@@ -238,14 +274,24 @@ def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
             level_offsets=np.asarray(level_offsets),
             level_sizes=level_sizes,
             num_levels=len(level_sizes),
-            selector_mut_nnz=int(np.asarray(data["sel_mut_indices"]).size),
-            selector_miss_nnz=int(np.asarray(data["sel_miss_indices"]).size),
+            selector_mut_nnz=int(np.asarray(data["sel_mut_nnz"]).item()),
+            selector_miss_nnz=int(np.asarray(data["sel_miss_nnz"]).item()),
+            has_individual_coals=bool(np.asarray(data["has_individual_coals"]).item()),
+            sel_mut_nnz_by_level=sel_mut_nnz_by_level,
+            sel_miss_nnz_by_level=sel_miss_nnz_by_level,
+            init_vector_up_bias_size=int(np.asarray(data["init_vector_up_bias_size"]).item()),
+            init_vector_down_bias_size=int(np.asarray(data["init_vector_down_bias_size"]).item()),
             blocks=tuple(blocks),
         )
+    _LOGGER.debug(
+        "scan_grg_spmv path=%s blocks=%d elapsed=%.3fs",
+        artifact_path, len(blocks), time.perf_counter() - t0,
+    )
+    return result
 
 
 def scan_grg_spmv(path) -> ArtifactScan:
-    artifact_path = Path(path)
+    artifact_path = Path(path).resolve()
     return _scan_grg_spmv_cached(artifact_path)
 
 
@@ -267,6 +313,7 @@ def iter_artifact_blocks(path):
 
 
 def _load_grg_spmv_host(artifact_path, dtype) -> CompiledOperatorState:
+    t0 = time.perf_counter()
     with _open_archive(artifact_path) as data:
         _validate_archive(data, artifact_path)
 
@@ -301,7 +348,7 @@ def _load_grg_spmv_host(artifact_path, dtype) -> CompiledOperatorState:
             shape=(num_mutations, num_nodes),
         )
 
-        return CompiledOperatorState(
+        result = CompiledOperatorState(
             A_blocks=None,
             level_offsets=level_offsets,
             node_perm=node_perm,
@@ -328,14 +375,22 @@ def _load_grg_spmv_host(artifact_path, dtype) -> CompiledOperatorState:
             init_xtx_up_bias=init_xtx_up_bias,
             init_xtx_down_bias=init_xtx_down_bias,
         )
+    _LOGGER.debug(
+        "_load_grg_spmv_host path=%s dtype=%s elapsed=%.3fs",
+        artifact_path, dtype, time.perf_counter() - t0,
+    )
+    return result
 
 
 def load_grg_spmv(artifact_path, dtype) -> CompiledOperatorState:
+    t0 = time.perf_counter()
     header = _load_grg_spmv_host(artifact_path, dtype)
     num_levels = len(header.level_offsets) - 1
     grids: list[list[object]] = [[] for _ in range(num_levels)]
     wasted_struct_bytes = False
+    num_blocks_loaded = 0
     for block in iter_artifact_blocks(artifact_path):
+        num_blocks_loaded += 1
         while len(grids[block.dst_level]) < block.src_level + 1:
             grids[block.dst_level].append(None)
         loaded = binary_csr_from_parts(
@@ -377,6 +432,10 @@ def load_grg_spmv(artifact_path, dtype) -> CompiledOperatorState:
             RuntimeWarning,
             stacklevel=2,
         )
+    _LOGGER.debug(
+        "load_grg_spmv path=%s dtype=%s blocks=%d elapsed=%.3fs",
+        artifact_path, dtype, num_blocks_loaded, time.perf_counter() - t0,
+    )
     return header
 
 
