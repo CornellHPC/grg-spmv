@@ -119,12 +119,6 @@ def _next_cupy_seed(rng: np.random.Generator) -> int:
     return int(rng.integers(0, np.iinfo(np.int64).max))
 
 
-def centered(x):
-    xp = _array_module(x)
-    arr = xp.asarray(x, dtype=_DTYPE)
-    return arr - arr.mean()
-
-
 def center_into(x, out=None):
     xp = _array_module(out if out is not None else x)
     if out is None:
@@ -301,9 +295,7 @@ def cg_solve(matvec_into, b, *, rel_tol: float, max_iter: int, bucket: CgBucket 
     b0 = center_into(xp.asarray(b, dtype=_DTYPE).copy())
     x = xp.zeros_like(b0)
     ax = xp.empty_like(b0)
-    matvec_into(x, ax)
-    r = b0 - ax
-    center_into(r)
+    r = b0.copy()
     p = r.copy()
     rr = _dot(r, r)
     b2 = max(_dot(b0, b0), 1e-300)
@@ -312,7 +304,7 @@ def cg_solve(matvec_into, b, *, rel_tol: float, max_iter: int, bucket: CgBucket 
         rel = math.sqrt(rr / b2)
         if bucket is not None:
             bucket.add(0, rel)
-        return x
+        return center_into(x)
 
     rel = math.sqrt(rr / b2)
     it_done = 0
@@ -583,18 +575,6 @@ class GrgBoltOps:
                 center_into(out)
             return out
 
-    def score_norm2(self, v, *, exclude_label: int | None = None) -> float:
-        with self.device:
-            total = self.cp.zeros((), dtype=_DTYPE)
-            for label in self.states:
-                if exclude_label is not None and int(label) == int(exclude_label):
-                    continue
-                scores = self.scores_view(label, v)
-                with self.stream:
-                    total += self.cp.sum(scores * scores)
-            self.stream.synchronize()
-            return float(total.get())
-
     def used_global_to_local(self, global_idx: int) -> tuple[int, int]:
         idx = int(global_idx)
         if idx < 0 or idx >= self.used_m:
@@ -732,10 +712,10 @@ def _make_random_components(ops: GrgBoltOps, rng: np.random.Generator, trials: i
                 ops.apply_x(label, weights, ops.sample_work)
                 with ops.stream:
                     g += ops.sample_work
-                with ops.stream:
-                    center_into(g)
-                    e = cp_rng.standard_normal(ops.n, dtype=_DTYPE)
-                    center_into(e)
+            with ops.stream:
+                center_into(g)
+                e = cp_rng.standard_normal(ops.n, dtype=_DTYPE)
+                center_into(e)
             g_rand.append(g)
             e_rand.append(e)
         return tuple(g_rand), tuple(e_rand)
@@ -754,36 +734,37 @@ def _estimate_variance_components(
     _LOGGER.info("Starting REML variance component estimation: n=%d m=%d mc_trials=%d", ops.n, ops.used_m, trials)
     with ops.device, ops.stream:
         g_rand, e_rand = _make_random_components(ops, rng, trials)
-        work = ops.cp.empty((ops.n,), dtype=_DTYPE)
+        reml_work = ops.cp.empty((ops.n,), dtype=_DTYPE)
         objective_evals = 0
 
-        def beta2_e2(y0, delta: float) -> tuple[float, float]:
+        def solve_moments(y0, delta: float) -> tuple[float, float]:
             def h_into(src, dst) -> None:
                 ops.apply_k(src, exclude_label=None, out=dst)
                 with ops.stream:
-                    dst += float(delta) * centered(src)
+                    dst += float(delta) * src
 
             z = cg_solve(h_into, y0, rel_tol=rel_tol, max_iter=max_iter, bucket=bucket)
-            beta2 = ops.score_norm2(z) / float(ops.used_m * ops.used_m)
-            e2 = (float(delta) ** 2) * _dot(z, z)
+            z_norm2 = _dot(z, z)
+            beta2 = (_dot(z, y0) - float(delta) * z_norm2) / float(ops.used_m)
+            e2 = (float(delta) ** 2) * z_norm2
             return beta2, e2
 
         def objective(log_delta: float) -> float:
             nonlocal objective_evals
             objective_evals += 1
+            work_arr = reml_work
             delta = math.exp(float(log_delta))
             _LOGGER.info("REML secant evaluation %d: log_delta=%g delta=%g", objective_evals, log_delta, delta)
-            b2_data, e2_data = beta2_e2(y, delta)
+            b2_data, e2_data = solve_moments(y, delta)
             b2_rand_sum = 0.0
             e2_rand_sum = 0.0
             sqrt_delta = math.sqrt(delta)
             for g_t, e_t in zip(g_rand, e_rand, strict=True):
                 with ops.stream:
-                    work[...] = e_t
-                    work *= sqrt_delta
-                    work += g_t
-                    center_into(work)
-                b2_t, e2_t = beta2_e2(work, delta)
+                    ops.cp.multiply(e_t, sqrt_delta, out=work_arr)
+                    ops.cp.add(work_arr, g_t, out=work_arr)
+                    center_into(work_arr)
+                b2_t, e2_t = solve_moments(work_arr, delta)
                 b2_rand_sum += b2_t
                 e2_rand_sum += e2_t
             if min(b2_data, e2_data, b2_rand_sum, e2_rand_sum) <= 0.0:
@@ -816,7 +797,7 @@ def _estimate_variance_components(
         def h_final_into(src, dst) -> None:
             ops.apply_k(src, exclude_label=None, out=dst)
             with ops.stream:
-                dst += delta * centered(src)
+                dst += delta * src
 
         z = cg_solve(h_final_into, y, rel_tol=rel_tol, max_iter=max_iter, bucket=bucket)
         sigma_g2 = _dot(y, z) / float(ops.n - 1)
@@ -853,7 +834,7 @@ def _solve_loco_residuals(
                 ops.apply_k(src, exclude_label=int(left_out), out=dst)
                 with ops.stream:
                     dst *= float(sigma_g2)
-                    dst += float(sigma_e2) * centered(src)
+                    dst += float(sigma_e2) * src
 
             residuals[int(label)] = cg_solve(v_into, y, rel_tol=rel_tol, max_iter=max_iter, bucket=bucket)
             _LOGGER.info("Finished LOCO residuals for chromosome %s", label)
@@ -896,7 +877,7 @@ def _calibrate_cinf(
                 ops.apply_k(src, exclude_label=int(left_out), out=dst)
                 with ops.stream:
                     dst *= float(sigma_g2)
-                    dst += float(sigma_e2) * centered(src)
+                    dst += float(sigma_e2) * src
 
             q = cg_solve(v_into, x, rel_tol=rel_tol, max_iter=max_iter, bucket=bucket)
             dot = _dot(x, residuals[int(label)])
@@ -1069,7 +1050,7 @@ def _effect_check_metrics(
                 ops.apply_k(src, exclude_label=int(left_out), out=dst)
                 with ops.stream:
                     dst *= float(sigma_g2)
-                    dst += float(sigma_e2) * centered(src)
+                    dst += float(sigma_e2) * src
 
             q = cg_solve(v_into, x, rel_tol=rel_tol, max_iter=max_iter, bucket=bucket)
             denom = _dot(x, q)

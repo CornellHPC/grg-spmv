@@ -20,14 +20,18 @@ from scripts.bolt_lmm_inf.__main__ import (
     _scan_metrics,
     _simulate_phenotype,
     cg_solve,
+    main as bolt_main,
 )
 
 
 def test_cg_solve_matches_tiny_spd_system():
     matrix = np.array([[2.0, -1.0], [-1.0, 2.0]], dtype=np.float64)
     b = np.array([1.0, -1.0], dtype=np.float64)
+    matvec_calls = 0
 
     def matvec_into(src, dst) -> None:
+        nonlocal matvec_calls
+        matvec_calls += 1
         dst[...] = matrix @ src
 
     bucket = CgBucket()
@@ -35,7 +39,8 @@ def test_cg_solve_matches_tiny_spd_system():
     expected = np.linalg.solve(matrix, b)
     np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)
     assert bucket.solves == 1
-    assert bucket.iterations > 0
+    assert bucket.iterations == 1
+    assert matvec_calls == 1
 
 
 def _standardized_from_counts(
@@ -128,6 +133,74 @@ def test_resolve_artifacts_maps_labeled_and_unlabeled_cases(tmp_path):
         chromosomes="21,22",
     )
     assert unlabeled == ((21, first), (22, second))
+
+
+@pytest.mark.gpu
+@pytest.mark.cusparse
+def test_bolt_lmm_inf_main_writes_valid_summary(primary_artifact, tmp_path):
+    pytest.importorskip("cupy")
+    summary_file = tmp_path / "bolt_summary.tsv"
+
+    bolt_main(
+        [
+            "--artifacts",
+            str(primary_artifact),
+            "--chromosomes",
+            "21",
+            "--summary-file",
+            str(summary_file),
+            "--vram-budget-bytes",
+            "1000000000",
+            "--n-calib",
+            "1",
+            "--n-effect-check",
+            "0",
+            "--scan-top-k",
+            "0",
+            "--cg-tol",
+            "1e-3",
+            "--cg-max-iter",
+            "200",
+            "--log-level",
+            "WARNING",
+        ]
+    )
+
+    lines = summary_file.read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0] == "metric\tvalue"
+    metrics = dict(line.split("\t", 1) for line in lines[1:])
+
+    def as_float(key: str) -> float:
+        return float(metrics[key])
+
+    def as_int(key: str) -> int:
+        return int(metrics[key])
+
+    assert metrics["backend"] == "cusparse"
+    assert metrics["chromosomes"] == "21"
+    assert as_int("artifact_count") == 1
+    assert as_int("num_individuals") > 0
+    assert as_int("num_samples") > 0
+    assert as_int("num_mutations.raw") > 0
+    assert as_int("num_mutations.used") > 0
+    assert as_int("chr21.num_mutations.raw") > 0
+    assert as_int("chr21.num_mutations.used") == as_int("num_mutations.used")
+
+    for key in ("reml.sigma_g2", "reml.sigma_e2", "reml.delta", "reml.h2"):
+        value = as_float(key)
+        assert np.isfinite(value)
+        assert value > 0.0
+    assert as_float("reml.h2") == pytest.approx(1.0 / (1.0 + as_float("reml.delta")))
+
+    assert as_float("calibration.c_inf") > 0.0
+    assert as_int("calibration.num_snps_effective") == min(1, as_int("num_mutations.used"))
+
+    hist_total = sum(as_int(f"scan.p_hist.bin{idx}.count") for idx in range(as_int("scan.p_hist.bin_count")))
+    assert hist_total == as_int("scan.genome.num_snps")
+
+    assert as_int("cg.reml.solves") > 0
+    assert as_int("cg.loco.solves") > 0
+    assert as_int("cg.calibration.solves") > 0
 
 
 def _synthetic_counts_artifact(tmp_path, name: str, counts: np.ndarray) -> tuple[object, np.ndarray]:
@@ -582,9 +655,7 @@ def test_grg_bolt_ops_runs_on_runtime_device_when_current_device_differs(primary
                 column = ops.column(21, local_idx)
                 x_result = ops.apply_x(21, weights_dev, out_x)
                 k_result = ops.apply_k(v_dev, exclude_label=None, out=out_k)
-                score_norm = ops.score_norm2(v_dev)
 
                 assert cp.cuda.runtime.getDevice() == 1
                 for array in (scores, column, x_result, k_result):
                     assert _cupy_device_id(array) == 0
-                assert np.isfinite(score_norm)
