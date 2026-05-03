@@ -20,6 +20,7 @@ def test_reference_runtime_exposes_ordered_grgs_and_cpu_null_stream(primary_arti
         assert runtime.stream is None
         assert runtime.stream_ptr is None
         assert [grg.artifact_path for grg in runtime.grgs] == [primary_artifact, primary_artifact]
+        assert [grg.device for grg in runtime.grgs] == [None, None]
 
 
 def test_runtime_requirements_fail_fast(primary_artifact):

@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import time
 import warnings
 
 import numpy as np
@@ -16,7 +17,7 @@ from pygrgl_spmv.grg.compile import CompiledOperatorState, _invert_permutation
 from pygrgl_spmv.grg.sparse import binary_csr_from_parts
 
 GRG_SPMV_FORMAT_MAGIC = "grg_spmv"
-GRG_SPMV_FORMAT_VERSION = 6
+GRG_SPMV_FORMAT_VERSION = 7
 _FORMAT_MAGIC_KEY = "grg_spmv_magic"
 _FORMAT_VERSION_KEY = "grg_spmv_format_version"
 _LOGGER = logging.getLogger(__name__)
@@ -74,11 +75,35 @@ class ArtifactScan:
     num_levels: int
     selector_mut_nnz: int
     selector_miss_nnz: int
+    has_individual_coals: bool
+    selector_nnz_by_level: np.ndarray
+    node_perm_dtype: np.dtype
+    sample_to_individual_dtype: np.dtype
     blocks: tuple[ArtifactBlockScan, ...]
 
     @property
     def max_block_nnz(self) -> int:
         return max((block.nnz for block in self.blocks), default=0)
+
+    @property
+    def sel_mut_nnz_by_level(self) -> np.ndarray:
+        return self.selector_nnz_by_level[:, 0]
+
+    @property
+    def sel_miss_nnz_by_level(self) -> np.ndarray:
+        return self.selector_nnz_by_level[:, 1]
+
+
+def _selector_nnz_by_level(selector_indices: np.ndarray, level_offsets: np.ndarray) -> np.ndarray:
+    offsets = np.asarray(level_offsets)
+    num_levels = max(int(offsets.size) - 1, 0)
+    indices = np.asarray(selector_indices)
+    if indices.size == 0:
+        return np.zeros((num_levels,), dtype=np.int64)
+    levels = np.searchsorted(offsets, indices, side="right") - 1
+    if np.any(levels < 0) or np.any(levels >= num_levels):
+        raise ValueError("selector indices are outside level_offsets")
+    return np.bincount(levels, minlength=num_levels).astype(np.int64, copy=False)
 
 
 def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
@@ -87,6 +112,15 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
     if state.init_vector_up_bias is None or state.init_vector_down_bias is None:
         raise RuntimeError("init vector bias cache must be populated before .grg_spmv save")
 
+    t0 = time.perf_counter()
+    sel_mut_indices = np.asarray(state.sel_mut.indices)
+    sel_miss_indices = np.asarray(state.sel_miss.indices)
+    level_offsets_arr = np.asarray(state.level_offsets)
+    sel_mut_nnz_by_level = _selector_nnz_by_level(sel_mut_indices, level_offsets_arr)
+    sel_miss_nnz_by_level = _selector_nnz_by_level(sel_miss_indices, level_offsets_arr)
+    selector_nnz_by_level = np.column_stack((sel_mut_nnz_by_level, sel_miss_nnz_by_level)).astype(np.int64, copy=False)
+    node_perm = np.asarray(state.node_perm)
+    sample_to_individual = np.asarray(state.sample_to_individual)
     save_dict = {
         _FORMAT_MAGIC_KEY: np.asarray(GRG_SPMV_FORMAT_MAGIC),
         _FORMAT_VERSION_KEY: np.asarray(GRG_SPMV_FORMAT_VERSION, dtype=np.int32),
@@ -98,8 +132,8 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         "num_edges": np.asarray(state.num_edges, dtype=np.int64),
         "has_missing_data": np.asarray(state.has_missing_data, dtype=bool),
         "level_offsets": np.asarray(state.level_offsets),
-        "node_perm": np.asarray(state.node_perm),
-        "sample_to_individual": np.asarray(state.sample_to_individual),
+        "node_perm": node_perm,
+        "sample_to_individual": sample_to_individual,
         "mutation_positions": np.asarray(state.mutation_positions, dtype=np.float64),
         "mutation_times": np.asarray(state.mutation_times, dtype=np.float64),
         "mutation_alleles": np.asarray(state.mutation_alleles),
@@ -113,9 +147,9 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
             state.init_xtx_up_bias is not None and state.init_xtx_down_bias is not None,
             dtype=bool,
         ),
-        "sel_mut_indices": np.asarray(state.sel_mut.indices),
+        "sel_mut_indices": sel_mut_indices,
         "sel_mut_indptr": np.asarray(state.sel_mut.indptr),
-        "sel_miss_indices": np.asarray(state.sel_miss.indices),
+        "sel_miss_indices": sel_miss_indices,
         "sel_miss_indptr": np.asarray(state.sel_miss.indptr),
     }
     if state.coalescence_counts is not None:
@@ -143,6 +177,12 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
     save_dict["scan_block_nnzs"] = np.asarray(scan_block_nnzs, dtype=np.int64)
     save_dict["scan_block_struct_itemsize"] = np.asarray(scan_block_struct_itemsize, dtype=np.uint8).reshape((-1, 2))
     save_dict["scan_selector_nnzs"] = np.asarray((int(state.sel_mut.nnz), int(state.sel_miss.nnz)), dtype=np.int64)
+    save_dict["scan_selector_nnz_by_level"] = selector_nnz_by_level
+    save_dict["scan_metadata_struct_itemsize"] = np.asarray(
+        (int(node_perm.dtype.itemsize), int(sample_to_individual.dtype.itemsize)),
+        dtype=np.uint8,
+    )
+    num_blocks = len(scan_block_levels)
 
     path = Path(artifact_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,6 +198,10 @@ def save_grg_spmv(state: CompiledOperatorState, artifact_path) -> None:
         tmp_path.unlink(missing_ok=True)
         raise
     _scan_grg_spmv_cached.cache_clear()
+    _LOGGER.debug(
+        "save_grg_spmv path=%s blocks=%d size=%.1fMB elapsed=%.3fs",
+        path, num_blocks, path.stat().st_size / 1e6, time.perf_counter() - t0,
+    )
 
 
 def _open_archive(artifact_path) -> np.lib.npyio.NpzFile:
@@ -175,20 +219,8 @@ def _validate_archive(data: np.lib.npyio.NpzFile, artifact_path) -> None:
     version = int(np.asarray(data[_FORMAT_VERSION_KEY]).item())
     if version != GRG_SPMV_FORMAT_VERSION:
         raise ValueError(
-            f"unsupported .grg_spmv artifact in {artifact_path}: got {version}, expected {GRG_SPMV_FORMAT_VERSION}"
+            f"unsupported .grg_spmv artifact in {artifact_path}: got version {version}, expected {GRG_SPMV_FORMAT_VERSION}"
         )
-
-
-def _log_struct_array(key: str, arr: np.ndarray) -> None:
-    if not _LOGGER.isEnabledFor(logging.INFO):
-        return
-    _LOGGER.info(
-        "artifact array key=%s dtype=%s shape=%s nbytes=%d",
-        key,
-        np.asarray(arr).dtype,
-        tuple(int(v) for v in np.asarray(arr).shape),
-        int(np.asarray(arr).nbytes),
-    )
 
 
 def _load_struct_array(data: np.lib.npyio.NpzFile, key: str, *, non_negative: bool = True) -> np.ndarray:
@@ -197,7 +229,6 @@ def _load_struct_array(data: np.lib.npyio.NpzFile, key: str, *, non_negative: bo
         raise ValueError(f"unsupported structural dtype for {key}: {arr.dtype}")
     if non_negative and arr.size and int(arr.min()) < 0:
         raise ValueError(f"structural array {key} must be non-negative")
-    _log_struct_array(key, arr)
     return arr
 
 
@@ -213,6 +244,7 @@ def _struct_dtype_from_itemsize(itemsize: int) -> np.dtype:
 
 @functools.cache
 def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
+    t0 = time.perf_counter()
     with _open_archive(artifact_path) as data:
         _validate_archive(data, artifact_path)
         level_offsets = _load_struct_array(data, "level_offsets")
@@ -226,6 +258,8 @@ def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
         block_nnzs = np.asarray(data["scan_block_nnzs"])
         block_struct_itemsize = np.asarray(data["scan_block_struct_itemsize"])
         selector_nnzs = np.asarray(data["scan_selector_nnzs"])
+        selector_nnz_by_level = np.asarray(data["scan_selector_nnz_by_level"], dtype=np.int64)
+        metadata_struct_itemsize = np.asarray(data["scan_metadata_struct_itemsize"])
         if block_levels.ndim != 2 or block_levels.shape[1] != 2:
             raise ValueError(f"scan_block_levels must have shape (num_blocks, 2), got {block_levels.shape}")
         if block_shapes.ndim != 2 or block_shapes.shape[1] != 2:
@@ -241,13 +275,23 @@ def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
             raise ValueError("scan block metadata arrays must have matching lengths")
         if selector_nnzs.shape != (2,):
             raise ValueError(f"scan_selector_nnzs must have shape (2,), got {selector_nnzs.shape}")
+        if selector_nnz_by_level.shape != (len(level_sizes), 2):
+            raise ValueError(
+                f"scan_selector_nnz_by_level must have shape ({len(level_sizes)}, 2), got {selector_nnz_by_level.shape}"
+            )
+        if metadata_struct_itemsize.shape != (2,):
+            raise ValueError(f"scan_metadata_struct_itemsize must have shape (2,), got {metadata_struct_itemsize.shape}")
         if (
             (block_levels.size and np.any(block_levels < 0))
             or (block_shapes.size and np.any(block_shapes < 0))
             or (block_nnzs.size and np.any(block_nnzs < 0))
             or np.any(selector_nnzs < 0)
+            or (selector_nnz_by_level.size and np.any(selector_nnz_by_level < 0))
         ):
             raise ValueError("scan metadata arrays must be non-negative")
+        if np.any(selector_nnz_by_level.sum(axis=0) != selector_nnzs):
+            raise ValueError("scan selector metadata arrays must have matching nnz totals")
+        selector_nnz_by_level.setflags(write=False)
         blocks: list[ArtifactBlockScan] = []
         for (dst_level, src_level), shape, nnz, itemsize in zip(
             block_levels,
@@ -266,7 +310,7 @@ def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
                     indptr_dtype=_struct_dtype_from_itemsize(int(itemsize[1])),
                 )
             )
-        return ArtifactScan(
+        result = ArtifactScan(
             path=artifact_path,
             num_samples=int(np.asarray(data["num_samples"]).item()),
             num_mutations=int(np.asarray(data["num_mutations"]).item()),
@@ -281,12 +325,21 @@ def _scan_grg_spmv_cached(artifact_path: Path) -> ArtifactScan:
             num_levels=len(level_sizes),
             selector_mut_nnz=int(selector_nnzs[0]),
             selector_miss_nnz=int(selector_nnzs[1]),
+            has_individual_coals=bool(np.asarray(data["has_individual_coals"]).item()),
+            selector_nnz_by_level=selector_nnz_by_level,
+            node_perm_dtype=_struct_dtype_from_itemsize(int(metadata_struct_itemsize[0])),
+            sample_to_individual_dtype=_struct_dtype_from_itemsize(int(metadata_struct_itemsize[1])),
             blocks=tuple(blocks),
         )
+    _LOGGER.debug(
+        "scan_grg_spmv path=%s blocks=%d elapsed=%.3fs",
+        artifact_path, len(blocks), time.perf_counter() - t0,
+    )
+    return result
 
 
 def scan_grg_spmv(path) -> ArtifactScan:
-    artifact_path = Path(path)
+    artifact_path = Path(path).resolve()
     return _scan_grg_spmv_cached(artifact_path)
 
 
@@ -317,6 +370,7 @@ def iter_artifact_blocks(path):
 
 
 def _load_grg_spmv_host(artifact_path, dtype) -> CompiledOperatorState:
+    t0 = time.perf_counter()
     with _open_archive(artifact_path) as data:
         _validate_archive(data, artifact_path)
 
@@ -351,7 +405,7 @@ def _load_grg_spmv_host(artifact_path, dtype) -> CompiledOperatorState:
             shape=(num_mutations, num_nodes),
         )
 
-        return CompiledOperatorState(
+        result = CompiledOperatorState(
             A_blocks=None,
             level_offsets=level_offsets,
             node_perm=node_perm,
@@ -378,14 +432,22 @@ def _load_grg_spmv_host(artifact_path, dtype) -> CompiledOperatorState:
             init_xtx_up_bias=init_xtx_up_bias,
             init_xtx_down_bias=init_xtx_down_bias,
         )
+    _LOGGER.debug(
+        "_load_grg_spmv_host path=%s dtype=%s elapsed=%.3fs",
+        artifact_path, dtype, time.perf_counter() - t0,
+    )
+    return result
 
 
 def load_grg_spmv(artifact_path, dtype) -> CompiledOperatorState:
+    t0 = time.perf_counter()
     header = _load_grg_spmv_host(artifact_path, dtype)
     num_levels = len(header.level_offsets) - 1
     grids: list[list[object]] = [[] for _ in range(num_levels)]
     wasted_struct_bytes = False
+    num_blocks_loaded = 0
     for block in iter_artifact_blocks(artifact_path):
+        num_blocks_loaded += 1
         while len(grids[block.dst_level]) < block.src_level + 1:
             grids[block.dst_level].append(None)
         loaded = binary_csr_from_parts(
@@ -427,6 +489,10 @@ def load_grg_spmv(artifact_path, dtype) -> CompiledOperatorState:
             RuntimeWarning,
             stacklevel=2,
         )
+    _LOGGER.debug(
+        "load_grg_spmv path=%s dtype=%s blocks=%d elapsed=%.3fs",
+        artifact_path, dtype, num_blocks_loaded, time.perf_counter() - t0,
+    )
     return header
 
 

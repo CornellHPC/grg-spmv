@@ -490,6 +490,7 @@ def test_triton_runtime_exposes_requested_stream_and_stream_ptr(primary_artifact
         assert runtime.stream_ptr == layout.stream_ptr == int(requested.cuda_stream)
         assert int(runtime.stream.cuda_stream) == int(requested.cuda_stream)
         assert len(runtime.grgs) == 1
+        assert runtime.grgs[0].device == layout.device
 
 
 def test_triton_runtime_enter_failure_releases_owned_state(primary_artifact, monkeypatch):

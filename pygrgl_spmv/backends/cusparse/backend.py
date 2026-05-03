@@ -5,9 +5,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 from ctypes import c_void_p
 from dataclasses import dataclass
+import logging
 from pathlib import Path
+import time
 from typing import Any
 import warnings
+
+_LOGGER = logging.getLogger(__name__)
 
 import numpy as np
 import scipy.sparse as sp
@@ -18,6 +22,7 @@ from pygrgl_spmv.backends.base import (
     _copy_struct_checked,
     _layout_struct_dtypes,
     _require_struct_dtype,
+    _struct_dtype_for_bound,
     iter_direction_level_pairs,
     materialize_sparse_block,
     relink_stream_dependencies,
@@ -34,7 +39,7 @@ from pygrgl_spmv.backends.cusparse.ffi import (
 )
 from pygrgl_spmv.backends.types import Direction, InitMode, SparseFormat, StoredMatrix
 from pygrgl_spmv.grg import BoundGRG, RuntimeRequirements, _CudaMatmulSpec
-from pygrgl_spmv.grg.artifact import _load_grg_spmv_host, iter_artifact_blocks, scan_grg_spmv
+from pygrgl_spmv.grg.artifact import ArtifactScan, _load_grg_spmv_host, iter_artifact_blocks, scan_grg_spmv
 
 from .plan import CusparsePlan, CusparsePlanPair, DenseOrder, Operation
 
@@ -434,18 +439,32 @@ def _side_io_rows(pair: CusparsePlanPair, requirements: RuntimeRequirements, *, 
     )
 
 
-def _metadata_bytes(state, pair: CusparsePlanPair, requirements: RuntimeRequirements, dtype: np.dtype) -> int:
-    total = int(np.asarray(state.node_perm).nbytes + np.asarray(state.sample_to_individual).nbytes)
+def _selector_bytes_from_scan(scan: ArtifactScan) -> int:
+    row_dtype = _struct_dtype_for_bound(max(scan.num_mutations - 1, 0))
+    total = 0
+    for level, (mut_nnz, miss_nnz) in enumerate(scan.selector_nnz_by_level):
+        level_size = scan.level_sizes[level]
+        col_dtype = _struct_dtype_for_bound(max(level_size - 1, 0))
+        for nnz in (int(mut_nnz), int(miss_nnz)):
+            total += nnz * row_dtype.itemsize
+            total += nnz * col_dtype.itemsize
+    return total
+
+
+def _metadata_bytes_from_scan(scan: ArtifactScan, pair: CusparsePlanPair, requirements: RuntimeRequirements, dtype: np.dtype) -> int:
+    dtype = np.dtype(dtype)
+    total = int(scan.num_nodes * scan.node_perm_dtype.itemsize)
+    total += int(scan.num_samples * scan.sample_to_individual_dtype.itemsize)
     if requirements.need_init_vector:
         if pair.plan_up is not None:
-            total += int(np.asarray(state.init_vector_up_bias, dtype=dtype).nbytes)
+            total += int(scan.num_mutations * dtype.itemsize)
         if pair.plan_down is not None:
-            total += int(np.asarray(state.init_vector_down_bias, dtype=dtype).nbytes)
-    if requirements.need_init_xtx:
-        if pair.plan_up is not None and state.init_xtx_up_bias is not None:
-            total += int(np.asarray(state.init_xtx_up_bias, dtype=dtype).nbytes)
-        if pair.plan_down is not None and state.init_xtx_down_bias is not None:
-            total += int(np.asarray(state.init_xtx_down_bias, dtype=dtype).nbytes)
+            total += int(scan.num_samples * dtype.itemsize)
+    if requirements.need_init_xtx and scan.has_xtx_bias:
+        if pair.plan_up is not None:
+            total += int(scan.num_mutations * dtype.itemsize)
+        if pair.plan_down is not None:
+            total += int(scan.num_samples * dtype.itemsize)
     return total
 
 
@@ -741,8 +760,10 @@ def plan_cusparse_layout(
         stream_device = _cuda_stream_device(stream_ptr)
         if stream_device != device_id:
             raise ValueError(f"CUDA stream device {stream_device} does not match requested CUDA device {device_id}")
+    t0 = time.perf_counter()
     paths = _resolve_artifacts(artifacts)
     scans = tuple(scan_grg_spmv(path) for path in paths)
+    _LOGGER.debug("plan_cusparse_layout scan artifacts=%d elapsed=%.3fs", len(paths), time.perf_counter() - t0)
     max_levels = max(scan.num_levels for scan in scans)
     max_rows_by_level = tuple(max((scan.level_sizes[level] if level < scan.num_levels else 0) for scan in scans) for level in range(max_levels))
     max_up_ops_by_level = tuple(max(sum(1 for block in scan.blocks if block.nnz > 0 and block.dst_level == level) for scan in scans) for level in range(max_levels))
@@ -769,14 +790,10 @@ def plan_cusparse_layout(
         blocks_down = () if pair.plan_down is None or share_storage else tuple(_block_plan(artifact_index, Direction.DOWN, False, block, pair.plan_down) for block in scan.blocks if block.nnz > 0)
         blocks.extend(blocks_up)
         blocks.extend(blocks_down)
-        state = _load_grg_spmv_host(path, dtype)
-        mut_pairs = split_selector_by_level(state.sel_mut, state.level_offsets)
-        miss_pairs = split_selector_by_level(state.sel_miss, state.level_offsets)
-        selector_bytes += sum(int(rows.nbytes + cols.nbytes) for rows, cols in mut_pairs)
-        selector_bytes += sum(int(rows.nbytes + cols.nbytes) for rows, cols in miss_pairs)
-        metadata_bytes += _metadata_bytes(state, pair, requirements, dtype)
-        if requirements.need_init_xtx and state.coalescence_counts is not None:
-            xtx_bias_bytes += int(state.num_nodes * dtype.itemsize)
+        selector_bytes += _selector_bytes_from_scan(scan)
+        metadata_bytes += _metadata_bytes_from_scan(scan, pair, requirements, dtype)
+        if requirements.need_init_xtx and scan.has_individual_coals:
+            xtx_bias_bytes += int(scan.num_nodes * dtype.itemsize)
         max_block_nnz = max(max_block_nnz, max((block.nnz for block in scan.blocks), default=0))
         planned.append(
             _CuArtifactLayout(
@@ -950,7 +967,7 @@ def plan_cusparse_layout(
             )
     for slot_idx, slot in enumerate(slot_plans):
         budget_items.append(BudgetItem(kind="ring_slot", name="ring_slots", nbytes=int(slot.nbytes), slot=slot_idx))
-    return CusparseLayout(
+    layout = CusparseLayout(
         artifacts=tuple(planned),
         pair=pair,
         dtype=dtype,
@@ -983,6 +1000,11 @@ def plan_cusparse_layout(
         bytes_by_category=bytes_by_category,
         bytes_total=int(sum(item.nbytes for item in budget_items)),
     )
+    _LOGGER.debug(
+        "plan_cusparse_layout done artifacts=%d blocks=%d total_bytes=%.1fMB elapsed=%.3fs",
+        len(paths), len(blocks), layout.bytes_total / 1e6, time.perf_counter() - t0,
+    )
+    return layout
 
 
 class CusparseRuntime:
@@ -1144,8 +1166,10 @@ class CusparseRuntime:
         self.stream = None
 
     def __enter__(self) -> "CusparseRuntime":
+        t_enter = time.perf_counter()
         artifacts: list[_CuArtifact] = []
         try:
+            t_alloc = time.perf_counter()
             with self.device:
                 self._cslib = CuSparseLib()
                 self._caller_stream = self._make_caller_stream()
@@ -1229,12 +1253,24 @@ class CusparseRuntime:
                     ]
                     self._ext_main_down = [None if size == 0 else self._cp.zeros((size,), dtype=self._cp.uint8) for size in self.layout.ext_main_down]
                     self._ext_scratch_down = [[None if size == 0 else self._cp.zeros((size,), dtype=self._cp.uint8) for size in row] for row in self.layout.ext_scratch_down]
+            _LOGGER.debug("CusparseRuntime.__enter__ gpu_alloc elapsed=%.3fs", time.perf_counter() - t_alloc)
+            t_load = time.perf_counter()
             states = tuple(_load_grg_spmv_host(artifact.path, self.layout.dtype) for artifact in self.layout.artifacts)
+            _LOGGER.debug(
+                "CusparseRuntime.__enter__ host_load artifacts=%d elapsed=%.3fs",
+                len(self.layout.artifacts), time.perf_counter() - t_load,
+            )
+            t_build = time.perf_counter()
             for artifact_layout, state in zip(self.layout.artifacts, states, strict=True):
                 artifacts.append(self._build_artifact(artifact_layout, state))
+            _LOGGER.debug(
+                "CusparseRuntime.__enter__ build_artifacts artifacts=%d elapsed=%.3fs",
+                len(artifacts), time.perf_counter() - t_build,
+            )
             self._artifacts = tuple(artifacts)
-            self._grgs = tuple(BoundGRG(self, idx, artifact.state, artifact.path) for idx, artifact in enumerate(self._artifacts))
+            self._grgs = tuple(BoundGRG(self, idx, artifact.state, artifact.path, self.layout.device) for idx, artifact in enumerate(self._artifacts))
             self._entered = True
+            _LOGGER.debug("CusparseRuntime.__enter__ total elapsed=%.3fs", time.perf_counter() - t_enter)
             return self
         except Exception:
             self._release_owned_state(artifacts)

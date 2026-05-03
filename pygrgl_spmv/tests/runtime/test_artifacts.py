@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from pygrgl_spmv import ReferenceRuntime
+from pygrgl_spmv.backends.base import split_selector_by_level
 import pygrgl_spmv.grg.artifact as artifact_module
 from pygrgl_spmv.grg.artifact import (
     GRG_SPMV_FORMAT_MAGIC,
@@ -35,6 +36,18 @@ def test_scan_matches_loaded_state(primary_artifact):
     assert scan.has_xtx_bias == bool(state.init_xtx_up_bias is not None and state.init_xtx_down_bias is not None)
     np.testing.assert_array_equal(scan.level_offsets, state.level_offsets)
     assert scan.num_levels == len(state.level_offsets) - 1
+    assert scan.has_individual_coals == (state.coalescence_counts is not None)
+    assert scan.node_perm_dtype == state.node_perm.dtype
+    assert scan.sample_to_individual_dtype == state.sample_to_individual.dtype
+    assert scan.selector_nnz_by_level.shape == (scan.num_levels, 2)
+    assert int(scan.selector_nnz_by_level[:, 0].sum()) == scan.selector_mut_nnz
+    assert int(scan.selector_nnz_by_level[:, 1].sum()) == scan.selector_miss_nnz
+    mut_pairs = split_selector_by_level(state.sel_mut, state.level_offsets)
+    miss_pairs = split_selector_by_level(state.sel_miss, state.level_offsets)
+    for level, (rows, _) in enumerate(mut_pairs):
+        assert int(scan.selector_nnz_by_level[level, 0]) == rows.size
+    for level, (rows, _) in enumerate(miss_pairs):
+        assert int(scan.selector_nnz_by_level[level, 1]) == rows.size
 
     loaded_blocks = {(dst_level, src_level): block for dst_level, row in enumerate(state.A_blocks or []) for src_level, block in enumerate(row)}
     assert len(scan.blocks) == len(loaded_blocks)
@@ -144,13 +157,26 @@ def test_saved_artifact_is_uncompressed_and_has_direct_scan_metadata(primary_art
             "scan_block_nnzs",
             "scan_block_struct_itemsize",
             "scan_selector_nnzs",
+            "scan_selector_nnz_by_level",
+            "scan_metadata_struct_itemsize",
         ):
             assert key in data.files
         assert np.asarray(data["scan_block_levels"]).ndim == 2
         assert np.asarray(data["scan_block_levels"]).shape[1] == 2
         assert np.asarray(data["scan_block_shapes"]).shape[1] == 2
         assert np.asarray(data["scan_block_struct_itemsize"]).shape[1] == 2
+        assert np.asarray(data["scan_selector_nnz_by_level"]).shape[1] == 2
+        assert np.asarray(data["scan_metadata_struct_itemsize"]).shape == (2,)
     assert not any(name.startswith("A_blocks_") and name.endswith("_shape.npy") for name in names)
+    assert not any(name.startswith("A_blocks_") and name.endswith("_nnz.npy") for name in names)
+    assert not any(name.startswith("A_blocks_") and name.endswith("_indices_dtype.npy") for name in names)
+    assert not any(name.startswith("A_blocks_") and name.endswith("_indptr_dtype.npy") for name in names)
+    assert "sel_mut_nnz.npy" not in names
+    assert "sel_miss_nnz.npy" not in names
+    assert "sel_mut_nnz_by_level.npy" not in names
+    assert "sel_miss_nnz_by_level.npy" not in names
+    assert "init_vector_up_bias_size.npy" not in names
+    assert "init_vector_down_bias_size.npy" not in names
 
 
 def test_scan_uses_direct_metadata_without_loading_block_or_selector_arrays(tmp_path, monkeypatch):
@@ -177,16 +203,17 @@ def test_scan_uses_direct_metadata_without_loading_block_or_selector_arrays(tmp_
     ]
 
 
-def test_v5_artifacts_are_rejected(tmp_path):
+@pytest.mark.parametrize("version", [5, 6])
+def test_old_artifacts_are_rejected(tmp_path, version):
     artifact = tmp_path / "old.grg_spmv"
     with artifact.open("wb") as handle:
         np.savez(
             handle,
             grg_spmv_magic=np.asarray(GRG_SPMV_FORMAT_MAGIC),
-            grg_spmv_format_version=np.asarray(5, dtype=np.int32),
+            grg_spmv_format_version=np.asarray(version, dtype=np.int32),
         )
 
-    with pytest.raises(ValueError, match=f"got 5, expected {GRG_SPMV_FORMAT_VERSION}"):
+    with pytest.raises(ValueError, match=f"got version {version}, expected {GRG_SPMV_FORMAT_VERSION}"):
         scan_grg_spmv(artifact)
 
 

@@ -33,7 +33,7 @@ from pygrgl_spmv.backends.triton.kernel import (
 )
 from pygrgl_spmv.backends.types import Direction, InitMode, SparseFormat, StoredMatrix, transpose_compatible_format
 from pygrgl_spmv.grg import BoundGRG, RuntimeRequirements, _CudaMatmulSpec
-from pygrgl_spmv.grg.artifact import _load_grg_spmv_host, iter_artifact_blocks, scan_grg_spmv
+from pygrgl_spmv.grg.artifact import ArtifactScan, _load_grg_spmv_host, iter_artifact_blocks, scan_grg_spmv
 
 from .plan import TritonPlan, TritonPlanPair
 
@@ -318,19 +318,25 @@ def _side_io_rows(pair: TritonPlanPair, requirements: RuntimeRequirements, *, ma
     )
 
 
-def _metadata_bytes(state, pair: TritonPlanPair, requirements: RuntimeRequirements, dtype: np.dtype) -> int:
+def _selector_bytes_from_scan(scan: ArtifactScan) -> int:
     long_itemsize = int(np.dtype(np.int64).itemsize)
-    total = int((state.num_nodes + state.num_samples) * long_itemsize)
+    return int(np.asarray(scan.selector_nnz_by_level, dtype=np.int64).sum() * 2 * long_itemsize)
+
+
+def _metadata_bytes_from_scan(scan: ArtifactScan, pair: TritonPlanPair, requirements: RuntimeRequirements, dtype: np.dtype) -> int:
+    dtype = np.dtype(dtype)
+    long_itemsize = int(np.dtype(np.int64).itemsize)
+    total = int((scan.num_nodes + scan.num_samples) * long_itemsize)
     if requirements.need_init_vector:
         if pair.plan_up is not None:
-            total += int(np.asarray(state.init_vector_up_bias, dtype=dtype).nbytes)
+            total += int(scan.num_mutations * dtype.itemsize)
         if pair.plan_down is not None:
-            total += int(np.asarray(state.init_vector_down_bias, dtype=dtype).nbytes)
-    if requirements.need_init_xtx:
-        if pair.plan_up is not None and state.init_xtx_up_bias is not None:
-            total += int(np.asarray(state.init_xtx_up_bias, dtype=dtype).nbytes)
-        if pair.plan_down is not None and state.init_xtx_down_bias is not None:
-            total += int(np.asarray(state.init_xtx_down_bias, dtype=dtype).nbytes)
+            total += int(scan.num_samples * dtype.itemsize)
+    if requirements.need_init_xtx and scan.has_xtx_bias:
+        if pair.plan_up is not None:
+            total += int(scan.num_mutations * dtype.itemsize)
+        if pair.plan_down is not None:
+            total += int(scan.num_samples * dtype.itemsize)
     return total
 
 
@@ -390,15 +396,11 @@ def plan_triton_layout(
     selector_bytes = 0
     metadata_bytes = 0
     xtx_bias_bytes = 0
-    long_itemsize = int(np.dtype(np.int64).itemsize)
-    for path in paths:
-        state = _load_grg_spmv_host(path, dtype)
-        sel_mut = state.sel_mut.tocoo()
-        sel_miss = state.sel_miss.tocoo()
-        selector_bytes += int((sel_mut.row.size + sel_mut.col.size + sel_miss.row.size + sel_miss.col.size) * long_itemsize)
-        metadata_bytes += _metadata_bytes(state, pair, requirements, dtype)
-        if requirements.need_init_xtx and state.coalescence_counts is not None:
-            xtx_bias_bytes += int(state.num_nodes * dtype.itemsize)
+    for scan in scans:
+        selector_bytes += _selector_bytes_from_scan(scan)
+        metadata_bytes += _metadata_bytes_from_scan(scan, pair, requirements, dtype)
+        if requirements.need_init_xtx and scan.has_individual_coals:
+            xtx_bias_bytes += int(scan.num_nodes * dtype.itemsize)
 
     max_k = _enabled_max_k(pair, requirements)
     state_bytes = int(max_num_nodes * max_k * dtype.itemsize)
@@ -748,7 +750,7 @@ class TritonRuntime:
             for artifact_layout, state in zip(self.layout.artifacts, states, strict=True):
                 artifacts.append(self._build_artifact(artifact_layout, state))
             self._artifacts = tuple(artifacts)
-            self._grgs = tuple(BoundGRG(self, idx, artifact.state, artifact.path) for idx, artifact in enumerate(self._artifacts))
+            self._grgs = tuple(BoundGRG(self, idx, artifact.state, artifact.path, self.layout.device) for idx, artifact in enumerate(self._artifacts))
             if self.layout.pair.plan_up is not None:
                 self._config_up = self._tune_direction(Direction.UP)
             if self.layout.pair.plan_down is not None:

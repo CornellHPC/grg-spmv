@@ -213,7 +213,11 @@ def test_cusparse_layout_planning_uses_sparse_metadata_only(tmp_path, monkeypatc
     def _fail_sparse_block_read(_path):
         raise AssertionError("cuSPARSE layout planning should not read sparse block arrays")
 
+    def _fail_host_load(*_args, **_kwargs):
+        raise AssertionError("cuSPARSE layout planning should not load artifact selectors")
+
     monkeypatch.setattr("pygrgl_spmv.backends.cusparse.backend.iter_artifact_blocks", _fail_sparse_block_read)
+    monkeypatch.setattr("pygrgl_spmv.backends.cusparse.backend._load_grg_spmv_host", _fail_host_load)
     layout = build_cusparse_layout([artifact], requirements=_requirements(2))
     assert layout.max_levels == 3
     assert len(layout.ext_main_up) == layout.max_levels
@@ -693,6 +697,7 @@ def test_cusparse_runtime_exposes_requested_stream_and_stream_ptr(primary_artifa
         assert runtime.stream_ptr == layout.stream_ptr == int(requested.ptr)
         assert int(runtime.stream.ptr) == int(requested.ptr)
         assert len(runtime.grgs) == 1
+        assert runtime.grgs[0].device == layout.device
 
 
 def test_cusparse_runtime_reusable_across_context_cycles(primary_artifact, primary_grg):

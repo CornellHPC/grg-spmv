@@ -9,4 +9,4 @@ Parent docs: [Project README](../../README.md)
 - the compile pipeline in [compile.py](compile.py)
 - the internal `BoundGRG` host-side API logic in [__init__.py](__init__.py)
 
-`.grg_spmv` v6 artifacts are uncompressed and store scan metadata directly for fast metadata reads.
+`.grg_spmv` v7 artifacts are uncompressed. Their header metadata is sufficient for layout planning without loading sparse block or selector arrays.
