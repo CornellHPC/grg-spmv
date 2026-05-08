@@ -153,16 +153,23 @@ def split_selector_by_level(
     selector: sp.csr_matrix,
     level_offsets: np.ndarray,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    out: list[tuple[np.ndarray, np.ndarray]] = []
+    coo = selector.tocoo()
+    all_rows = np.asarray(coo.row)
+    all_cols = np.asarray(coo.col)
+    sort_idx = np.argsort(all_cols, kind="stable")
+    sorted_rows = all_rows[sort_idx]
+    sorted_cols = all_cols[sort_idx]
     row_dtype = _struct_dtype_for_bound(max(int(selector.shape[0]) - 1, 0))
     offsets = np.asarray(level_offsets, dtype=np.int64)
+    out: list[tuple[np.ndarray, np.ndarray]] = []
     for level in range(len(offsets) - 1):
         lo = int(offsets[level])
         hi = int(offsets[level + 1])
-        block = selector[:, lo:hi].tocoo()
+        start = int(np.searchsorted(sorted_cols, lo))
+        end = int(np.searchsorted(sorted_cols, hi))
         col_dtype = _struct_dtype_for_bound(max(hi - lo - 1, 0))
-        rows = np.asarray(block.row, dtype=row_dtype)
-        cols = np.asarray(block.col, dtype=col_dtype)
+        rows = sorted_rows[start:end].astype(row_dtype, copy=False)
+        cols = (sorted_cols[start:end] - lo).astype(col_dtype, copy=False)
         out.append((rows, cols))
     return out
 
