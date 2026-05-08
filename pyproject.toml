@@ -41,6 +41,7 @@ dev = [
     "seaborn>=0.13.2",
     "igdtools>=2.6",
     "pandas>=2.3.3",
+    "grg-pheno-sim>=1.4",
 ]
 
 [tool.hatch.build.targets.wheel]

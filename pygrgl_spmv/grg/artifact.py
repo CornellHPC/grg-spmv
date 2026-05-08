@@ -17,7 +17,7 @@ from pygrgl_spmv.grg.compile import CompiledOperatorState, _invert_permutation
 from pygrgl_spmv.grg.sparse import binary_csr_from_parts
 
 GRG_SPMV_FORMAT_MAGIC = "grg_spmv"
-GRG_SPMV_FORMAT_VERSION = 7
+GRG_SPMV_FORMAT_VERSION = 8
 _FORMAT_MAGIC_KEY = "grg_spmv_magic"
 _FORMAT_VERSION_KEY = "grg_spmv_format_version"
 _LOGGER = logging.getLogger(__name__)

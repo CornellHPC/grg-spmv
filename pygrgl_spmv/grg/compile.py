@@ -323,32 +323,23 @@ def _build_coalescence_counts(grg, *, node_perm: np.ndarray) -> np.ndarray | Non
     return counts_orig[node_perm]
 
 
-_NUCLEOTIDE_ENCODE = {"A": 0b00, "T": 0b01, "C": 0b10, "G": 0b11}
-
-
 def _encode_alleles(alleles: list[str]) -> tuple[np.ndarray, np.ndarray]:
-    """Pack variable-length allele strings into a 2-bit-per-nucleotide uint8 buffer with CSR offsets."""
+    """Pack variable-length allele strings into a UTF-8 uint8 buffer with CSR offsets."""
     n = len(alleles)
     offsets = np.empty(n + 1, dtype=np.uint32)
     offsets[0] = 0
 
     total = 0
+    encoded: list[bytes] = []
     for i, allele_str in enumerate(alleles):
-        for ch in allele_str:
-            if ch not in _NUCLEOTIDE_ENCODE:
-                raise ValueError(f"Non-ATCG character {ch!r} in allele at index {i}: {allele_str!r}")
-        total += len(allele_str)
+        payload = str(allele_str).encode("utf-8")
+        encoded.append(payload)
+        total += len(payload)
         if total > np.iinfo(np.uint32).max:
-            raise ValueError(f"Allele offset overflow at index {i}: total nucleotide count {total} exceeds uint32 max")
+            raise ValueError(f"Allele offset overflow at index {i}: total byte count {total} exceeds uint32 max")
         offsets[i + 1] = total
 
-    buf = np.zeros((total + 3) // 4, dtype=np.uint8)
-    pos = 0
-    for allele_str in alleles:
-        for ch in allele_str:
-            buf[pos // 4] |= np.uint8(_NUCLEOTIDE_ENCODE[ch] << ((pos % 4) * 2))
-            pos += 1
-
+    buf = np.frombuffer(b"".join(encoded), dtype=np.uint8).copy()
     return buf, offsets
 
 

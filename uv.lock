@@ -1304,6 +1304,7 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "grapp" },
+    { name = "grg-pheno-sim" },
     { name = "igdtools" },
     { name = "matplotlib" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1321,6 +1322,7 @@ gpu = [
 requires-dist = [
     { name = "cupy-cuda12x", marker = "extra == 'gpu'", specifier = ">=13.6.0" },
     { name = "grapp", marker = "extra == 'dev'", specifier = ">=0.3" },
+    { name = "grg-pheno-sim", marker = "extra == 'dev'", specifier = ">=1.4" },
     { name = "igdtools", marker = "extra == 'dev'", specifier = ">=2.6" },
     { name = "matplotlib", marker = "extra == 'dev'", specifier = ">=3.10.8" },
     { name = "numpy", specifier = ">=1.26.0" },

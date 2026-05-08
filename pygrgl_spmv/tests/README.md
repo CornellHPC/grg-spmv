@@ -39,7 +39,7 @@ The suite protects five things:
 - `test_bench_scripts.py`
   - Minimal benchmark runner loop counts and reporting contract.
 - `test_bolt_lmm_inf.py`
-  - BOLT-LMM-inf script math contracts, including CG solves, dense GPU formula parity, synthetic null/infinitesimal validation, scan summaries, effect checks, monomorphic SNP skipping, and CUDA device restoration.
+  - CPU Boost RNG and phenotype-simulator determinism guards plus GPU/cuSPARSE 1000 Genomes chr19-22 covariate-aware BOLT-LMM-inf smoke against official BOLT v2.5; parses stdout and `summary.json`, requires 128 matched/model SNPs with generated `PC1`-`PC20` and `SEX` covariates, and enforces strict comparison thresholds in the test.
 - `runtime/test_convert.py`
   - `convert()` path/object behavior, artifact writing, init-bias persistence, and down-edge-only compilation.
 - `runtime/test_artifacts.py`

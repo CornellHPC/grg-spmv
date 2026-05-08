@@ -218,9 +218,9 @@ def _build_band_csr(n: int, bandwidth: int, shift: int, dtype: np.dtype) -> sp.c
 
 
 def _allele_tables(num_mutations: int) -> tuple[np.ndarray, np.ndarray]:
-    offsets = np.arange(num_mutations + 1, dtype=np.int32)
-    packed = np.zeros((max((num_mutations + 3) // 4, 1),), dtype=np.uint8)
-    return packed, offsets
+    offsets = np.arange(num_mutations + 1, dtype=np.uint32)
+    data = np.frombuffer(b"A" * int(num_mutations), dtype=np.uint8).copy()
+    return data, offsets
 
 
 def _identity_permutation(num_nodes: int, struct_dtype: np.dtype) -> tuple[np.ndarray, np.ndarray]:

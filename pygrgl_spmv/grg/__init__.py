@@ -20,7 +20,6 @@ from pygrgl_spmv.grg.compile import CompiledOperatorState, compile_grg
 if TYPE_CHECKING:
     from pygrgl_spmv.backends.reference import ReferenceLayout, ReferenceRuntime
 
-_NUCLEOTIDE_DECODE = ["A", "T", "C", "G"]
 _COMPILE_LOGGER = logging.getLogger("pygrgl_spmv.grg.compile")
 
 
@@ -58,10 +57,7 @@ class _CudaMatmulSpec:
 def _decode_allele(data: np.ndarray, offsets: np.ndarray, idx: int) -> str:
     start = int(offsets[idx])
     end = int(offsets[idx + 1])
-    return "".join(
-        _NUCLEOTIDE_DECODE[(int(data[j // 4]) >> ((j % 4) * 2)) & 0b11]
-        for j in range(start, end)
-    )
+    return bytes(np.asarray(data[start:end], dtype=np.uint8)).decode("utf-8")
 
 
 def _validate_runtime_requirements(

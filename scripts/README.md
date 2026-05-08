@@ -7,7 +7,6 @@ The benchmark surface is intentionally minimal and runtime-centric.
 - `python -m scripts.bench.mkl`
 - `python -m scripts.bench.triton`
 - `python -m scripts.bench.cusparse`
-- `python -m scripts.bolt_lmm_inf`
 
 Use them as:
 
@@ -45,38 +44,33 @@ cuSPARSE-only flags:
 `PLAN` may be a named preset or a JSON object with `plan_up` and `plan_down` fields accepted by `CusparsePlanPair.from_dicts(...)`.
 The default is `exhaustive-best`, selected from an exhaustive CSR/CSC cuSPARSE sweep with `float64`, `scratch=none`, and residency allowed.
 
-## BOLT-LMM-inf GRG Benchmark
+## BOLT-LMM-inf Reference Comparison
 
-`python -m scripts.bolt_lmm_inf` runs the lean BOLT-LMM-inf workload against chromosome GRG artifacts with the cuSPARSE backend. It writes a key/value summary TSV and does not write per-SNP association text.
+`python -m scripts.bolt_lmm_inf` is now a reference-comparison driver for the GRG BOLT-LMM-inf prototype. It prepares matched GRG/PLINK inputs, builds or preflights official BOLT-LMM v2.5, simulates a phenotype, runs official `--lmmInfOnly`, runs the local GRG implementation, and writes per-SNP comparison output.
 
-Raw GRG quick start:
+The GRG path is intentionally BOLT-parity oriented: solver control flow and stats formatting are kept close to official BOLT-LMM rather than adding local numerical guards.
 
-```bash
-uv run python -u -m scripts.bolt_lmm_inf \
-  --grg-dir /global/cfs/projectdirs/m4341/grg/sim/500k/grg \
-  --artifact-cache /path/to/cache \
-  --phenotype-mode null \
-  --summary-file bolt_summary.tsv
-```
-
-The default chromosome selection is `--chromosomes all`, meaning every discovered raw `chr*.grg` or every labeled direct artifact. Use `--chromosomes 21,22` to narrow a run.
-
-Direct artifact quick start:
+The recommended 1000 Genomes smoke uses chr19-22 GRG/PLINK files, with 32 sampled singleton GRG/BIM matches per chromosome:
 
 ```bash
 uv run python -u -m scripts.bolt_lmm_inf \
-  --artifacts /path/to/chr21.grg_spmv /path/to/chr22.grg_spmv \
-  --chromosomes 21,22 \
-  --summary-file bolt_summary.tsv
+  --workDir "$SCRATCH/bolt_lmm_inf_1000genome_chr19_22" \
+  --artifactCache "$SCRATCH/grg/pygrgl_spmv_artifacts" \
+  --grgDir /global/cfs/projectdirs/m4341/grg/1000genome \
+  --plinkDir /global/cfs/projectdirs/m4341/grg/1000genome/plink \
+  --chromosomes 19,20,21,22 \
+  --snpsPerChrom 32 \
+  --seed 12345 \
+  --simH2 0.3 \
+  --numThreads "$(nproc)" \
+  --device 0 \
+  --vramBudgetBytes 0 \
+  --ringBufferSize 0 \
+  --logLevel INFO \
+  --covarMaxLevels 10
 ```
 
-Artifact selection rules:
-
-- `--grg-dir` discovers raw `chr*.grg` files and requires `--artifact-cache`; missing `.grg_spmv` artifacts are converted lazily.
-- `--artifacts` bypasses discovery and conversion, and is mutually exclusive with `--grg-dir`.
-- Direct artifacts must be either all `chr<num>`-labeled, or all unlabeled with one explicit `--chromosomes` label per path.
-
-See [bolt_lmm_inf/README.md](bolt_lmm_inf/README.md) for algorithm details, validation expectations, and the summary metric reference.
+The old key/value summary benchmark contract has been removed. `--grgDir`, `--plinkDir`, and `--chromosomes` select the source data, `--snpsPerChrom` controls random singleton-match sampling per chromosome (`0` means all singleton matches), and `--simH2` controls the simulated phenotype heritability. Without `--covarFile`, the driver caches `PC1`-`PC20` and `SEX` under `inputs/covariates.tsv` and forwards those covariates to both official BOLT and the GRG path. Outputs are written under `--workDir`, including filtered PLINK inputs, `inputs/run_manifest.tsv`, `inputs/covariates.tsv`, `inputs/pheno.tsv`, `bolt.log`, `bolt.stats`, `grg.stats`, and `summary.json`; the script prints one JSON summary to stdout and reports comparison errors without threshold-gating CLI exit status. See [bolt_lmm_inf/README.md](bolt_lmm_inf/README.md) for details.
 
 ## PCA Benchmark
 
@@ -85,7 +79,7 @@ See [bolt_lmm_inf/README.md](bolt_lmm_inf/README.md) for algorithm details, vali
 Full benchmark:
 
 ```bash
-uv run python -u -m scripts.pca_bench --artifact /pscratch/sd/q/qys/grg/pygrgl_spmv_artifacts/_abs/pscratch/sd/q/qys/grg/simulation-mutation-200m.trees.v4.igd.final.grg_spmv --pcs 20
+uv run python -u -m scripts.pca_bench --artifact "$SCRATCH/grg/pygrgl_spmv_artifacts/example.grg_spmv" --pcs 20
 ```
 
 The randomized Rayleigh-Ritz solver defaults to `--rr-oversample 40 --rr-power-iters 10`. LOBPCG methods are reported as `status=skipped` when local SciPy/CuPy would switch to their dense fallback (`num_mutations < 5 * pcs`).
