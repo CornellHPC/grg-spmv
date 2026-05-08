@@ -5,6 +5,7 @@ import zipfile
 
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
 from pygrgl_spmv import ReferenceRuntime
 from pygrgl_spmv.backends.base import split_selector_by_level
@@ -19,6 +20,54 @@ from pygrgl_spmv.grg.artifact import (
 )
 from pygrgl_spmv.tests.runtime._runtime_builders import build_reference_layout
 from pygrgl_spmv.tests.runtime._streaming_cases import write_three_level_band_artifact
+
+
+def test_split_selector_by_level_reconstructs_unsorted_selector_with_empty_level():
+    level_offsets = np.asarray([0, 3, 3, 7, 10], dtype=np.int64)
+    selector_rows = np.asarray([2, 0, 2, 1, 2, 0], dtype=np.int64)
+    selector_cols = np.asarray([8, 1, 4, 6, 2, 9], dtype=np.int64)
+    selector = sp.csr_matrix(
+        (np.ones(selector_rows.size, dtype=np.int8), (selector_rows, selector_cols)),
+        shape=(4, 10),
+    )
+
+    pairs = split_selector_by_level(selector, level_offsets)
+
+    assert pairs[1][0].size == 0
+    assert pairs[1][1].size == 0
+
+    reconstructed_rows = []
+    reconstructed_cols = []
+    for level, (rows, cols) in enumerate(pairs):
+        reconstructed_rows.append(rows)
+        reconstructed_cols.append(cols.astype(np.int64, copy=False) + int(level_offsets[level]))
+    reconstructed = sp.csr_matrix(
+        (
+            np.ones(selector.nnz, dtype=np.int8),
+            (np.concatenate(reconstructed_rows), np.concatenate(reconstructed_cols)),
+        ),
+        shape=selector.shape,
+    )
+
+    np.testing.assert_array_equal(reconstructed.toarray(), selector.toarray())
+
+
+def test_split_selector_by_level_uses_wide_column_dtype_for_wide_level():
+    wide_col = int(np.iinfo(np.int32).max) + 1
+    selector = sp.csr_matrix(
+        (
+            np.ones(1, dtype=np.int8),
+            (np.asarray([0], dtype=np.int64), np.asarray([wide_col], dtype=np.int64)),
+        ),
+        shape=(1, wide_col + 1),
+    )
+
+    ((rows, cols),) = split_selector_by_level(selector, np.asarray([0, wide_col + 1], dtype=np.int64))
+
+    assert rows.dtype == np.dtype(np.int32)
+    assert cols.dtype == np.dtype(np.int64)
+    np.testing.assert_array_equal(rows, np.asarray([0], dtype=np.int32))
+    np.testing.assert_array_equal(cols, np.asarray([wide_col], dtype=np.int64))
 
 
 def test_scan_matches_loaded_state(primary_artifact):

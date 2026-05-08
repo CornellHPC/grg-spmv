@@ -154,22 +154,23 @@ def split_selector_by_level(
     level_offsets: np.ndarray,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     coo = selector.tocoo()
-    all_rows = np.asarray(coo.row)
-    all_cols = np.asarray(coo.col)
-    sort_idx = np.argsort(all_cols, kind="stable")
-    sorted_rows = all_rows[sort_idx]
-    sorted_cols = all_cols[sort_idx]
-    row_dtype = _struct_dtype_for_bound(max(int(selector.shape[0]) - 1, 0))
+    selector_rows = np.asarray(coo.row)
+    selector_cols = np.asarray(coo.col)
+    order = np.argsort(selector_cols, kind="stable")
+    sorted_rows = selector_rows[order]
+    sorted_cols = selector_cols[order]
+    selector_row_dtype = _struct_dtype_for_bound(max(int(selector.shape[0]) - 1, 0))
     offsets = np.asarray(level_offsets, dtype=np.int64)
+    level_bounds = np.searchsorted(sorted_cols, offsets)
     out: list[tuple[np.ndarray, np.ndarray]] = []
-    for level in range(len(offsets) - 1):
+    for level, (start, end) in enumerate(zip(level_bounds[:-1], level_bounds[1:], strict=True)):
         lo = int(offsets[level])
         hi = int(offsets[level + 1])
-        start = int(np.searchsorted(sorted_cols, lo))
-        end = int(np.searchsorted(sorted_cols, hi))
-        col_dtype = _struct_dtype_for_bound(max(hi - lo - 1, 0))
-        rows = sorted_rows[start:end].astype(row_dtype, copy=False)
-        cols = (sorted_cols[start:end] - lo).astype(col_dtype, copy=False)
+        level_size = hi - lo
+        col_dtype = _struct_dtype_for_bound(max(level_size - 1, 0))
+        rows = sorted_rows[start:end].astype(selector_row_dtype, copy=False)
+        cols = np.empty(end - start, dtype=col_dtype)
+        np.subtract(sorted_cols[start:end], lo, out=cols, casting="unsafe")
         out.append((rows, cols))
     return out
 
