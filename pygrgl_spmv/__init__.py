@@ -13,6 +13,7 @@ from pygrgl_spmv.adaptor import (
     make_backend_cusparse,
     make_runconfig_matmul,
     make_runconfig_pca,
+    make_runconfig_bolt,
     load_grg_spmv_single,
     load_grg_spmv_multi,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "make_backend_cusparse",
     "make_runconfig_matmul",
     "make_runconfig_pca",
+    "make_runconfig_bolt",
     "load_grg_spmv_single",
     "load_grg_spmv_multi",
 ]

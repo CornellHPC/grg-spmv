@@ -37,30 +37,247 @@ class CapturedBoundGRG:
     cupy.ndarray on device — no host transfers occur.
     """
 
-    def __init__(self, grg, prepared_ops, graphs, src_tensors, init_tensors, capture_stream, *, native=False):
+    def __init__(self, grg, prepared_ops, graphs, src_tensors, init_tensors, miss_tensors, capture_stream, *, native=False):
         self._grg = grg
-        self._prepared_ops = prepared_ops  # dict[(direction, by_individual), PreparedOp]
-        self._graphs = graphs              # dict[(direction, by_individual), CUDAGraph]
-        self._src_tensors = src_tensors    # dict[(direction, by_individual), torch.Tensor]
-        self._init_tensors = init_tensors  # dict[(direction, by_individual), torch.Tensor]
+        self._prepared_ops = prepared_ops  # dict[key, PreparedOp]
+        self._graphs = graphs              # dict[key, CUDAGraph]
+        self._src_tensors = src_tensors    # dict[key, torch.Tensor]
+        self._init_tensors = init_tensors  # dict[key, torch.Tensor]
+        self._miss_tensors = miss_tensors  # dict[key, torch.Tensor]
         self._capture_stream = capture_stream
         self._native = native
+
+    @property
+    def use_cupy(self):
+        return self._native
 
     def __getattr__(self, name):
         if name == "_grg":
             raise AttributeError(name)
         return getattr(self._grg, name)
 
-    def _key(self, direction, by_individual):
-        k = (direction, by_individual)
-        return k if k in self._src_tensors else direction
+    def _key(self, direction, by_individual, init_mode="none", use_miss=False):
+        k = (direction, by_individual, init_mode, use_miss)
+        return k if k in self._src_tensors else (direction, by_individual, "none", False)
 
-    def matmul(self, input, direction, emit_all_nodes=False, by_individual=False, init=None, miss=None):
-        """Graph replay. Input/output are numpy arrays (copy mode) or GPU tensors/cupy arrays (native mode)."""
+    @staticmethod
+    def _to_np_dtype(d):
+        if isinstance(d, np.dtype):
+            return d
+        mod = getattr(type(d), "__module__", "")
+        if mod.startswith("torch"):
+            import torch
+            _map = {
+                torch.float32: np.float32,
+                torch.float64: np.float64,
+                torch.int32:   np.int32,
+            }
+            if d not in _map:
+                raise TypeError(f"unsupported torch dtype {d!r}")
+            return np.dtype(_map[d])
+        return np.dtype(d)
+
+    def _validate_array(self, arr, *, name, role, expected_shape, expected_dtype, expected_device):
+        """Validate one input array against expected shape/dtype/device.
+
+        expected_device: torch.device (native mode) or None (copy mode → numpy).
+        role: 'input' | 'init' | 'miss-in' | 'miss-out' (for error wording).
+        """
+        if arr is None:
+            raise ValueError(f"matmul(): {name} ({role}) is required but got None")
+
+        import torch
+        try:
+            import cupy as cp
+            _cp_ndarray = cp.ndarray
+        except Exception:
+            _cp_ndarray = ()
+
+        exp_np_dtype = self._to_np_dtype(expected_dtype)
+
+        if expected_device is not None:
+            if isinstance(arr, torch.Tensor):
+                if not arr.is_cuda:
+                    raise TypeError(
+                        f"matmul(): {name} ({role}) expected GPU tensor on {expected_device}, "
+                        f"got CPU torch.Tensor"
+                    )
+                if arr.device != expected_device:
+                    raise TypeError(
+                        f"matmul(): {name} ({role}) expected device {expected_device}, "
+                        f"got torch tensor on {arr.device}"
+                    )
+                actual_np_dtype = self._to_np_dtype(arr.dtype)
+            elif _cp_ndarray and isinstance(arr, _cp_ndarray):
+                if arr.device.id != expected_device.index:
+                    raise TypeError(
+                        f"matmul(): {name} ({role}) expected device {expected_device}, "
+                        f"got cupy array on cuda:{arr.device.id}"
+                    )
+                actual_np_dtype = np.dtype(arr.dtype)
+            else:
+                raise TypeError(
+                    f"matmul(): {name} ({role}) expected torch.Tensor or cupy.ndarray on "
+                    f"{expected_device} (native mode), got {type(arr).__name__}"
+                )
+        else:
+            if not isinstance(arr, np.ndarray):
+                raise TypeError(
+                    f"matmul(): {name} ({role}) expected numpy.ndarray (copy mode), "
+                    f"got {type(arr).__name__}"
+                )
+            actual_np_dtype = arr.dtype
+
+        allow_int32 = (
+            exp_np_dtype == np.dtype(np.float64)
+            and actual_np_dtype == np.dtype(np.int32)
+        )
+        if actual_np_dtype != exp_np_dtype and not allow_int32:
+            raise TypeError(
+                f"matmul(): {name} ({role}) dtype mismatch: expected {exp_np_dtype}, got {actual_np_dtype}"
+            )
+
+        actual_shape = tuple(arr.shape)
+        if actual_shape != tuple(expected_shape):
+            raise ValueError(
+                f"matmul(): {name} ({role}) shape mismatch: expected {tuple(expected_shape)}, got {actual_shape}"
+            )
+
+    def _maybe_cast_to_capture_dtype(self, arr, target_dtype):
+        """If arr is int32 and target is fp64, cast to fp64; otherwise pass through.
+
+        Used to support int32 inputs to an fp64 capture. In native mode the
+        result is a torch.Tensor (works for torch and cupy inputs); in copy
+        mode the result is a numpy.ndarray.
+        """
+        import torch
+        actual = self._to_np_dtype(arr.dtype)
+        if actual == np.dtype(np.int32) and target_dtype == torch.float64:
+            if self._native:
+                return torch.as_tensor(arr).to(torch.float64)
+            return np.asarray(arr).astype(np.float64, copy=False)
+        return arr
+
+    def matmul(self, input, direction, emit_all_nodes=False, by_individual=False,
+               init=None, miss=None):
+        """Run the captured matmul graph and return the result.
+
+        Parameters
+        ----------
+        input : array
+            Source matrix of shape ``(k, input_cols)``, dtype matching the runtime
+            (float32 or float64). Shape must equal ``self._src_tensors[key].shape``.
+            Exception: when the capture dtype is float64, int32 input/init/miss
+            arrays are also accepted; they are cast to float64 before the kernel
+            runs and the returned ``result`` is cast back to int32.
+        direction : {"up", "down"}
+        init : None | "xtx" | 1-D array | 2-D array
+            Initialization payload; must match the init_mode of the captured spec
+            (vector / matrix / xtx). Raises ValueError if the captured key needs
+            init and ``init`` is None.
+        miss : None | array
+            DOWN with use_miss: miss INPUT, shape ``self._miss_tensors[key].shape``.
+            UP   with use_miss: miss OUTPUT accumulator, shape
+            ``self._prepared_ops[key].miss_output.shape``; updated in place (+=).
+
+        Mode-specific contract
+        ----------------------
+        Native mode (self._native=True):
+            input / init / miss MUST be GPU arrays — ``torch.Tensor`` on, or
+            ``cupy.ndarray`` on, the same CUDA device the graph was captured on.
+            CPU (numpy) arrays are rejected. Returned ``result`` is a fresh
+            ``cupy.ndarray`` on that device. miss (UP+use_miss) is updated in
+            place via a cupy ``+=`` on cupy's current stream.
+
+        Copy mode (self._native=False):
+            input / init / miss MUST be ``numpy.ndarray`` on host. GPU arrays are
+            rejected. Host↔device transfers happen internally on
+            ``self._capture_stream``. Returned ``result`` is a fresh
+            ``numpy.ndarray`` on host. miss (UP+use_miss) is updated in place via
+            a numpy ``+=`` on the CPU.
+
+        Output readiness
+        ----------------
+        When matmul returns, ``result`` and the in-place update to ``miss`` are
+        fully materialized in their memory space (host or device). The caller may
+        consume them from any stream / library / CPU without further sync.
+
+        Two ``torch.cuda.synchronize(device)`` calls inside matmul enforce this:
+          1. After graph_replay, before the cupy ``.copy()`` of the output —
+             orders the kernel on capture_stream ahead of cupy reads on cupy's
+             current stream.
+          2. After the cupy ``.copy()`` and ``miss +=`` — drains cupy's current
+             stream so caller-side reads see ready data.
+
+        Both syncs are device-wide barriers (cudaDeviceSynchronize), so they
+        also drain any other streams active on the device.
+
+        Raises
+        ------
+        TypeError
+            Array type / device / dtype does not match the mode's contract.
+        ValueError
+            Array shape mismatch, or required ``init``/``miss`` missing for the
+            captured key.
+        """
+        assert emit_all_nodes is False, "emit_all_nodes=True is not supported for CapturedBoundGRG.matmul()"
+        #TODO: support emit all nodes
+
+        if init is None:
+            init_mode, init_payload = "none", None
+        elif isinstance(init, str):
+            if init != "xtx":
+                raise ValueError(f"unexpected init value: {init!r}")
+            init_mode, init_payload = "xtx", None
+        elif hasattr(init, "ndim") and init.ndim == 1:
+            init_mode, init_payload = "vector", init
+        else:
+            init_mode, init_payload = "matrix", init
+        use_miss = miss is not None
+
         import torch
         nvtx = torch.cuda.nvtx
-        key = self._key(direction, by_individual)
+        key = self._key(direction, by_individual, init_mode, use_miss)
         src = self._src_tensors[key]
+
+        expected_dtype = src.dtype
+        expected_device = src.device if self._native else None
+
+        # int32 → fp64 coercion: only when capture dtype is fp64 AND input is int32.
+        input_is_int32 = (
+            src.dtype == torch.float64
+            and hasattr(input, "dtype")
+            and self._to_np_dtype(input.dtype) == np.dtype(np.int32)
+        )
+
+        self._validate_array(
+            input, name="input", role="input",
+            expected_shape=tuple(src.shape),
+            expected_dtype=expected_dtype,
+            expected_device=expected_device,
+        )
+        if key in self._init_tensors:
+            self._validate_array(
+                init_payload, name="init", role="init",
+                expected_shape=tuple(self._init_tensors[key].shape),
+                expected_dtype=expected_dtype,
+                expected_device=expected_device,
+            )
+        if key in self._miss_tensors:
+            self._validate_array(
+                miss, name="miss", role="miss-in",
+                expected_shape=tuple(self._miss_tensors[key].shape),
+                expected_dtype=expected_dtype,
+                expected_device=expected_device,
+            )
+        elif use_miss:
+            op_miss_out = self._prepared_ops[key].miss_output
+            self._validate_array(
+                miss, name="miss", role="miss-out",
+                expected_shape=tuple(op_miss_out.shape),
+                expected_dtype=expected_dtype,
+                expected_device=expected_device,
+            )
 
         nvtx.range_push(f"matmul_{direction}")
 
@@ -70,27 +287,76 @@ class CapturedBoundGRG:
                 import cupy as cp
                 cp.cuda.get_current_stream().synchronize()
                 input = torch.as_tensor(input)
+            input = self._maybe_cast_to_capture_dtype(input, src.dtype)
             with torch.cuda.stream(self._capture_stream):
                 src.copy_(input)
         else:
+            input_cast = self._maybe_cast_to_capture_dtype(input, src.dtype)
             with torch.cuda.stream(self._capture_stream):
-                src.copy_(torch.from_numpy(np.ascontiguousarray(input)))
+                src.copy_(torch.from_numpy(np.ascontiguousarray(input_cast)))
+        nvtx.range_pop()
+
+        nvtx.range_push("init")
+        if key in self._init_tensors:
+            if init_payload is None:
+                raise ValueError(f"matmul() requires init data for captured graph key={key!r}")
+            init_cast = self._maybe_cast_to_capture_dtype(init_payload, src.dtype)
+            with torch.cuda.stream(self._capture_stream):
+                if self._native:
+                    self._init_tensors[key].copy_(torch.as_tensor(init_cast))
+                else:
+                    self._init_tensors[key].copy_(torch.from_numpy(np.ascontiguousarray(init_cast)))
+        nvtx.range_pop()
+
+        nvtx.range_push("miss_input")
+        if key in self._miss_tensors:
+            if miss is None:
+                raise ValueError(f"matmul() requires miss for captured graph key={key!r}")
+            miss_cast = self._maybe_cast_to_capture_dtype(miss, src.dtype)
+            with torch.cuda.stream(self._capture_stream):
+                if self._native:
+                    self._miss_tensors[key].copy_(torch.as_tensor(miss_cast))
+                else:
+                    self._miss_tensors[key].copy_(torch.from_numpy(np.ascontiguousarray(miss_cast)))
         nvtx.range_pop()
 
         nvtx.range_push("graph_replay")
         self._graphs[key].replay()
         nvtx.range_pop()
 
+        # Sync #1: kernel on capture_stream → cupy reads on cupy's current stream.
         nvtx.range_push("sync")
         torch.cuda.synchronize(src.device)
         nvtx.range_pop()
 
+        # Native: cp.copy() is async on cupy's current stream; sync #2 drains it.
         nvtx.range_push("output")
         if self._native:
             import cupy as cp
             result = cp.asarray(self._prepared_ops[key].output).copy()
+            if input_is_int32:
+                result = result.astype(cp.int32)
         else:
             result = self._prepared_ops[key].output.cpu().numpy().copy()
+            if input_is_int32:
+                result = result.astype(np.int32)
+        nvtx.range_pop()
+
+        # Native: cp.copy() and miss += are async on cupy's current stream; sync #2 drains them.
+        nvtx.range_push("miss_output")
+        op = self._prepared_ops[key]
+        if use_miss and hasattr(op, "miss_output") and miss is not None:
+            if self._native:
+                import cupy as cp
+                miss_data = cp.asarray(op.miss_output).copy()
+            else:
+                miss_data = op.miss_output.cpu().numpy().copy()
+            miss += miss_data.astype(miss.dtype, copy=False)
+        nvtx.range_pop()
+
+        # Sync #2: cupy copy/accumulate → caller-side reads on any stream.
+        nvtx.range_push("sync")
+        torch.cuda.synchronize(src.device)
         nvtx.range_pop()
 
         nvtx.range_pop()
@@ -107,6 +373,8 @@ class CaptureSpec:
     direction: str
     k: int
     by_individual: bool = False
+    init_mode: str = "none"   # "none" | "vector" | "matrix" | "xtx"
+    use_miss: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,7 +469,7 @@ def make_backend_cusparse(device=0, allow_residency=True, capture=False, native=
 
 def make_runconfig_matmul(k_up, k_down=None, need_miss=False, **kwargs) -> RunConfigs:
     """Create a RunConfigs for a plain matmul workload."""
-    #TODO: support more runtime requirement params?
+    assert False, "UNCHECKED"
     if kwargs:
         raise TypeError(f"make_runconfig_matmul() got unexpected keyword arguments: {sorted(kwargs)}")
     if k_down is None:
@@ -217,10 +485,10 @@ def make_runconfig_matmul(k_up, k_down=None, need_miss=False, **kwargs) -> RunCo
             need_init_xtx=False,
         ),
         capture_ops=(
-            CaptureSpec("up",   int(k_up),  by_individual=False),
-            CaptureSpec("down", int(k_down), by_individual=False),
-            CaptureSpec("up",   int(k_up),  by_individual=True),
-            CaptureSpec("down", int(k_down), by_individual=True),
+            CaptureSpec("up",   int(k_up),   by_individual=False, use_miss=bool(need_miss)),
+            CaptureSpec("down", int(k_down), by_individual=False, use_miss=bool(need_miss)),
+            CaptureSpec("up",   int(k_up),   by_individual=True,  use_miss=bool(need_miss)),
+            CaptureSpec("down", int(k_down), by_individual=True,  use_miss=bool(need_miss)),
         ),
     )
 
@@ -233,6 +501,7 @@ def make_runconfig_pca(**kwargs) -> RunConfigs:
       (individual eigsh blocks), and up at k=1 by_individual=False
       (allele_counts single pass).
     """
+    assert False, "UNCHECKED"
     if kwargs:
         raise TypeError(f"make_runconfig_pca() got unexpected keyword arguments: {sorted(kwargs)}")
     return RunConfigs(
@@ -246,15 +515,48 @@ def make_runconfig_pca(**kwargs) -> RunConfigs:
             need_init_xtx=False,
         ),
 
-        #TODO: check what is actually required
         capture_ops=(
-            CaptureSpec("up",   1, by_individual=False),  
-            CaptureSpec("down", 1, by_individual=False),  
-            CaptureSpec("up",    1, by_individual=True),   
-            CaptureSpec("down",  1, by_individual=True),   
+            CaptureSpec("up",   1, by_individual=False, init_mode="vector"),
+            CaptureSpec("down", 1, by_individual=False, init_mode="vector"),
+            CaptureSpec("up",   1, by_individual=True,  init_mode="vector"),
+            CaptureSpec("down", 1, by_individual=True,  init_mode="vector"),
         ),
     )
 
+def make_runconfig_bolt(**kwargs) -> RunConfigs:
+    """Create a RunConfigs for a BoltLMM workload (init_vector enabled, k=20).
+
+    Captures all five graph variants used by BoltLMM:
+      up/down at k=20 (main matmul), up/down at k=1 by_individual=True
+      (individual eigsh blocks), and up at k=1 by_individual=False
+      (allele_counts single pass).
+    """
+    if kwargs:
+        raise TypeError(f"make_runconfig_boltlmm() got unexpected keyword arguments: {sorted(kwargs)}")
+    return RunConfigs(
+        req=RuntimeRequirements(
+            max_k_up=1,
+            max_k_down=1,
+            need_down_miss_input=True,
+            need_up_miss_output=True,
+            need_init_vector=False,
+            need_init_matrix=False,
+            need_init_xtx=True,
+        ),
+
+        capture_ops=(
+            # all others
+            CaptureSpec("up",   1, by_individual=True),
+            CaptureSpec("up",   1, by_individual=True, init_mode="xtx"),
+            CaptureSpec("down", 1, by_individual=True),
+            CaptureSpec("up",   1, by_individual=True, use_miss=True),
+            CaptureSpec("down", 1, by_individual=True, use_miss=True),
+            CaptureSpec("up",   1, by_individual=False),
+            CaptureSpec("down", 1, by_individual=False),
+            CaptureSpec("up",   1, by_individual=False, use_miss=True),
+            CaptureSpec("down", 1, by_individual=False, use_miss=True),
+        ),
+    )
 
 # ---------------------------------------------------------------------------
 # Private helpers
@@ -402,12 +704,29 @@ def _make_cusparse_standard_pair() -> CusparsePlanPair:
     )
 
 
-def _init_mode_from_req(req) -> str:
-    r = _bare_req(req)
-    if r.need_init_xtx:    return "xtx"
-    if r.need_init_matrix: return "matrix"
-    if r.need_init_vector: return "vector"
-    return "none"
+_VALID_INIT_MODES = {"none", "vector", "matrix", "xtx"}
+
+
+def _validate_capture_spec(spec: CaptureSpec, req: RuntimeRequirements) -> None:
+    if spec.init_mode not in _VALID_INIT_MODES:
+        raise ValueError(
+            f"CaptureSpec.init_mode {spec.init_mode!r} invalid; expected one of {sorted(_VALID_INIT_MODES)}"
+        )
+    if spec.init_mode != "none" and spec.use_miss:
+        raise ValueError(
+            f"CaptureSpec direction={spec.direction!r}: init_mode and use_miss are mutually exclusive"
+        )
+    if spec.use_miss:
+        if spec.direction == "up" and not req.need_up_miss_output:
+            raise ValueError("CaptureSpec use_miss=True for 'up' but need_up_miss_output is False")
+        if spec.direction == "down" and not req.need_down_miss_input:
+            raise ValueError("CaptureSpec use_miss=True for 'down' but need_down_miss_input is False")
+    if spec.init_mode == "vector" and not req.need_init_vector:
+        raise ValueError("CaptureSpec init_mode='vector' but need_init_vector is False")
+    if spec.init_mode == "matrix" and not req.need_init_matrix:
+        raise ValueError("CaptureSpec init_mode='matrix' but need_init_matrix is False")
+    if spec.init_mode == "xtx" and not req.need_init_xtx:
+        raise ValueError("CaptureSpec init_mode='xtx' but need_init_xtx is False")
 
 
 def _capture_grg(grg, capture_stream, req, cfg, stack) -> CapturedBoundGRG:
@@ -415,9 +734,12 @@ def _capture_grg(grg, capture_stream, req, cfg, stack) -> CapturedBoundGRG:
 
     All prepare_matmul_cuda contexts are entered into the caller's stack so they
     live as long as the runtime.
+
+    A single shared src buffer and a single shared init/miss buffer are allocated
+    (each sized to the maximum across all ops) and aliased per op. This is safe
+    because ops of the same GRG never run concurrently.
     """
     import torch
-    init_mode = _init_mode_from_req(req)
 
     if isinstance(req, RunConfigs) and req.capture_ops:
         ops_to_capture = req.capture_ops
@@ -428,49 +750,99 @@ def _capture_grg(grg, capture_stream, req, cfg, stack) -> CapturedBoundGRG:
             CaptureSpec("down", bare.max_k_down),
         )
 
+    bare_req = _bare_req(req)
+
+    # ---- Phase 1: enter all contexts and record buffer sizes ----
     prepared_ops: dict = {}
-    graphs: dict = {}
-    src_tensors: dict = {}
-    init_tensors: dict = {}
+    input_numels: list[int] = []
+    init_numels:  list[int] = []
+    miss_numels:  list[int] = []
 
     for spec in ops_to_capture:
-        key = (spec.direction, spec.by_individual)
+        _validate_capture_spec(spec, bare_req)
+        key = (spec.direction, spec.by_individual, spec.init_mode, spec.use_miss)
+        if key in prepared_ops:
+            raise ValueError(f"Duplicate CaptureSpec key {key!r} in capture_ops")
         op = stack.enter_context(
             grg.prepare_matmul_cuda(
                 direction=spec.direction,
                 k=spec.k,
-                init_mode=init_mode,
                 by_individual=spec.by_individual,
+                init_mode=spec.init_mode,
+                use_miss=spec.use_miss,
             )
         )
-        src = torch.zeros_like(op.input)
+        prepared_ops[key] = op
+        input_numels.append(op.input.numel())
+        init_numels.append(
+            op.init_vector.numel() if spec.init_mode == "vector" else
+            op.init_matrix.numel() if spec.init_mode == "matrix" else 0
+        )
+        miss_numels.append(
+            op.miss_input.numel()  if (spec.use_miss and spec.direction == "down") else
+            op.miss_output.numel() if (spec.use_miss and spec.direction == "up")   else 0
+        )
+
+    # ---- Phase 2: allocate shared staging buffers ----
+    any_op = next(iter(prepared_ops.values()))
+    dtype, device = any_op.input.dtype, any_op.input.device
+
+    shared_src  = torch.zeros(max(input_numels), dtype=dtype, device=device)
+    shared_init = torch.zeros(max(init_numels),  dtype=dtype, device=device) if max(init_numels) > 0 else None
+    shared_miss = torch.zeros(max(miss_numels),  dtype=dtype, device=device) if max(miss_numels) > 0 else None
+
+    # ---- Phase 3: capture graphs with aliased buffer views ----
+    graphs:       dict = {}
+    src_tensors:  dict = {}
+    init_tensors: dict = {}
+    miss_tensors: dict = {}
+
+    for i, spec in enumerate(ops_to_capture):
+        key = (spec.direction, spec.by_individual, spec.init_mode, spec.use_miss)
+        op  = prepared_ops[key]
+        k, input_cols = op.input.shape  # op.input is (k, input_cols), column-major
+
+        # Alias a column-major view of shared_src that matches op.input's layout.
+        # op.input is _io0_torch[:input_cols, :k].T, so strides are (1, k).
+        src = torch.as_strided(shared_src, size=(k, input_cols), stride=(1, k))
         graph = torch.cuda.CUDAGraph()
 
-        if init_mode == "vector":
-            init = torch.zeros_like(op.init_vector)
+        if spec.init_mode == "vector":
+            init = shared_init[:k]  # shape (k,), stride (1,)
             with torch.cuda.graph(graph, stream=capture_stream, capture_error_mode="thread_local"):
                 op.input.copy_(src)
                 op.init_vector.copy_(init)
                 op()
             init_tensors[key] = init
-        elif init_mode == "matrix":
-            init = torch.zeros_like(op.init_matrix)
+
+        elif spec.init_mode == "matrix":
+            num_nodes = op.init_matrix.shape[1]  # op.init_matrix is (k, num_nodes), column-major
+            init = torch.as_strided(shared_init, size=(k, num_nodes), stride=(1, k))
             with torch.cuda.graph(graph, stream=capture_stream, capture_error_mode="thread_local"):
                 op.input.copy_(src)
                 op.init_matrix.copy_(init)
                 op()
             init_tensors[key] = init
-        else:  # "none" or "xtx"
+
+        elif spec.use_miss and spec.direction == "down":
+            num_mut = op.miss_input.shape[1]  # op.miss_input is (k, num_mutations), column-major
+            miss = torch.as_strided(shared_miss, size=(k, num_mut), stride=(1, k))
+            with torch.cuda.graph(graph, stream=capture_stream, capture_error_mode="thread_local"):
+                op.input.copy_(src)
+                op.miss_input.copy_(miss)
+                op()
+            miss_tensors[key] = miss
+
+        else:  # "none", "xtx", or UP+use_miss (miss_output written by kernel)
             with torch.cuda.graph(graph, stream=capture_stream, capture_error_mode="thread_local"):
                 op.input.copy_(src)
                 op()
 
-        prepared_ops[key] = op
-        graphs[key] = graph
         src_tensors[key] = src
+        graphs[key] = graph
 
     return CapturedBoundGRG(
-        grg, prepared_ops, graphs, src_tensors, init_tensors,
+        grg, prepared_ops, graphs, src_tensors, init_tensors, miss_tensors,
         capture_stream, native=cfg.native,
     )
 
@@ -593,6 +965,7 @@ __all__ = [
     "make_backend_cusparse",
     "make_runconfig_matmul",
     "make_runconfig_pca",
+    "make_runconfig_bolt",
     "load_grg_spmv_single",
     "load_grg_spmv_multi",
 ]
