@@ -873,35 +873,42 @@ def _load_cusparse_multi(paths, cfg, req, stack, dtype):
 
     def _load_one_device(device_id, indexed_paths):
         import torch
-        capture_stream = torch.cuda.Stream(device=device_id) if cfg.capture else 0
+        # Pin this thread to its device. torch.cuda.Stream(device=...) sets the
+        # stream's device but NOT the thread-local current device, which stays at
+        # the default (0). torch.cuda.graph.__enter__ calls torch.cuda.synchronize()
+        # with no argument, so without this every worker would synchronize device 0
+        # — and a stray sync of device 0 while another thread is mid-capture there
+        # raises a CUDA error. Pinning the device makes the sync hit the right one.
+        with torch.cuda.device(device_id):
+            capture_stream = torch.cuda.Stream(device=device_id) if cfg.capture else 0
 
-        group_paths = [p for _, p in indexed_paths]
-        layout = plan_cusparse_layout(
-            artifacts=group_paths,
-            pair=pair,
-            dtype=dtype,
-            requirements=_bare_req(req),
-            vram_budget_bytes=0,
-            ring_buffer_size=2,
-            allow_residency=cfg.allow_residency,
-            device=device_id,
-            stream=capture_stream,
-        )
-        # Heavy I/O: load from disk to GPU — done outside the global stack lock.
-        device_stack = contextlib.ExitStack()
-        try:
-            runtime = device_stack.enter_context(CusparseRuntime(layout))
-        except Exception:
-            device_stack.close()
-            raise
-        # Transfer cleanup ownership to the caller's ExitStack (fast, needs lock).
-        with lock:
-            stack.enter_context(device_stack.pop_all())
+            group_paths = [p for _, p in indexed_paths]
+            layout = plan_cusparse_layout(
+                artifacts=group_paths,
+                pair=pair,
+                dtype=dtype,
+                requirements=_bare_req(req),
+                vram_budget_bytes=0,
+                ring_buffer_size=0,
+                allow_residency=cfg.allow_residency,
+                device=device_id,
+                stream=capture_stream,
+            )
+            # Heavy I/O: load from disk to GPU — done outside the global stack lock.
+            device_stack = contextlib.ExitStack()
+            try:
+                runtime = device_stack.enter_context(CusparseRuntime(layout))
+            except Exception:
+                device_stack.close()
+                raise
+            # Transfer cleanup ownership to the caller's ExitStack (fast, needs lock).
+            with lock:
+                stack.enter_context(device_stack.pop_all())
 
-        for (original_idx, _), grg in zip(indexed_paths, runtime.grgs):
-            if cfg.capture:
-                grg = _capture_grg(grg, capture_stream, req, cfg, stack)
-            grg_by_index[original_idx] = grg
+            for (original_idx, _), grg in zip(indexed_paths, runtime.grgs):
+                if cfg.capture:
+                    grg = _capture_grg(grg, capture_stream, req, cfg, stack)
+                grg_by_index[original_idx] = grg
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [
