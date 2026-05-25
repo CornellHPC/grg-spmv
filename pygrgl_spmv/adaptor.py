@@ -33,8 +33,9 @@ class CapturedBoundGRG:
 
     matmul() performs graph replay. When *native=False* (default), input is a
     numpy array copied host→device and output is returned as a numpy array.
-    When *native=True*, input is a GPU tensor or cupy array and output is a
-    cupy.ndarray on device — no host transfers occur.
+    When *native=True*, input is a cupy.ndarray on device and output is a
+    cupy.ndarray on device — no host transfers occur. (torch.Tensor input is
+    rejected in native mode; see matmul for the rationale.)
     """
 
     def __init__(self, grg, prepared_ops, graphs, src_tensors, init_tensors, miss_tensors, capture_stream, *, native=False):
@@ -86,41 +87,30 @@ class CapturedBoundGRG:
         if arr is None:
             raise ValueError(f"matmul(): {name} ({role}) is required but got None")
 
-        import torch
-        try:
-            import cupy as cp
-            _cp_ndarray = cp.ndarray
-        except Exception:
-            _cp_ndarray = ()
-
         exp_np_dtype = self._to_np_dtype(expected_dtype)
 
         if expected_device is not None:
-            if isinstance(arr, torch.Tensor):
-                if not arr.is_cuda:
-                    raise TypeError(
-                        f"matmul(): {name} ({role}) expected GPU tensor on {expected_device}, "
-                        f"got CPU torch.Tensor"
-                    )
-                if arr.device != expected_device:
-                    raise TypeError(
-                        f"matmul(): {name} ({role}) expected device {expected_device}, "
-                        f"got torch tensor on {arr.device}"
-                    )
-                actual_np_dtype = self._to_np_dtype(arr.dtype)
-            elif _cp_ndarray and isinstance(arr, _cp_ndarray):
-                if arr.device.id != expected_device.index:
-                    raise TypeError(
-                        f"matmul(): {name} ({role}) expected device {expected_device}, "
-                        f"got cupy array on cuda:{arr.device.id}"
-                    )
-                actual_np_dtype = np.dtype(arr.dtype)
-            else:
+            # Native mode: input MUST be a cupy.ndarray on the capture device.
+            # torch.Tensor is intentionally rejected
+            try:
+                import cupy as cp
+                _cp_ndarray = cp.ndarray
+            except Exception:
+                _cp_ndarray = ()
+
+            if not (_cp_ndarray and isinstance(arr, _cp_ndarray)):
                 raise TypeError(
-                    f"matmul(): {name} ({role}) expected torch.Tensor or cupy.ndarray on "
+                    f"matmul(): {name} ({role}) expected cupy.ndarray on "
                     f"{expected_device} (native mode), got {type(arr).__name__}"
                 )
+            if arr.device.id != expected_device.index:
+                raise TypeError(
+                    f"matmul(): {name} ({role}) expected device {expected_device}, "
+                    f"got cupy array on cuda:{arr.device.id}"
+                )
+            actual_np_dtype = np.dtype(arr.dtype)
         else:
+            # Copy mode: input MUST be a numpy.ndarray on host.
             if not isinstance(arr, np.ndarray):
                 raise TypeError(
                     f"matmul(): {name} ({role}) expected numpy.ndarray (copy mode), "
@@ -183,11 +173,11 @@ class CapturedBoundGRG:
         Mode-specific contract
         ----------------------
         Native mode (self._native=True):
-            input / init / miss MUST be GPU arrays — ``torch.Tensor`` on, or
-            ``cupy.ndarray`` on, the same CUDA device the graph was captured on.
-            CPU (numpy) arrays are rejected. Returned ``result`` is a fresh
-            ``cupy.ndarray`` on that device. miss (UP+use_miss) is updated in
-            place via a cupy ``+=`` on cupy's current stream.
+            input / init / miss MUST be ``cupy.ndarray`` on the same CUDA device
+            the graph was captured on. ``torch.Tensor`` and CPU (numpy) arrays
+            are rejected:. Returned ``result`` is a fresh ``cupy.ndarray`` 
+            on that device. miss (UP+use_miss) is updated in place via a 
+            cupy ``+=`` on capture_stream.
 
         Copy mode (self._native=False):
             input / init / miss MUST be ``numpy.ndarray`` on host. GPU arrays are
@@ -202,15 +192,20 @@ class CapturedBoundGRG:
         fully materialized in their memory space (host or device). The caller may
         consume them from any stream / library / CPU without further sync.
 
-        Two ``torch.cuda.synchronize(device)`` calls inside matmul enforce this:
-          1. After graph_replay, before the cupy ``.copy()`` of the output —
-             orders the kernel on capture_stream ahead of cupy reads on cupy's
-             current stream.
-          2. After the cupy ``.copy()`` and ``miss +=`` — drains cupy's current
-             stream so caller-side reads see ready data.
-
-        Both syncs are device-wide barriers (cudaDeviceSynchronize), so they
-        also drain any other streams active on the device.
+        Stream model
+        ------------
+        The entire matmul runs on a single CUDA stream, ``self._capture_stream``:
+        the torch staging copies, the graph replay (which launches on the current
+        torch stream, set to capture_stream via ``torch.cuda.stream``), and — in
+        native mode — the cupy output copy and ``miss +=`` (cupy is bound to the
+        same physical stream via ``cupy.cuda.ExternalStream(cap.cuda_stream)``).
+        Single-stream execution makes all ordering implicit, so no device-wide
+        barriers are used. Two stream-scoped syncs bracket the work:
+          entry: in native mode, ``cupy.cuda.get_current_stream().synchronize()``
+                 — wait for the caller's pending work that produced the cupy
+                 inputs before reading them on capture_stream.
+          exit:  ``capture_stream.synchronize()`` — drain only this stream so the
+                 result and in-place miss update are ready for the caller.
 
         Raises
         ------
@@ -279,84 +274,104 @@ class CapturedBoundGRG:
                 expected_device=expected_device,
             )
 
-        nvtx.range_push(f"matmul_{direction}")
+        # ---- Single-stream execution ----------------------------------------
+        # The whole matmul runs on self._capture_stream: the torch staging
+        # copies (input/init/miss), the CUDA graph replay, and — in native mode
+        # — the cupy output copy and the miss accumulate. Because every op is on
+        # one stream, ordering is implicit (intra-stream) and no device-wide
+        # barriers are needed. Only two stream-scoped syncs remain:
+        #   entry: wait for the caller's pending work that produced the inputs
+        #   exit:  drain capture_stream so result/miss are ready for the caller
+        cap = self._capture_stream
 
-        nvtx.range_push("input")
+        # Entry: native inputs are cupy arrays produced on cupy's current stream;
+        # block the host until that work is done before we read them on cap.
+        # (Copy mode inputs are host numpy — nothing on-device to wait for, and
+        # cap was drained by the previous call's exit sync.)
+        nvtx.range_push("sync before computation")
         if self._native:
-            if not isinstance(input, torch.Tensor):
-                import cupy as cp
+            import cupy as cp
+            # Pin cupy's current device to the capture device: get_current_stream()
+            # is device-local, so without this it could drain the wrong device's
+            # stream in the calling thread.
+            with cp.cuda.Device(src.device.index):
                 cp.cuda.get_current_stream().synchronize()
-                input = torch.as_tensor(input)
-            input = self._maybe_cast_to_capture_dtype(input, src.dtype)
-            with torch.cuda.stream(self._capture_stream):
-                src.copy_(input)
-        else:
-            input_cast = self._maybe_cast_to_capture_dtype(input, src.dtype)
-            with torch.cuda.stream(self._capture_stream):
-                src.copy_(torch.from_numpy(np.ascontiguousarray(input_cast)))
+        
+        torch.cuda.synchronize(src.device)
+
         nvtx.range_pop()
 
-        nvtx.range_push("init")
-        if key in self._init_tensors:
-            if init_payload is None:
-                raise ValueError(f"matmul() requires init data for captured graph key={key!r}")
-            init_cast = self._maybe_cast_to_capture_dtype(init_payload, src.dtype)
-            with torch.cuda.stream(self._capture_stream):
+        nvtx.range_push(f"matmul_{direction}")
+        op = self._prepared_ops[key]
+
+        with torch.cuda.stream(cap):
+            nvtx.range_push("input")
+            if self._native:
+                input = torch.as_tensor(input)
+                input = self._maybe_cast_to_capture_dtype(input, src.dtype)
+                src.copy_(input)
+            else:
+                input_cast = self._maybe_cast_to_capture_dtype(input, src.dtype)
+                src.copy_(torch.from_numpy(np.ascontiguousarray(input_cast)))
+            nvtx.range_pop()
+
+            nvtx.range_push("init")
+            if key in self._init_tensors:
+                if init_payload is None:
+                    raise ValueError(f"matmul() requires init data for captured graph key={key!r}")
+                init_cast = self._maybe_cast_to_capture_dtype(init_payload, src.dtype)
                 if self._native:
                     self._init_tensors[key].copy_(torch.as_tensor(init_cast))
                 else:
                     self._init_tensors[key].copy_(torch.from_numpy(np.ascontiguousarray(init_cast)))
-        nvtx.range_pop()
+            nvtx.range_pop()
 
-        nvtx.range_push("miss_input")
-        if key in self._miss_tensors:
-            if miss is None:
-                raise ValueError(f"matmul() requires miss for captured graph key={key!r}")
-            miss_cast = self._maybe_cast_to_capture_dtype(miss, src.dtype)
-            with torch.cuda.stream(self._capture_stream):
+            nvtx.range_push("miss_input")
+            if key in self._miss_tensors:
+                if miss is None:
+                    raise ValueError(f"matmul() requires miss for captured graph key={key!r}")
+                miss_cast = self._maybe_cast_to_capture_dtype(miss, src.dtype)
                 if self._native:
                     self._miss_tensors[key].copy_(torch.as_tensor(miss_cast))
                 else:
                     self._miss_tensors[key].copy_(torch.from_numpy(np.ascontiguousarray(miss_cast)))
-        nvtx.range_pop()
+            nvtx.range_pop()
 
-        nvtx.range_push("graph_replay")
-        self._graphs[key].replay()
-        nvtx.range_pop()
+            # replay() launches on the current torch stream, which is cap here.
+            nvtx.range_push("graph_replay")
+            self._graphs[key].replay()
+            nvtx.range_pop()
 
-        # Sync #1: kernel on capture_stream → cupy reads on cupy's current stream.
-        nvtx.range_push("sync")
-        torch.cuda.synchronize(src.device)
-        nvtx.range_pop()
-
-        # Native: cp.copy() is async on cupy's current stream; sync #2 drains it.
-        nvtx.range_push("output")
-        if self._native:
-            import cupy as cp
-            result = cp.asarray(self._prepared_ops[key].output).copy()
-            if input_is_int32:
-                result = result.astype(cp.int32)
-        else:
-            result = self._prepared_ops[key].output.cpu().numpy().copy()
-            if input_is_int32:
-                result = result.astype(np.int32)
-        nvtx.range_pop()
-
-        # Native: cp.copy() and miss += are async on cupy's current stream; sync #2 drains them.
-        nvtx.range_push("miss_output")
-        op = self._prepared_ops[key]
-        if use_miss and hasattr(op, "miss_output") and miss is not None:
+            nvtx.range_push("output")
             if self._native:
                 import cupy as cp
-                miss_data = cp.asarray(op.miss_output).copy()
+                # Bind cupy onto the SAME physical CUDA stream as cap, so the
+                # output copy and miss accumulate are ordered after replay
+                # without any cross-stream barrier. Pin cupy's current device to
+                # the capture device first: torch.cuda.stream(cap) sets torch's
+                # device/stream but NOT cupy's, so without this the ExternalStream
+                # (and the copy/miss launched on it) can bind to the wrong device
+                # in the calling thread and escape cap's exit sync
+                with cp.cuda.Device(src.device.index):
+                    with cp.cuda.ExternalStream(cap.cuda_stream, device_id=src.device.index):
+                        result = cp.asarray(op.output).copy()
+                        if input_is_int32:
+                            result = result.astype(cp.int32)
+                        if use_miss and hasattr(op, "miss_output") and miss is not None:
+                            miss += cp.asarray(op.miss_output).astype(miss.dtype, copy=False)
             else:
-                miss_data = op.miss_output.cpu().numpy().copy()
-            miss += miss_data.astype(miss.dtype, copy=False)
-        nvtx.range_pop()
+                # .cpu() copies on cap (current stream) and syncs that copy.
+                result = op.output.cpu().numpy().copy()
+                if input_is_int32:
+                    result = result.astype(np.int32)
+                if use_miss and hasattr(op, "miss_output") and miss is not None:
+                    miss += op.miss_output.cpu().numpy().astype(miss.dtype, copy=False)
+            nvtx.range_pop()
 
-        # Sync #2: cupy copy/accumulate → caller-side reads on any stream.
+        # Exit: drain ONLY capture_stream (not the whole device) so result and
+        # the in-place miss update are fully materialized for the caller.
         nvtx.range_push("sync")
-        torch.cuda.synchronize(src.device)
+        cap.synchronize()
         nvtx.range_pop()
 
         nvtx.range_pop()
