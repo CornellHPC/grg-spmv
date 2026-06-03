@@ -965,7 +965,6 @@ __all__ = [
     "CusparseBackendConfig",
     "make_backend_mkl",
     "make_backend_cusparse",
-    "make_runconfig_matmul",
     "make_runconfig_pca",
     "make_runconfig_bolt",
     "load_grg_spmv_single",
