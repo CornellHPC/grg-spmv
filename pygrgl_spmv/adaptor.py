@@ -130,10 +130,19 @@ class CapturedBoundGRG:
                 f"matmul(): {name} ({role}) dtype mismatch: expected {exp_np_dtype}, got {actual_np_dtype}"
             )
 
+        # Allow a smaller k (axis 0) than captured; 
+        # trailing dims (input_cols / num_nodes / num_mutations)
+        # must match exactly. Padding/truncation happens on axis 0.
         actual_shape = tuple(arr.shape)
-        if actual_shape != tuple(expected_shape):
+        exp_shape = tuple(expected_shape)
+        if (
+            len(actual_shape) != len(exp_shape)
+            or actual_shape[0] > exp_shape[0]
+            or actual_shape[1:] != exp_shape[1:]
+        ):
             raise ValueError(
-                f"matmul(): {name} ({role}) shape mismatch: expected {tuple(expected_shape)}, got {actual_shape}"
+                f"matmul(): {name} ({role}) shape mismatch: expected k <= {exp_shape[0]} "
+                f"with trailing dims {exp_shape[1:]}, got {actual_shape}"
             )
 
     def _maybe_cast_to_capture_dtype(self, arr, target_dtype):
@@ -159,7 +168,12 @@ class CapturedBoundGRG:
         ----------
         input : array
             Source matrix of shape ``(k, input_cols)``, dtype matching the runtime
-            (float32 or float64). Shape must equal ``self._src_tensors[key].shape``.
+            (float32 or float64). ``k`` (axis 0) may be **smaller than or equal to**
+            the captured ``k`` (``self._src_tensors[key].shape[0]``); ``input_cols``
+            (axis 1) must match exactly. When ``k`` is smaller, the input is zero-
+            padded up to the captured ``k`` before the graph replays and the output
+            is truncated back, so ``result`` has the caller's ``k``. ``init``/``miss``
+            (if used) must use the SAME ``k`` as ``input``.
             Exception: when the capture dtype is float64, int32 input/init/miss
             arrays are also accepted; they are cast to float64 before the kernel
             runs and the returned ``result`` is cast back to int32.
@@ -255,17 +269,29 @@ class CapturedBoundGRG:
                 expected_dtype=expected_dtype,
                 expected_device=expected_device,
             )
+            # k may be smaller than captured; derive the caller's k (axis 0) from
+            # the input and require init/miss to use the SAME k. A smaller k is
+            # zero-padded up to k_full before replay and the output is truncated
+            # back to k_prime. Capture k_prime before `input` is reassigned below.
+            k_prime = int(input.shape[0])
+            k_full = int(src.shape[0])
+
+            def _expect(captured_shape):
+                # Substitute k_prime into axis 0 of a captured (full-k) shape so
+                # init/miss must match the input's k exactly.
+                return (k_prime,) + tuple(captured_shape[1:])
+
             if key in self._init_tensors:
                 self._validate_array(
                     init_payload, name="init", role="init",
-                    expected_shape=tuple(self._init_tensors[key].shape),
+                    expected_shape=_expect(self._init_tensors[key].shape),
                     expected_dtype=expected_dtype,
                     expected_device=expected_device,
                 )
             if key in self._miss_tensors:
                 self._validate_array(
                     miss, name="miss", role="miss-in",
-                    expected_shape=tuple(self._miss_tensors[key].shape),
+                    expected_shape=_expect(self._miss_tensors[key].shape),
                     expected_dtype=expected_dtype,
                     expected_device=expected_device,
                 )
@@ -273,7 +299,7 @@ class CapturedBoundGRG:
                 op_miss_out = self._prepared_ops[key].miss_output
                 self._validate_array(
                     miss, name="miss", role="miss-out",
-                    expected_shape=tuple(op_miss_out.shape),
+                    expected_shape=_expect(op_miss_out.shape),
                     expected_dtype=expected_dtype,
                     expected_device=expected_device,
                 )
@@ -309,14 +335,24 @@ class CapturedBoundGRG:
             op = self._prepared_ops[key]
 
             with torch.cuda.stream(cap):
+                # Stage a (k_prime, ...) payload into a full-k staging view, zero-
+                # padding the tail (axis 0) when the caller's k is smaller than the
+                # captured k. The fast path (k_prime == k_full) is a single copy_.
+                def _stage(dst, payload):
+                    if k_prime < k_full:
+                        dst[:k_prime].copy_(payload)
+                        dst[k_prime:].zero_()
+                    else:
+                        dst.copy_(payload)
+
                 nvtx.range_push("input")
                 if self._native:
                     input = torch.as_tensor(input)
                     input = self._maybe_cast_to_capture_dtype(input, src.dtype)
-                    src.copy_(input)
+                    _stage(src, input)
                 else:
                     input_cast = self._maybe_cast_to_capture_dtype(input, src.dtype)
-                    src.copy_(torch.from_numpy(np.ascontiguousarray(input_cast)))
+                    _stage(src, torch.from_numpy(np.ascontiguousarray(input_cast)))
                 nvtx.range_pop()
 
                 nvtx.range_push("init")
@@ -325,9 +361,9 @@ class CapturedBoundGRG:
                         raise ValueError(f"matmul() requires init data for captured graph key={key!r}")
                     init_cast = self._maybe_cast_to_capture_dtype(init_payload, src.dtype)
                     if self._native:
-                        self._init_tensors[key].copy_(torch.as_tensor(init_cast))
+                        _stage(self._init_tensors[key], torch.as_tensor(init_cast))
                     else:
-                        self._init_tensors[key].copy_(torch.from_numpy(np.ascontiguousarray(init_cast)))
+                        _stage(self._init_tensors[key], torch.from_numpy(np.ascontiguousarray(init_cast)))
                 nvtx.range_pop()
 
                 nvtx.range_push("miss_input")
@@ -336,9 +372,9 @@ class CapturedBoundGRG:
                         raise ValueError(f"matmul() requires miss for captured graph key={key!r}")
                     miss_cast = self._maybe_cast_to_capture_dtype(miss, src.dtype)
                     if self._native:
-                        self._miss_tensors[key].copy_(torch.as_tensor(miss_cast))
+                        _stage(self._miss_tensors[key], torch.as_tensor(miss_cast))
                     else:
-                        self._miss_tensors[key].copy_(torch.from_numpy(np.ascontiguousarray(miss_cast)))
+                        _stage(self._miss_tensors[key], torch.from_numpy(np.ascontiguousarray(miss_cast)))
                 nvtx.range_pop()
 
                 # replay() launches on the current torch stream, which is cap here.
@@ -358,18 +394,20 @@ class CapturedBoundGRG:
                     # in the calling thread and escape cap's exit sync
                     with cp.cuda.Device(src.device.index):
                         with cp.cuda.ExternalStream(cap.cuda_stream, device_id=src.device.index):
-                            result = cp.asarray(op.output).copy()
+                            # Truncate the captured-k output back to the caller's k
+                            # (axis 0 of the torch-facing output tensor).
+                            result = cp.asarray(op.output[:k_prime, :]).copy()
                             if input_is_int32:
                                 result = result.astype(cp.int32)
                             if use_miss and hasattr(op, "miss_output") and miss is not None:
-                                miss += cp.asarray(op.miss_output).astype(miss.dtype, copy=False)
+                                miss += cp.asarray(op.miss_output[:k_prime, :]).astype(miss.dtype, copy=False)
                 else:
                     # .cpu() copies on cap (current stream) and syncs that copy.
-                    result = op.output.cpu().numpy().copy()
+                    result = op.output[:k_prime, :].cpu().numpy().copy()
                     if input_is_int32:
                         result = result.astype(np.int32)
                     if use_miss and hasattr(op, "miss_output") and miss is not None:
-                        miss += op.miss_output.cpu().numpy().astype(miss.dtype, copy=False)
+                        miss += op.miss_output[:k_prime, :].cpu().numpy().astype(miss.dtype, copy=False)
                 nvtx.range_pop()
 
             # Exit: drain ONLY capture_stream (not the whole device) so result and
@@ -486,20 +524,24 @@ def make_backend_cusparse(device=0, allow_residency=True, capture=False, native=
 # RunConfig factory functions
 # ---------------------------------------------------------------------------
 
-def make_runconfig_pca(**kwargs) -> RunConfigs:
-    """Create a RunConfigs for a PCA workload (init_vector enabled, k=20).
+def make_runconfig_pca(force_spmm=False, **kwargs) -> RunConfigs:
+    """Create a RunConfigs for a PCA workload (init_vector enabled).
 
-    Captures all five graph variants used by PCA:
-      up/down at k=20 (main matmul), up/down at k=1 by_individual=True
-      (individual eigsh blocks), and up at k=1 by_individual=False
-      (allele_counts single pass).
+    Captures the graph variants used by PCA:
+      up by_individual=False (allele_counts single pass), and up/down
+      by_individual=True (individual eigsh blocks).
+
+    force_spmm: when False (default) graphs are captured at k=1 (SpMV path);
+        when True they are captured at k=2 (SpMM path). Captures at k=2 still
+        serve k=1 callers via CapturedBoundGRG.matmul()'s zero-pad/truncate.
     """
     if kwargs:
         raise TypeError(f"make_runconfig_pca() got unexpected keyword arguments: {sorted(kwargs)}")
+    k = 2 if force_spmm else 1
     return RunConfigs(
         req=RuntimeRequirements(
-            max_k_up=1,
-            max_k_down=1,
+            max_k_up=k,
+            max_k_down=k,
             need_down_miss_input=False,
             need_up_miss_output=False,
             need_init_vector=True,
@@ -508,26 +550,30 @@ def make_runconfig_pca(**kwargs) -> RunConfigs:
         ),
 
         capture_ops=(
-            CaptureSpec("up", 1, by_individual=False),
-            CaptureSpec("up",   1, by_individual=True),
-            CaptureSpec("down", 1, by_individual=True),
+            CaptureSpec("up",   k, by_individual=False),
+            CaptureSpec("up",   k, by_individual=True),
+            CaptureSpec("down", k, by_individual=True),
         ),
     )
 
-def make_runconfig_bolt(**kwargs) -> RunConfigs:
-    """Create a RunConfigs for a BoltLMM workload (init_vector enabled, k=20).
+def make_runconfig_bolt(force_spmm=False, **kwargs) -> RunConfigs:
+    """Create a RunConfigs for a BoltLMM workload (init_xtx + miss enabled).
 
-    Captures all five graph variants used by BoltLMM:
-      up/down at k=20 (main matmul), up/down at k=1 by_individual=True
-      (individual eigsh blocks), and up at k=1 by_individual=False
-      (allele_counts single pass).
+    Captures the graph variants used by BoltLMM across by_individual in
+    {True, False}: plain up/down, up with init_mode="xtx", and up/down with
+    use_miss=True.
+
+    force_spmm: when False (default) graphs are captured at k=1 (SpMV path);
+        when True they are captured at k=2 (SpMM path). Captures at k=2 still
+        serve k=1 callers via CapturedBoundGRG.matmul()'s zero-pad/truncate.
     """
     if kwargs:
         raise TypeError(f"make_runconfig_boltlmm() got unexpected keyword arguments: {sorted(kwargs)}")
+    k = 2 if force_spmm else 1
     return RunConfigs(
         req=RuntimeRequirements(
-            max_k_up=1,
-            max_k_down=1,
+            max_k_up=k,
+            max_k_down=k,
             need_down_miss_input=True,
             need_up_miss_output=True,
             need_init_vector=False,
@@ -537,15 +583,15 @@ def make_runconfig_bolt(**kwargs) -> RunConfigs:
 
         capture_ops=(
             # all others
-            CaptureSpec("up",   1, by_individual=True),
-            CaptureSpec("up",   1, by_individual=True, init_mode="xtx"),
-            CaptureSpec("down", 1, by_individual=True),
-            CaptureSpec("up",   1, by_individual=True, use_miss=True),
-            CaptureSpec("down", 1, by_individual=True, use_miss=True),
-            CaptureSpec("up",   1, by_individual=False),
-            CaptureSpec("down", 1, by_individual=False),
-            CaptureSpec("up",   1, by_individual=False, use_miss=True),
-            CaptureSpec("down", 1, by_individual=False, use_miss=True),
+            CaptureSpec("up",   k, by_individual=True),
+            CaptureSpec("up",   k, by_individual=True, init_mode="xtx"),
+            CaptureSpec("down", k, by_individual=True),
+            CaptureSpec("up",   k, by_individual=True, use_miss=True),
+            CaptureSpec("down", k, by_individual=True, use_miss=True),
+            CaptureSpec("up",   k, by_individual=False),
+            CaptureSpec("down", k, by_individual=False),
+            CaptureSpec("up",   k, by_individual=False, use_miss=True),
+            CaptureSpec("down", k, by_individual=False, use_miss=True),
         ),
     )
 
