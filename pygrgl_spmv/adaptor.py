@@ -524,6 +524,29 @@ def make_backend_cusparse(device=0, allow_residency=True, capture=False, native=
 # RunConfig factory functions
 # ---------------------------------------------------------------------------
 
+def make_runconfig_kernel(direction, k, force_spmm=False) -> RunConfigs:
+    """RunConfigs for a plain matmul kernel benchmark.
+
+    No init, no miss, by_individual=False. Captures only the benchmarked
+    direction at width k (k=2 when force_spmm and k==1, still serving k=1
+    via the existing zero-pad/truncate in CapturedBoundGRG.matmul).
+    """
+    if direction not in ("up", "down"):
+        raise ValueError(f"direction must be 'up' or 'down', got {direction!r}")
+    cap_k = 2 if (force_spmm and k == 1) else int(k)
+    return RunConfigs(
+        req=RuntimeRequirements(
+            max_k_up=cap_k,
+            max_k_down=cap_k,
+            need_down_miss_input=False,
+            need_up_miss_output=False,
+            need_init_vector=False,
+            need_init_matrix=False,
+            need_init_xtx=False,
+        ),
+        capture_ops=(CaptureSpec(direction, cap_k, by_individual=False),),
+    )
+
 def make_runconfig_pca(force_spmm=False, **kwargs) -> RunConfigs:
     """Create a RunConfigs for a PCA workload (init_vector enabled).
 
@@ -1011,6 +1034,7 @@ __all__ = [
     "CusparseBackendConfig",
     "make_backend_mkl",
     "make_backend_cusparse",
+    "make_runconfig_kernel",
     "make_runconfig_pca",
     "make_runconfig_bolt",
     "load_grg_spmv_single",
