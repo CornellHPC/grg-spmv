@@ -547,7 +547,7 @@ def make_runconfig_kernel(direction, k, force_spmm=False) -> RunConfigs:
         capture_ops=(CaptureSpec(direction, cap_k, by_individual=False),),
     )
 
-def make_runconfig_pca(force_spmm=False, **kwargs) -> RunConfigs:
+def make_runconfig_pca(force_spmm=False, maxk=1, **kwargs) -> RunConfigs:
     """Create a RunConfigs for a PCA workload (init_vector enabled).
 
     Captures the graph variants used by PCA:
@@ -560,20 +560,23 @@ def make_runconfig_pca(force_spmm=False, **kwargs) -> RunConfigs:
     """
     if kwargs:
         raise TypeError(f"make_runconfig_pca() got unexpected keyword arguments: {sorted(kwargs)}")
-    k = 2 if force_spmm else 1
+    if maxk==1:
+        k = 2 if force_spmm else 1
+    else:
+        k = maxk
     return RunConfigs(
         req=RuntimeRequirements(
             max_k_up=k,
             max_k_down=k,
             need_down_miss_input=False,
-            need_up_miss_output=False,
+            need_up_miss_output=True,
             need_init_vector=True,
             need_init_matrix=False,
             need_init_xtx=False,
         ),
 
         capture_ops=(
-            CaptureSpec("up",   k, by_individual=False),
+            CaptureSpec("up",   k, by_individual=False, use_miss=True),
             CaptureSpec("up",   k, by_individual=True),
             CaptureSpec("down", k, by_individual=True),
         ),
