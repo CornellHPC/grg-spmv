@@ -470,11 +470,15 @@ class CusparseBackendConfig:
     Files on the same device share a single layout+runtime; different devices
     are loaded in parallel.
     allow_residency: if True, resident mode is preferred. Streaming mode is enabled if set to false.
+    vram_budget_mb: GPU memory cap in MiB, applied ONLY when allow_residency is
+        False (streaming mode), where it must be > 0. Ignored (and left 0) in
+        resident mode.
     capture: if True, capture CUDA graphs after loading and return CapturedBoundGRG.
     native: if True, CapturedBoundGRG uses GPU-native I/O (matmul_native).
     """
     device: object      # int | dict[str, {"cuda_device": int}]
     allow_residency: bool = True
+    vram_budget_mb: int = 0
     capture: bool = False
     native: bool = False
 
@@ -498,11 +502,13 @@ def make_backend_mkl(n_threads=0, optimize=False, **kwargs) -> MklBackendConfig:
     return MklBackendConfig(n_threads=n_threads, optimize=bool(optimize))
 
 
-def make_backend_cusparse(device=0, allow_residency=True, capture=False, native=False, **kwargs) -> CusparseBackendConfig:
+def make_backend_cusparse(device=0, allow_residency=True, vram_budget_mb=0, capture=False, native=False, **kwargs) -> CusparseBackendConfig:
     """Create a cuSPARSE backend config.
 
     device: int (same device for all files) or dict of the form
         {"<file_stem>": {"cuda_device": int}, ...}
+    vram_budget_mb: GPU memory cap in MiB, applied only when allow_residency is
+        False (streaming mode), where it must be > 0.
     capture: if True, CUDA graphs are captured after loading.
     native: if True, matmul uses GPU-native I/O (requires capture=True).
     """
@@ -512,9 +518,16 @@ def make_backend_cusparse(device=0, allow_residency=True, capture=False, native=
         raise TypeError(f"device must be int or dict, got {type(device).__name__}")
     if isinstance(device, int) and device < 0:
         raise ValueError(f"device must be >= 0, got {device}")
+    if not isinstance(vram_budget_mb, int):
+        raise TypeError(f"vram_budget_mb must be int, got {type(vram_budget_mb).__name__}")
+    if vram_budget_mb < 0:
+        raise ValueError(f"vram_budget_mb must be >= 0, got {vram_budget_mb}")
+    if not allow_residency and vram_budget_mb == 0:
+        raise ValueError("vram_budget_mb must be > 0 in streaming mode (allow_residency=False)")
     return CusparseBackendConfig(
         device=device,
         allow_residency=bool(allow_residency),
+        vram_budget_mb=int(vram_budget_mb),
         capture=bool(capture),
         native=bool(native),
     )
@@ -950,13 +963,21 @@ def _load_cusparse_multi(paths, cfg, req, stack, dtype):
             capture_stream = torch.cuda.Stream(device=device_id) if cfg.capture else 0
 
             group_paths = [p for _, p in indexed_paths]
+            if cfg.allow_residency:
+                vram_budget_bytes = 0
+                ring_buffer_size = 0
+            else:
+                # Streaming mode: planner requires ring_buffer_size >= 1 (backend.py:875).
+                # Hardcoded to 2 slots; revisit if a larger ring is needed for throughput.
+                vram_budget_bytes = cfg.vram_budget_mb * 1024 * 1024
+                ring_buffer_size = 2
             layout = plan_cusparse_layout(
                 artifacts=group_paths,
                 pair=pair,
                 dtype=dtype,
                 requirements=_bare_req(req),
-                vram_budget_bytes=0,
-                ring_buffer_size=0,
+                vram_budget_bytes=vram_budget_bytes,
+                ring_buffer_size=ring_buffer_size,
                 allow_residency=cfg.allow_residency,
                 device=device_id,
                 stream=capture_stream,
