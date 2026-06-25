@@ -589,7 +589,8 @@ def make_runconfig_pca(force_spmm=False, maxk=1, **kwargs) -> RunConfigs:
         ),
 
         capture_ops=(
-            CaptureSpec("up",   k, by_individual=False, use_miss=True),
+            CaptureSpec("up",   k, by_individual=False, use_miss=False),    # Current implementation requires no missing for >1 grg
+            CaptureSpec("up",   k, by_individual=False, use_miss=True),     # But missing for 1 grg
             CaptureSpec("up",   k, by_individual=True),
             CaptureSpec("down", k, by_individual=True),
         ),
