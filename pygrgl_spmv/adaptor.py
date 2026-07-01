@@ -635,6 +635,47 @@ def make_runconfig_bolt(force_spmm=False, **kwargs) -> RunConfigs:
         ),
     )
 
+def make_runconfig_gwas(force_spmm=False, maxk=1, sample_variance=True, **kwargs) -> RunConfigs:
+    """Create a RunConfigs for a basic GWAS (assoc) workload.
+
+    maxk: width of the widest UP product. Use 1 for no-covariate GWAS; for
+        covariate GWAS set maxk = n_covariates + 1 so the X^T Q product (Q carries
+        an intercept column) fits. Narrower-k callers (allele_counts, xtx, X^T y)
+        are served via zero-pad/truncate.
+    force_spmm: when maxk == 1, capture at k=2 (SpMM path) instead of k=1 (SpMV);
+        k=1 callers are still served via pad/truncate.
+    sample_variance: capture the init_mode="xtx" graph and request need_init_xtx.
+        Set False for the binomial-variance-only workload (no xtx product).
+    """
+    if kwargs:
+        raise TypeError(f"make_runconfig_gwas() got unexpected keyword arguments: {sorted(kwargs)}")
+    if not isinstance(maxk, int) or maxk < 1:
+        raise ValueError(f"maxk must be an int >= 1, got {maxk!r}")
+    k = (2 if force_spmm else 1) if maxk == 1 else maxk
+
+    capture_ops = [
+        CaptureSpec("up", k, by_individual=False, use_miss=True),   # allele_counts
+        CaptureSpec("up", k, by_individual=True,  use_miss=False),  # X-op: standardized / no-missing
+        CaptureSpec("up", k, by_individual=True,  use_miss=True),   # X-op: non-standardized + missing
+    ]
+    if sample_variance:
+        capture_ops.append(
+            CaptureSpec("up", k, by_individual=False, init_mode="xtx")  # diag(X^T X)
+        )
+
+    return RunConfigs(
+        req=RuntimeRequirements(
+            max_k_up=k,
+            max_k_down=k,
+            need_down_miss_input=False,
+            need_up_miss_output=True,
+            need_init_vector=False,
+            need_init_matrix=False,
+            need_init_xtx=sample_variance,
+        ),
+        capture_ops=tuple(capture_ops),
+    )
+
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
@@ -1062,6 +1103,7 @@ __all__ = [
     "make_runconfig_kernel",
     "make_runconfig_pca",
     "make_runconfig_bolt",
+    "make_runconfig_gwas",
     "load_grg_spmv_single",
     "load_grg_spmv_multi",
 ]

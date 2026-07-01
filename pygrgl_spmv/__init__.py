@@ -14,6 +14,7 @@ from pygrgl_spmv.adaptor import (
     make_runconfig_kernel,
     make_runconfig_pca,
     make_runconfig_bolt,
+    make_runconfig_gwas,
     load_grg_spmv_single,
     load_grg_spmv_multi,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "make_runconfig_kernel",
     "make_runconfig_pca",
     "make_runconfig_bolt",
+    "make_runconfig_gwas",
     "load_grg_spmv_single",
     "load_grg_spmv_multi",
 ]
