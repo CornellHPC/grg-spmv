@@ -30,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = [
-    "cupy-cuda12x>=13.6.0",
+    "cupy-cuda13x>=13.6.0",
     "torch>=2.10.0",
     "triton>=3.6.0",
 ]

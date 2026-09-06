@@ -17,6 +17,7 @@ from pygrgl_spmv.adaptor import (
     make_runconfig_gwas,
     load_grg_spmv_single,
     load_grg_spmv_multi,
+    simple_convert,
 )
 
 __all__ = [
@@ -43,4 +44,5 @@ __all__ = [
     "make_runconfig_gwas",
     "load_grg_spmv_single",
     "load_grg_spmv_multi",
+    "simple_convert",
 ]

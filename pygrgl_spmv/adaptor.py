@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pygrgl_spmv.grg import RuntimeRequirements
+from pygrgl_spmv.grg import RuntimeRequirements, convert
 from pygrgl_spmv.backends.mkl import MklPlan, MklPlanPair, MklRuntime, plan_mkl_layout
 from pygrgl_spmv.backends.cusparse import (
     CusparsePlan,
@@ -1052,6 +1052,39 @@ def _load_cusparse_multi(paths, cfg, req, stack, dtype):
 
 
 # ---------------------------------------------------------------------------
+# Public conversion
+# ---------------------------------------------------------------------------
+
+_ARTIFACT_SUFFIX = ".grg_spmv"
+
+
+def simple_convert(input_path, output_path, dtype=np.float64):
+    """Convert a .grg file into a .grg_spmv artifact at an exact destination.
+
+    convert() derives the artifact path from the source path underneath an
+    output directory, which makes the result hard to predict. This writes
+    exactly to *output_path* instead. The .grg_spmv suffix is forced when it is
+    absent, and parent directories are created as needed.
+
+    Returns the path that was written.
+    """
+    src = Path(input_path).expanduser()
+    if src.suffix != ".grg":
+        raise ValueError(f"expected a .grg file, got {src}")
+    if not src.exists():
+        raise FileNotFoundError(src)
+
+    dst = Path(output_path).expanduser()
+    if dst.suffix != _ARTIFACT_SUFFIX:
+        dst = dst.with_name(dst.name + _ARTIFACT_SUFFIX)
+    name = dst.name[: -len(_ARTIFACT_SUFFIX)]
+
+    dtype = _validate_dtype(dtype)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    return convert(src, dst.parent, dtype=dtype, name=name)
+
+
+# ---------------------------------------------------------------------------
 # Public load functions
 # ---------------------------------------------------------------------------
 
@@ -1104,6 +1137,7 @@ __all__ = [
     "make_runconfig_pca",
     "make_runconfig_bolt",
     "make_runconfig_gwas",
+    "simple_convert",
     "load_grg_spmv_single",
     "load_grg_spmv_multi",
 ]

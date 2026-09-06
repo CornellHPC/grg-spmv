@@ -751,7 +751,7 @@ def plan_cusparse_layout(
     try:
         import cupy as cp
     except ImportError as exc:
-        raise ImportError("CuPy required: pip install cupy-cuda12x") from exc
+        raise ImportError("CuPy required: pip install cupy-cuda13x") from exc
 
     allow_residency = bool(allow_residency)
     device_id = parse_cuda_device(device)
@@ -1015,7 +1015,7 @@ class CusparseRuntime:
             import cupy as cp
             import cupyx
         except ImportError as exc:
-            raise ImportError("CuPy required: pip install cupy-cuda12x") from exc
+            raise ImportError("CuPy required: pip install cupy-cuda13x") from exc
         self._cp = cp
         self._cupyx = cupyx
         self.layout = layout
